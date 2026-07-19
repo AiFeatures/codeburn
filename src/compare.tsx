@@ -4,9 +4,11 @@ import { render, Box, Text, useInput, useApp, useStdout } from 'ink'
 import type { ModelStats, ComparisonRow, CategoryComparison, WorkingStyleRow } from './compare-stats.js'
 import { aggregateModelStats, computeComparison, computeCategoryComparison, computeWorkingStyle, scanSelfCorrections } from './compare-stats.js'
 import { formatCost } from './format.js'
-import { parseAllSessions } from './parser.js'
+import { parseAllSessions, setInteractiveScanUI } from './parser.js'
 import { getAllProviders } from './providers/index.js'
 import type { ProjectSummary, DateRange } from './types.js'
+import { patchStdoutForWindows } from './ink-win.js'
+import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 
 const ORANGE = '#FF8C42'
 const GREEN = '#5BF5A0'
@@ -50,11 +52,12 @@ function barWidth(rate: number): number {
 
 type ModelSelectorProps = {
   models: ModelStats[]
+  recommendations: ModelDefaultRecommendation[]
   onSelect: (a: ModelStats, b: ModelStats) => void
   onBack: () => void
 }
 
-function ModelSelector({ models, onSelect, onBack }: ModelSelectorProps) {
+function ModelSelector({ models, recommendations, onSelect, onBack }: ModelSelectorProps) {
   const { exit } = useApp()
   const [cursor, setCursor] = useState(0)
   const [selected, setSelected] = useState<Set<number>>(new Set())
@@ -125,6 +128,26 @@ function ModelSelector({ models, onSelect, onBack }: ModelSelectorProps) {
         <Text color={ORANGE} bold>[esc]</Text><Text dimColor> back  </Text>
         <Text color={ORANGE} bold>[q]</Text><Text dimColor> quit</Text>
       </Text>
+
+      {recommendations.length > 0 && (
+        <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={ORANGE} paddingX={1}>
+          <Text bold color={ORANGE}>Model defaults recommendation</Text>
+          <Text> </Text>
+          {recommendations.map(rec => (
+            <Box flexDirection="column" key={rec.project} marginBottom={1}>
+              <Text>
+                <Text>{rec.project}: </Text>
+                <Text bold>{rec.currentModel}</Text>
+                <Text>{' -> '}</Text>
+                <Text bold color={GREEN}>{rec.candidateModel}</Text>
+              </Text>
+              <Text color={DIM}>  Current:  {(rec.currentOneShotRate*100).toFixed(1)}% one-shot over {rec.currentEditTurns} edits, {formatCost(rec.currentCostPerEdit)}/edit</Text>
+              <Text color={DIM}>  Candidate: {(rec.candidateOneShotRate*100).toFixed(1)}% one-shot over {rec.candidateEditTurns} edits, {formatCost(rec.candidateCostPerEdit)}/edit</Text>
+              <Text>  To apply: <Text color="#00FFFF">codeburn act apply-model {rec.project}</Text></Text>
+            </Box>
+          ))}
+        </Box>
+      )}
     </Box>
   )
 }
@@ -273,14 +296,14 @@ function ComparisonResults({ modelA, modelB, rows, categories, workingStyle, onB
                 <Text color={DIM}>{'  '}{cat.category}</Text>
                 <Text>
                   <Text>{'  '}</Text>
-                  <Text color={cat.winner === 'a' ? BAR_A : DIM}>{FULL_BLOCK.repeat(Math.max(bwA, 1))}</Text>
+                  <Text color={BAR_A}>{FULL_BLOCK.repeat(Math.max(bwA, 1))}</Text>
                   <Text>{' '.repeat(Math.max(0, BAR_MAX_WIDTH - bwA))} </Text>
                   <Text color={cat.winner === 'a' ? GREEN : undefined}>{rateA.padStart(6)}</Text>
                   <Text color={DIM}> {turnsA}</Text>
                 </Text>
                 <Text>
                   <Text>{'  '}</Text>
-                  <Text color={cat.winner === 'b' ? BAR_B : DIM}>{FULL_BLOCK.repeat(Math.max(bwB, 1))}</Text>
+                  <Text color={BAR_B}>{FULL_BLOCK.repeat(Math.max(bwB, 1))}</Text>
                   <Text>{' '.repeat(Math.max(0, BAR_MAX_WIDTH - bwB))} </Text>
                   <Text color={cat.winner === 'b' ? GREEN : undefined}>{rateB.padStart(6)}</Text>
                   <Text color={DIM}> {turnsB}</Text>
@@ -316,6 +339,14 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
   const { exit } = useApp()
   const [phase, setPhase] = useState<'select' | 'loading' | 'results'>('select')
   const [models, setModels] = useState<ModelStats[]>(() => aggregateModelStats(projects))
+  const [recommendations, setRecommendations] = useState<ModelDefaultRecommendation[]>(() => {
+    const recs: ModelDefaultRecommendation[] = []
+    for (const p of projects) {
+      const rec = recommendModelDefault(p)
+      if (rec) recs.push(rec)
+    }
+    return recs
+  })
   const [pickedNames, setPickedNames] = useState<[string, string] | null>(null)
   const [selectedA, setSelectedA] = useState<ModelStats | null>(null)
   const [selectedB, setSelectedB] = useState<ModelStats | null>(null)
@@ -330,16 +361,47 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
     const newModels = aggregateModelStats(projects)
     setModels(newModels)
 
-    if (pickedNames) {
-      const hasA = newModels.some(m => m.model === pickedNames[0])
-      const hasB = newModels.some(m => m.model === pickedNames[1])
-      if (hasA && hasB) {
-        setLoadTrigger(t => t + 1)
-      } else {
-        setPickedNames(null)
-        setPhase('select')
-      }
+    const recs: ModelDefaultRecommendation[] = []
+    for (const p of projects) {
+      const rec = recommendModelDefault(p)
+      if (rec) recs.push(rec)
     }
+    setRecommendations(recs)
+
+    if (!pickedNames) return
+    const hasA = newModels.some(m => m.model === pickedNames[0])
+    const hasB = newModels.some(m => m.model === pickedNames[1])
+    if (!hasA || !hasB) {
+      setPickedNames(null)
+      setPhase('select')
+      return
+    }
+
+    // When the periodic CLI refresh updates `projects` while the user is
+    // reading the results page, recompute the comparison rows IN PLACE rather
+    // than flipping to a loading screen. Previously every 30s tick bounced the
+    // user to a loading flash and reset their scroll position; the slow part
+    // (scanSelfCorrections, which walks every provider's session dir) is
+    // skipped on these refreshes — corrections drift slowly enough that
+    // staying with the existing values until the user re-enters compare from
+    // scratch is fine.
+    if (phase === 'results') {
+      const a = newModels.find(m => m.model === pickedNames[0])
+      const b = newModels.find(m => m.model === pickedNames[1])
+      if (!a || !b) return
+      const aCopy = { ...a, selfCorrections: selectedA?.selfCorrections ?? 0 }
+      const bCopy = { ...b, selfCorrections: selectedB?.selfCorrections ?? 0 }
+      setSelectedA(aCopy)
+      setSelectedB(bCopy)
+      setRows(computeComparison(aCopy, bCopy))
+      setCategories(computeCategoryComparison(projects, a.model, b.model))
+      setStyle(computeWorkingStyle(projects, a.model, b.model))
+      return
+    }
+
+    // Initial load (or returning from select after picking) — full pipeline,
+    // including scanSelfCorrections.
+    setLoadTrigger(t => t + 1)
   }, [projects])
 
   useEffect(() => {
@@ -435,6 +497,7 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
   return (
     <ModelSelector
       models={models}
+      recommendations={recommendations}
       onSelect={handleSelect}
       onBack={onBack}
     />
@@ -442,12 +505,17 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
 }
 
 export async function renderCompare(range: DateRange, provider: string): Promise<void> {
+  // Interactive Ink UI: suppress the CLI scan-progress line for the whole
+  // lifetime so it can't print over the rendered comparison. Plain CLI
+  // commands still show progress.
+  setInteractiveScanUI()
   const isTTY = process.stdin.isTTY && process.stdout.isTTY
   if (!isTTY) {
     process.stdout.write('Model comparison requires an interactive terminal.\n')
     return
   }
 
+  patchStdoutForWindows()
   const projects = await parseAllSessions(range, provider)
   const { waitUntilExit } = render(
     <CompareView projects={projects} onBack={() => process.exit(0)} />

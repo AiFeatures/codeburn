@@ -6,6 +6,7 @@ function emptyEntry(date: string): DailyEntry {
   return {
     date,
     cost: 0,
+    savingsUSD: 0,
     calls: 0,
     sessions: 0,
     inputTokens: 0,
@@ -40,51 +41,63 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
 
       for (const turn of session.turns) {
         if (turn.assistantCalls.length === 0) continue
-        const turnDate = dateKey(turn.assistantCalls[0]!.timestamp)
+        // Turn-anchored bucketing: attribute the WHOLE turn — every one of its
+        // calls — to the day of the turn's user-message timestamp, matching the
+        // live headline/report rollup (main.ts daily). Falls back to the first
+        // assistant-call timestamp when the user line is missing (continuation
+        // sessions that begin mid-conversation). Previously the calls were
+        // bucketed per-call by each call's own timestamp, so a midnight-
+        // straddling turn split across two days and history.daily / the provider
+        // breakdown never reconciled to current.cost (a constant offset).
+        const turnDate = dateKey(turn.timestamp || turn.assistantCalls[0]!.timestamp)
         const turnDay = ensure(turnDate)
 
         const editTurns = turn.hasEdits ? 1 : 0
         const oneShotTurns = turn.hasEdits && turn.retries === 0 ? 1 : 0
         const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
+        const turnSavings = turn.assistantCalls.reduce((s, c) => s + (c.savingsUSD ?? 0), 0)
 
         turnDay.editTurns += editTurns
         turnDay.oneShotTurns += oneShotTurns
 
-        const cat = turnDay.categories[turn.category] ?? { turns: 0, cost: 0, editTurns: 0, oneShotTurns: 0 }
+        const cat = turnDay.categories[turn.category] ?? { turns: 0, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
         cat.turns += 1
         cat.cost += turnCost
+        cat.savingsUSD += turnSavings
         cat.editTurns += editTurns
         cat.oneShotTurns += oneShotTurns
         turnDay.categories[turn.category] = cat
 
         for (const call of turn.assistantCalls) {
-          const callDate = dateKey(call.timestamp)
-          const callDay = ensure(callDate)
+          const callSavings = call.savingsUSD ?? 0
 
-          callDay.cost += call.costUSD
-          callDay.calls += 1
-          callDay.inputTokens += call.usage.inputTokens
-          callDay.outputTokens += call.usage.outputTokens
-          callDay.cacheReadTokens += call.usage.cacheReadInputTokens
-          callDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
+          turnDay.cost += call.costUSD
+          turnDay.savingsUSD += callSavings
+          turnDay.calls += 1
+          turnDay.inputTokens += call.usage.inputTokens
+          turnDay.outputTokens += call.usage.outputTokens
+          turnDay.cacheReadTokens += call.usage.cacheReadInputTokens
+          turnDay.cacheWriteTokens += call.usage.cacheCreationInputTokens
 
-          const model = callDay.models[call.model] ?? {
-            calls: 0, cost: 0,
+          const model = turnDay.models[call.model] ?? {
+            calls: 0, cost: 0, savingsUSD: 0,
             inputTokens: 0, outputTokens: 0,
             cacheReadTokens: 0, cacheWriteTokens: 0,
           }
           model.calls += 1
           model.cost += call.costUSD
+          model.savingsUSD += callSavings
           model.inputTokens += call.usage.inputTokens
           model.outputTokens += call.usage.outputTokens
           model.cacheReadTokens += call.usage.cacheReadInputTokens
           model.cacheWriteTokens += call.usage.cacheCreationInputTokens
-          callDay.models[call.model] = model
+          turnDay.models[call.model] = model
 
-          const provider = callDay.providers[call.provider] ?? { calls: 0, cost: 0 }
+          const provider = turnDay.providers[call.provider] ?? { calls: 0, cost: 0, savingsUSD: 0 }
           provider.calls += 1
           provider.cost += call.costUSD
-          callDay.providers[call.provider] = provider
+          provider.savingsUSD += callSavings
+          turnDay.providers[call.provider] = provider
         }
       }
     }
@@ -94,13 +107,14 @@ export function aggregateProjectsIntoDays(projects: ProjectSummary[]): DailyEntr
 }
 
 export function buildPeriodDataFromDays(days: DailyEntry[], label: string): PeriodData {
-  let cost = 0, calls = 0, sessions = 0
+  let cost = 0, savingsUSD = 0, calls = 0, sessions = 0
   let inputTokens = 0, outputTokens = 0, cacheReadTokens = 0, cacheWriteTokens = 0
-  const catTotals: Record<string, { turns: number; cost: number; editTurns: number; oneShotTurns: number }> = {}
-  const modelTotals: Record<string, { calls: number; cost: number }> = {}
+  const catTotals: Record<string, { turns: number; cost: number; savingsUSD: number; editTurns: number; oneShotTurns: number }> = {}
+  const modelTotals: Record<string, { calls: number; cost: number; savingsUSD: number }> = {}
 
   for (const d of days) {
     cost += d.cost
+    savingsUSD += d.savingsUSD
     calls += d.calls
     sessions += d.sessions
     inputTokens += d.inputTokens
@@ -109,15 +123,17 @@ export function buildPeriodDataFromDays(days: DailyEntry[], label: string): Peri
     cacheWriteTokens += d.cacheWriteTokens
 
     for (const [name, m] of Object.entries(d.models)) {
-      const acc = modelTotals[name] ?? { calls: 0, cost: 0 }
+      const acc = modelTotals[name] ?? { calls: 0, cost: 0, savingsUSD: 0 }
       acc.calls += m.calls
       acc.cost += m.cost
+      acc.savingsUSD += (m.savingsUSD ?? 0)
       modelTotals[name] = acc
     }
     for (const [cat, c] of Object.entries(d.categories)) {
-      const acc = catTotals[cat] ?? { turns: 0, cost: 0, editTurns: 0, oneShotTurns: 0 }
+      const acc = catTotals[cat] ?? { turns: 0, cost: 0, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
       acc.turns += c.turns
       acc.cost += c.cost
+      acc.savingsUSD += (c.savingsUSD ?? 0)
       acc.editTurns += c.editTurns
       acc.oneShotTurns += c.oneShotTurns
       catTotals[cat] = acc
@@ -127,6 +143,7 @@ export function buildPeriodDataFromDays(days: DailyEntry[], label: string): Peri
   return {
     label,
     cost,
+    savingsUSD,
     calls,
     sessions,
     inputTokens,

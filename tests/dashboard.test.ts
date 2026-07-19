@@ -1,5 +1,8 @@
+import { homedir } from 'os'
+
 import { describe, it, expect } from 'vitest'
 
+import { getDailyActivityRows, pageHistoryCursor, scrollHistoryCursor, shortProject, showEmptyState } from '../src/dashboard.js'
 import { formatCost } from '../src/format.js'
 import type { ProjectSummary, SessionSummary } from '../src/types.js'
 
@@ -37,6 +40,7 @@ function makeSession(id: string, cost: number, timestamp = '2026-04-14T10:00:00Z
     mcpBreakdown: {},
     bashBreakdown: {},
     categoryBreakdown: { ...EMPTY_CATEGORY_BREAKDOWN },
+    skillBreakdown: {},
   }
 }
 
@@ -50,9 +54,36 @@ function makeProject(name: string, sessions: SessionSummary[]): ProjectSummary {
   }
 }
 
+function makeTurn(timestamp: string, costs: number[]): SessionSummary['turns'][number] {
+  return {
+    userMessage: 'fixture turn',
+    sessionId: 'fixture-session',
+    timestamp,
+    category: 'coding',
+    retries: 0,
+    hasEdits: false,
+    assistantCalls: costs.map((costUSD, index) => ({
+      provider: 'codex',
+      model: 'test-model',
+      usage: { inputTokens: 0, outputTokens: 0, cacheCreationInputTokens: 0, cacheReadInputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0, webSearchRequests: 0 },
+      costUSD,
+      tools: [],
+      mcpTools: [],
+      skills: [],
+      subagentTypes: [],
+      hasAgentSpawn: false,
+      hasPlanMode: false,
+      speed: 'standard',
+      timestamp,
+      bashCommands: [],
+      deduplicationKey: `fixture-${timestamp}-${index}`,
+    })),
+  }
+}
+
 // Logic replicated from TopSessions component
 function getTopSessions(projects: ProjectSummary[], n = 5) {
-  const all = projects.flatMap(p => p.sessions.map(s => ({ ...s, projectName: p.project })))
+  const all = projects.flatMap(p => p.sessions.map(s => ({ ...s, projectPath: p.projectPath })))
   return [...all].sort((a, b) => b.totalCostUSD - a.totalCostUSD).slice(0, n)
 }
 
@@ -98,6 +129,36 @@ describe('TopSessions - top-5 selection', () => {
   })
 })
 
+describe('shortProject - path shortening', () => {
+  const home = homedir()
+
+  it('preserves directory names containing dashes', () => {
+    expect(shortProject(`${home}/work/my-project`)).toBe('work/my-project')
+  })
+
+  it('preserves directory names containing dots', () => {
+    expect(shortProject(`${home}/work/my.app.io`)).toBe('work/my.app.io')
+  })
+
+  it('returns "home" for the home dir itself', () => {
+    expect(shortProject(home)).toBe('home')
+  })
+
+  it('does not strip a sibling whose name shares the home prefix', () => {
+    const sibling = `${home}-backup/proj`
+    expect(shortProject(sibling).endsWith('proj')).toBe(true)
+    expect(shortProject(sibling)).not.toMatch(/^-/)
+  })
+
+  it('keeps only the last 3 segments for deeply nested paths', () => {
+    expect(shortProject(`${home}/a/b/c/d/e/f`)).toBe('d/e/f')
+  })
+
+  it('handles paths outside the home dir', () => {
+    expect(shortProject('/opt/myproject')).toBe('opt/myproject')
+  })
+})
+
 describe('avg/s in ProjectBreakdown', () => {
   it('returns dash for a project with no sessions', () => {
     const project = makeProject('proj', [])
@@ -108,5 +169,52 @@ describe('avg/s in ProjectBreakdown', () => {
     const sessions = [makeSession('s1', 2.0), makeSession('s2', 4.0)]
     const project = makeProject('proj', sessions)
     expect(avgCostLabel(project)).toBe(formatCost(3.0))
+  })
+})
+
+describe('Daily Activity history', () => {
+  it('aggregates every active day in chronological order', () => {
+    const session = makeSession('s1', 0)
+    session.turns = [
+      makeTurn('2025-01-02T12:00:00Z', [1.25, 0.75]),
+      makeTurn('2024-12-31T12:00:00Z', [3]),
+    ]
+
+    expect(getDailyActivityRows([makeProject('proj', [session])])).toEqual([
+      { day: '2024-12-31', cost: 3, calls: 1 },
+      { day: '2025-01-02', cost: 2, calls: 2 },
+    ])
+  })
+
+  it('pages one viewport and keeps the final page full', () => {
+    expect(pageHistoryCursor(0, 1, 35, 69)).toBe(34)
+    expect(pageHistoryCursor(34, -1, 35, 69)).toBe(0)
+    expect(pageHistoryCursor(0, -1, 35, 69)).toBe(0)
+  })
+
+  it('scrolls one row without moving past either end', () => {
+    expect(scrollHistoryCursor(0, 1, 14, 21)).toBe(1)
+    expect(scrollHistoryCursor(1, -1, 14, 21)).toBe(0)
+    expect(scrollHistoryCursor(0, -1, 14, 21)).toBe(0)
+    expect(scrollHistoryCursor(7, 1, 14, 21)).toBe(7)
+  })
+})
+
+describe('showEmptyState', () => {
+  it('keeps the clean empty state for a truly-new user in scrollable mode', () => {
+    expect(showEmptyState(0, true, 0, false)).toBe(true)
+  })
+
+  it('renders the dashboard while full history is still loading', () => {
+    expect(showEmptyState(0, true, 0, true)).toBe(false)
+  })
+
+  it('renders the dashboard when the period is empty but history exists', () => {
+    expect(showEmptyState(0, true, 3, false)).toBe(false)
+  })
+
+  it('non-scrollable mode (custom range, day view) keeps the original behavior', () => {
+    expect(showEmptyState(0, false, 0, false)).toBe(true)
+    expect(showEmptyState(2, false, 0, false)).toBe(false)
   })
 })

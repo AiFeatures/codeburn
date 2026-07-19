@@ -1,12 +1,22 @@
 import { basename } from 'path'
+import stripAnsi from 'strip-ansi'
 
 function stripQuotedStrings(command: string): string {
   return command.replace(/"[^"]*"|'[^']*'/g, match => ' '.repeat(match.length))
 }
 
-export function extractBashCommands(command: string): string[] {
-  if (!command || !command.trim()) return []
+const COMMAND_PREFIXES = new Set([
+  'sudo', 'doas',
+  'npx', 'bunx',
+  'time',
+  'nice', 'nohup', 'stdbuf',
+  'rtk',
+])
 
+export function extractBashCommands(rawCommand: string): string[] {
+  if (!rawCommand || !rawCommand.trim()) return []
+
+  const command = stripAnsi(rawCommand)
   const stripped = stripQuotedStrings(command)
 
   const separatorRegex = /\s*(?:&&|;|\|)\s*/g
@@ -32,7 +42,17 @@ export function extractBashCommands(command: string): string[] {
 
     const tokens = segment.split(/\s+/)
     let i = 0
-    while (i < tokens.length && /^\w+=/.test(tokens[i]!)) i++
+    while (i < tokens.length) {
+      if (/^\w+=/.test(tokens[i]!)) { i++; continue }
+      const next = tokens[i + 1]
+      if (
+        next !== undefined &&
+        COMMAND_PREFIXES.has(basename(tokens[i]!)) &&
+        !next.startsWith('-') &&
+        !/["']/.test(next)
+      ) { i++; continue }
+      break
+    }
     const base = i < tokens.length ? basename(tokens[i]!) : ''
 
     if (base && base !== 'cd' && base !== 'true' && base !== 'false') {

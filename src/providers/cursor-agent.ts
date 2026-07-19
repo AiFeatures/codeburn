@@ -6,6 +6,8 @@ import { homedir } from 'os'
 
 import { calculateCost } from '../models.js'
 import { openDatabase, type SqliteDatabase } from '../sqlite.js'
+import { normalizeContentBlocks } from '../content-utils.js'
+import { estimateTokensFromChars } from '../token-estimate.js'
 import type {
   Provider,
   SessionSource,
@@ -31,8 +33,7 @@ type ParsedTurn = {
   assistant: AssistantTurn
 }
 
-const CURSOR_AGENT_DEFAULT_MODEL = 'claude-sonnet-4-5'
-const CHARS_PER_TOKEN = 4
+const CURSOR_AGENT_COST_MODEL = 'claude-sonnet-4-5'
 const MAX_USER_TEXT_LENGTH = 500
 const DIGITS_ONLY = /^\d+$/
 const UUID_LIKE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -43,6 +44,7 @@ const TOOL_CALL_MARKER = /^\s*\[Tool call\]\s*(.+?)\s*$/i
 const TOOL_RESULT_MARKER = /^\s*\[Tool result\]\b/i
 const USER_QUERY_OPEN = '<user_query>'
 const USER_QUERY_CLOSE = '</user_query>'
+const warnedUnrecognizedTranscripts = new Set<string>()
 const CONVERSATION_SUMMARY_QUERY = `
   SELECT conversationId, model, title, updatedAt
   FROM conversation_summaries
@@ -80,7 +82,7 @@ function getAttributionDbPath(baseDir: string): string {
 
 function estimateTokens(charCount: number): number {
   if (charCount <= 0) return 0
-  return Math.ceil(charCount / CHARS_PER_TOKEN)
+  return estimateTokensFromChars(charCount)
 }
 
 function parseToolName(raw: string): string {
@@ -129,14 +131,89 @@ function prettifyProjectId(raw: string): string {
 }
 
 function resolveModel(raw: string | null | undefined): string {
-  if (!raw || raw === 'default') return CURSOR_AGENT_DEFAULT_MODEL
+  if (!raw || raw === 'default') return 'cursor-agent-auto'
   return raw
 }
 
+function costModel(model: string): string {
+  return model === 'cursor-agent-auto' ? CURSOR_AGENT_COST_MODEL : model
+}
+
+function transcriptStem(transcriptPath: string): string {
+  const name = basename(transcriptPath)
+  if (name.endsWith('.jsonl')) return name.slice(0, -'.jsonl'.length)
+  if (name.endsWith('.txt')) return name.slice(0, -'.txt'.length)
+  return name
+}
+
 function toConversationId(transcriptPath: string): string {
-  const filename = basename(transcriptPath, '.txt')
+  const filename = transcriptStem(transcriptPath)
   if (filename.length === 36 && UUID_LIKE.test(filename)) return filename
   return createHash('sha1').update(transcriptPath).digest('hex').slice(0, 16)
+}
+
+async function appendTranscriptSources(
+  scanDir: string,
+  projectId: string,
+  sources: SessionSource[],
+): Promise<void> {
+  const transcriptEntries = await readdir(scanDir, { withFileTypes: true })
+  for (const transcript of transcriptEntries) {
+    // Legacy format: .txt files directly in the scan dir
+    if (transcript.isFile() && transcript.name.endsWith('.txt')) {
+      sources.push({
+        path: join(scanDir, transcript.name),
+        project: projectId,
+        provider: 'cursor-agent',
+      })
+      continue
+    }
+
+    // Composer 2 format: UUID subdirectories with .jsonl files
+    if (transcript.isDirectory() && UUID_LIKE.test(transcript.name)) {
+      const subdir = join(scanDir, transcript.name)
+      const subEntries = await readdir(subdir, { withFileTypes: true }).catch(() => [])
+      const transcriptFilesByStem = new Map<string, { jsonl?: string; txt?: string }>()
+
+      for (const sub of subEntries) {
+        if (sub.isFile() && (sub.name.endsWith('.jsonl') || sub.name.endsWith('.txt'))) {
+          const stem = transcriptStem(sub.name)
+          const existing = transcriptFilesByStem.get(stem) ?? {}
+          if (sub.name.endsWith('.jsonl')) {
+            transcriptFilesByStem.set(stem, { ...existing, jsonl: sub.name })
+          } else {
+            transcriptFilesByStem.set(stem, { ...existing, txt: sub.name })
+          }
+          continue
+        }
+
+        // Subagent transcripts inside a subagents/ directory
+        if (sub.isDirectory() && sub.name === 'subagents') {
+          const subagentEntries = await readdir(join(subdir, sub.name), { withFileTypes: true }).catch(() => [])
+          for (const sa of subagentEntries) {
+            if (!sa.isFile()) continue
+            if (!sa.name.endsWith('.jsonl') && !sa.name.endsWith('.txt')) continue
+            sources.push({
+              path: join(subdir, sub.name, sa.name),
+              project: projectId,
+              provider: 'cursor-agent',
+            })
+          }
+        }
+      }
+
+      for (const files of transcriptFilesByStem.values()) {
+        const selectedName = files.jsonl ?? files.txt
+        if (selectedName) {
+          sources.push({
+            path: join(subdir, selectedName),
+            project: projectId,
+            provider: 'cursor-agent',
+          })
+        }
+      }
+    }
+  }
 }
 
 function extractUserQuery(userBlock: string): string {
@@ -158,6 +235,58 @@ function extractUserQuery(userBlock: string): string {
 
   const combined = chunks.filter(Boolean).join(' ').replace(/\s+/g, ' ').trim()
   return combined.slice(0, MAX_USER_TEXT_LENGTH)
+}
+
+function parseJsonlTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
+  const lines = raw.split(/\r?\n/).filter(l => l.trim())
+  if (lines.length === 0) return { turns: [], recognized: false }
+
+  const turns: ParsedTurn[] = []
+  let currentUserMessage = ''
+
+  for (const line of lines) {
+    let entry: { role?: string; message?: { content?: Array<{ type?: string; text?: string; name?: string }> } }
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      continue
+    }
+
+    if (entry.role === 'user') {
+      const texts = normalizeContentBlocks(entry.message?.content)
+        .filter(c => c.type === 'text')
+        .map(c => c.text ?? '')
+      const combined = texts.join(' ')
+      currentUserMessage = extractUserQuery(combined) || combined.slice(0, MAX_USER_TEXT_LENGTH)
+      continue
+    }
+
+    if (entry.role === 'assistant' && currentUserMessage) {
+      const content = normalizeContentBlocks(entry.message?.content)
+      const bodyParts: string[] = []
+      const tools: string[] = []
+
+      for (const block of content) {
+        if (block.type === 'text' && block.text) {
+          bodyParts.push(block.text)
+        } else if (block.type === 'tool_use' && block.name) {
+          tools.push(`cursor:${block.name.toLowerCase()}`)
+        }
+      }
+
+      turns.push({
+        userMessage: currentUserMessage,
+        assistant: {
+          body: bodyParts.join('\n').trim(),
+          reasoning: '',
+          tools,
+        },
+      })
+      currentUserMessage = ''
+    }
+  }
+
+  return { turns, recognized: turns.length > 0 }
 }
 
 function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolean } {
@@ -183,7 +312,7 @@ function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolea
 
     let output = ''
     let reasoning = ''
-    const toolsByTurn: Record<string, boolean> = Object.create(null)
+    const toolsByTurn = new Map<string, true>()
 
     for (const line of assistantLines) {
       if (TOOL_RESULT_MARKER.test(line)) continue
@@ -199,7 +328,7 @@ function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolea
       if (toolMatch) {
         const parsedTool = parseToolName(toolMatch[1] ?? '')
         const toolKey = `cursor:${parsedTool}`
-        toolsByTurn[toolKey] = true
+        toolsByTurn.set(toolKey, true)
         continue
       }
 
@@ -208,7 +337,7 @@ function parseTranscript(raw: string): { turns: ParsedTurn[]; recognized: boolea
 
     if (pendingUsers.length > 0) {
       const userMessage = pendingUsers.shift()!
-      const tools = Object.keys(toolsByTurn)
+      const tools = Array.from(toolsByTurn.keys())
       turns.push({
         userMessage,
         assistant: {
@@ -261,13 +390,13 @@ function createParser(
   source: SessionSource,
   seenKeys: Set<string>,
   dbPath: string,
-  summariesByConversationId: Record<string, ConversationSummary | undefined>,
+  summariesByConversationId: Map<string, ConversationSummary>,
 ): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const conversationId = toConversationId(source.path)
 
-      let summary = summariesByConversationId[conversationId]
+      let summary = summariesByConversationId.get(conversationId)
       let db: SqliteDatabase | null = null
 
       try {
@@ -290,7 +419,7 @@ function createParser(
                   title: row.title,
                   updatedAt: normalizeTimestamp(row.updatedAt),
                 }
-                summariesByConversationId[conversationId] = summary
+                summariesByConversationId.set(conversationId, summary)
               }
             } catch {
               summary = undefined
@@ -299,10 +428,14 @@ function createParser(
         }
 
         const transcript = await readFile(source.path, 'utf-8')
-        const parsed = parseTranscript(transcript)
+        const isJsonl = source.path.endsWith('.jsonl')
+        const parsed = isJsonl ? parseJsonlTranscript(transcript) : parseTranscript(transcript)
 
         if (!parsed.recognized) {
-          process.stderr.write(`codeburn: skipped ${basename(source.path)}: unrecognized cursor-agent transcript format\n`)
+          if (!warnedUnrecognizedTranscripts.has(source.path)) {
+            warnedUnrecognizedTranscripts.add(source.path)
+            process.stderr.write(`codeburn: skipped ${basename(source.path)}: unrecognized cursor-agent transcript format\n`)
+          }
           return
         }
 
@@ -325,7 +458,7 @@ function createParser(
           seenKeys.add(deduplicationKey)
 
           const costUSD = calculateCost(
-            model,
+            costModel(model),
             inputTokens,
             outputTokens + reasoningTokens,
             0,
@@ -364,14 +497,14 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
   const baseDir = getCursorAgentBaseDir(baseDirOverride)
   const projectsDir = getProjectsDir(baseDir)
   const dbPath = getAttributionDbPath(baseDir)
-  const summariesByConversationId: Record<string, ConversationSummary | undefined> = Object.create(null)
+  const summariesByConversationId = new Map<string, ConversationSummary>()
 
   return {
     name: 'cursor-agent',
     displayName: 'Cursor Agent',
 
     modelDisplayName(model: string): string {
-      if (model === 'default') return modelDisplayNames.default
+      if (model === 'cursor-agent-auto') return 'Cursor (auto)'
       const label = modelDisplayNames[model] ?? model
       return `${label} (est.)`
     },
@@ -390,21 +523,15 @@ export function createCursorAgentProvider(baseDirOverride?: string): Provider {
         if (!entry.isDirectory()) continue
 
         const projectId = prettifyProjectId(entry.name)
-        const transcriptDir = join(projectsDir, entry.name, 'agent-transcripts')
-        if (!existsSync(transcriptDir)) continue
-
-        const transcriptEntries = await readdir(transcriptDir, { withFileTypes: true })
-        for (const transcript of transcriptEntries) {
-          if (!transcript.isFile()) continue
-          if (!transcript.name.endsWith('.txt')) continue
-
-          const transcriptPath = join(transcriptDir, transcript.name)
-          sources.push({
-            path: transcriptPath,
-            project: projectId,
-            provider: 'cursor-agent',
-          })
+        const projectDir = join(projectsDir, entry.name)
+        if (entry.name === 'agent-transcripts') {
+          await appendTranscriptSources(projectDir, projectId, sources)
+          continue
         }
+
+        const transcriptDir = join(projectDir, 'agent-transcripts')
+        if (!existsSync(transcriptDir)) continue
+        await appendTranscriptSources(transcriptDir, projectId, sources)
       }
 
       return sources

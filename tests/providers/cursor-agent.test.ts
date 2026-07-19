@@ -1,16 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, mkdir, rm, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'fs/promises'
 import { existsSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
 import { getAllProviders } from '../../src/providers/index.js'
 import { createCursorAgentProvider } from '../../src/providers/cursor-agent.js'
+import { estimateTokensFromChars } from '../../src/token-estimate.js'
 import type { ParsedProviderCall, Provider, SessionSource } from '../../src/providers/types.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
 
-const CHARS_PER_TOKEN = 4
-const CURSOR_AGENT_DEFAULT_MODEL = 'claude-sonnet-4-5'
+const CURSOR_AGENT_DEFAULT_MODEL = 'cursor-agent-auto'
 const FIXED_UUID = '123e4567-e89b-12d3-a456-426614174000'
 
 const skipUnlessSqlite = isSqliteAvailable() ? describe : describe.skip
@@ -61,9 +61,9 @@ describe('cursor-agent provider', () => {
     expect(provider?.displayName).toBe('Cursor Agent')
   })
 
-  it('maps default model to auto with estimation label', () => {
+  it('maps default model to Cursor (auto) label', () => {
     const provider = createCursorAgentProvider('/tmp/nonexistent-cursor-agent-fixture')
-    expect(provider.modelDisplayName('default')).toBe('Auto (Sonnet est.)')
+    expect(provider.modelDisplayName('cursor-agent-auto')).toBe('Cursor (auto)')
   })
 
   it('maps known models and appends estimation label', () => {
@@ -125,6 +125,40 @@ describe('cursor-agent provider', () => {
     expect(sources.every((s) => s.provider === 'cursor-agent')).toBe(true)
   })
 
+  it('does not scan a workspace root when agent-transcripts is missing', async () => {
+    const baseDir = await makeBaseDir()
+    const workspaceRoot = join(baseDir, 'projects', 'workspace-without-transcripts')
+    await mkdir(workspaceRoot, { recursive: true })
+    await writeFile(
+      join(workspaceRoot, 'extension-state.txt'),
+      'user:\n<user_query>not a transcript</user_query>\nA:\nnot a cursor-agent answer\n',
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const sources = await provider.discoverSessions()
+
+    expect(sources).toEqual([])
+  })
+
+  it('prefers jsonl over same-session txt inside UUID transcript dirs', async () => {
+    const baseDir = await makeBaseDir()
+    const sessionDir = join(baseDir, 'projects', 'proj-with-duplicates', 'agent-transcripts', FIXED_UUID)
+    const jsonlPath = join(sessionDir, `${FIXED_UUID}.jsonl`)
+    const txtPath = join(sessionDir, `${FIXED_UUID}.txt`)
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(
+      jsonlPath,
+      '{"role":"user","message":{"content":[{"type":"text","text":"<user_query>jsonl wins</user_query>"}]}}\n{"role":"assistant","message":{"content":[{"type":"text","text":"jsonl answer"}]}}\n',
+    )
+    await writeFile(txtPath, 'user:\n<user_query>txt duplicate</user_query>\nA:\ntxt answer\n')
+
+    const provider = createCursorAgentProvider(baseDir)
+    const sources = await provider.discoverSessions()
+
+    expect(sources).toHaveLength(1)
+    expect(sources[0]!.path).toBe(jsonlPath)
+  })
+
   it('parses one user/assistant pair with estimated token counts', async () => {
     const baseDir = await makeBaseDir()
     const transcriptDir = join(baseDir, 'projects', 'my-proj', 'agent-transcripts')
@@ -146,8 +180,8 @@ describe('cursor-agent provider', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]!.provider).toBe('cursor-agent')
     expect(calls[0]!.model).toBe(CURSOR_AGENT_DEFAULT_MODEL)
-    expect(calls[0]!.inputTokens).toBe(Math.ceil(userText.length / CHARS_PER_TOKEN))
-    expect(calls[0]!.outputTokens).toBe(Math.ceil(assistantText.length / CHARS_PER_TOKEN))
+    expect(calls[0]!.inputTokens).toBe(estimateTokensFromChars(userText.length))
+    expect(calls[0]!.outputTokens).toBe(estimateTokensFromChars(assistantText.length))
     expect(calls[0]!.reasoningTokens).toBe(0)
     expect(calls[0]!.deduplicationKey).toBe(`cursor-agent:${FIXED_UUID}:0`)
   })
@@ -188,6 +222,58 @@ describe('cursor-agent provider', () => {
     expect(String(stderrSpy.mock.calls[0]?.[0] ?? '')).toContain('unrecognized cursor-agent transcript format')
 
     stderrSpy.mockRestore()
+  })
+
+  it('warns only once for the same unrecognized transcript', async () => {
+    const baseDir = await makeBaseDir()
+    const transcriptDir = join(baseDir, 'projects', 'bad-proj-repeat', 'agent-transcripts')
+    await mkdir(transcriptDir, { recursive: true })
+    const transcriptPath = join(transcriptDir, 'repeat-bad.txt')
+    await writeFile(transcriptPath, 'no cursor-agent markers here')
+
+    const provider = createCursorAgentProvider(baseDir)
+    const source = (await provider.discoverSessions())[0]!
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+
+    await collectCalls(provider, source)
+    await collectCalls(provider, source)
+
+    const warnings = stderrSpy.mock.calls
+      .map(call => String(call[0] ?? ''))
+      .filter(message => message.includes('unrecognized cursor-agent transcript format'))
+    expect(warnings).toHaveLength(1)
+
+    stderrSpy.mockRestore()
+  })
+
+  it('discovers jsonl transcripts stored directly under project dir (workspace-less layout)', async () => {
+    const baseDir = await makeBaseDir()
+    const fixtureRoot = join(import.meta.dirname, '../fixtures/cursor-agent/workspace-less')
+    const sessionDir = join(baseDir, 'projects', 'agent-transcripts', '1031d227-0c67-4e17-8954-0b6e2b3322f0')
+    await mkdir(sessionDir, { recursive: true })
+    await writeFile(
+      join(sessionDir, '1031d227-0c67-4e17-8954-0b6e2b3322f0.jsonl'),
+      await readFile(
+        join(
+          fixtureRoot,
+          'projects/agent-transcripts/1031d227-0c67-4e17-8954-0b6e2b3322f0/1031d227-0c67-4e17-8954-0b6e2b3322f0.jsonl',
+        ),
+        'utf-8',
+      ),
+    )
+
+    const provider = createCursorAgentProvider(baseDir)
+    const sources = await provider.discoverSessions()
+
+    expect(sources).toHaveLength(1)
+    expect(sources[0]!.project).toBe('transcripts')
+    expect(sources[0]!.path.endsWith('.jsonl')).toBe(true)
+
+    const calls = await collectCalls(provider, sources[0]!)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe('1031d227-0c67-4e17-8954-0b6e2b3322f0')
+    expect(calls[0]!.userMessage).toBe('Run a quick smoke test')
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
   })
 
   it('falls back to stable sha1 conversation id for non-uuid filenames', async () => {

@@ -16,12 +16,27 @@ export type SqliteDatabase = {
 
 type DatabaseSyncCtor = new (path: string, options?: { readOnly?: boolean }) => {
   prepare(sql: string): { all(...params: unknown[]): Row[] }
+  exec?(sql: string): void
   close(): void
 }
 
 let DatabaseSync: DatabaseSyncCtor | null = null
 let loadAttempted = false
 let loadError: string | null = null
+
+const textDecoder = new TextDecoder('utf-8', { fatal: false })
+
+/// Safely decode a BLOB column (Uint8Array) to a UTF-8 string. Node's
+/// node:sqlite crashes with a V8 CHECK abort when a TEXT column contains
+/// invalid UTF-8 (common in Cursor chat blobs with truncated multi-byte
+/// chars). By selecting those columns as `CAST(... AS BLOB)` in SQL, we
+/// get a Uint8Array here and decode it in JS where bad bytes become the
+/// U+FFFD replacement character instead of aborting the process.
+export function blobToText(value: Uint8Array | string | null | undefined): string {
+  if (value == null) return ''
+  if (typeof value === 'string') return value
+  return textDecoder.decode(value)
+}
 
 /// Lazily imports `node:sqlite`. On Node 22/23 it emits an ExperimentalWarning the first
 /// time the module is loaded; we silence that specific warning once so dashboards aren't
@@ -71,7 +86,7 @@ function loadDriver(): boolean {
       `(underlying error: ${message})`
     return false
   } finally {
-    restore()
+    process.nextTick(restore)
   }
 }
 
@@ -83,12 +98,35 @@ export function getSqliteLoadError(): string {
   return loadError ?? 'SQLite driver not available'
 }
 
+export function isSqliteBusyError(err: unknown): boolean {
+  const e = err as { code?: unknown; errcode?: unknown; errstr?: unknown; message?: unknown } | null
+  const code = typeof e?.code === 'string' ? e.code : ''
+  const errcode = typeof e?.errcode === 'number' ? e.errcode : null
+  const message = [
+    typeof e?.message === 'string' ? e.message : '',
+    typeof e?.errstr === 'string' ? e.errstr : '',
+  ].join(' ')
+
+  return (
+    errcode === 5 ||
+    errcode === 6 ||
+    code === 'SQLITE_BUSY' ||
+    code === 'SQLITE_LOCKED' ||
+    /\bSQLITE_(BUSY|LOCKED)\b|database (?:is |table is )?locked/i.test(message)
+  )
+}
+
 export function openDatabase(path: string): SqliteDatabase {
   if (!loadDriver() || DatabaseSync === null) {
     throw new Error(getSqliteLoadError())
   }
 
   const db = new DatabaseSync(path, { readOnly: true })
+  try {
+    db.exec?.('PRAGMA busy_timeout = 1000')
+  } catch {
+    // Best effort. Some Node sqlite builds may not expose exec on DatabaseSync.
+  }
 
   return {
     query<T extends Row = Row>(sql: string, params: unknown[] = []): T[] {

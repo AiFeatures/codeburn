@@ -10,8 +10,8 @@ private let minValidFXRate: Double = 0.0001
 private let maxValidFXRate: Double = 1_000_000
 private let fxFetchTimeoutSeconds: TimeInterval = 10
 
-@Observable
-final class CurrencyState: @unchecked Sendable {
+@MainActor @Observable
+final class CurrencyState: Sendable {
     static let shared = CurrencyState()
 
     var code: String = "USD"
@@ -31,7 +31,7 @@ final class CurrencyState: @unchecked Sendable {
         }
     }
 
-    static func symbolForCode(_ code: String) -> String {
+    nonisolated static func symbolForCode(_ code: String) -> String {
         // Some locales return "US$" for USD or "CA$" for CAD via NumberFormatter. Prefer the
         // plain glyph form everyone recognises.
         if let override = symbolOverrides[code] { return override }
@@ -42,7 +42,7 @@ final class CurrencyState: @unchecked Sendable {
         return formatter.currencySymbol ?? code
     }
 
-    private static let symbolOverrides: [String: String] = [
+    nonisolated private static let symbolOverrides: [String: String] = [
         "USD": "$",
         "CAD": "$",
         "AUD": "$",
@@ -60,7 +60,8 @@ final class CurrencyState: @unchecked Sendable {
         "CHF": "CHF",
         "SEK": "kr",
         "DKK": "kr",
-        "ZAR": "R"
+        "ZAR": "R",
+        "RON": "lei"
     ]
 }
 
@@ -205,5 +206,76 @@ enum CLICurrencyConfig {
         } catch {
             NSLog("CodeBurn: failed to persist currency config: \(error)")
         }
+    }
+}
+
+struct CodeburnCLIConfigStore {
+    let homeDirectory: String
+
+    init(homeDirectory: String = NSHomeDirectory()) {
+        self.homeDirectory = homeDirectory
+    }
+
+    private var configDir: String {
+        (homeDirectory as NSString).appendingPathComponent(".config/codeburn")
+    }
+    private var configPath: String {
+        (configDir as NSString).appendingPathComponent("config.json")
+    }
+    private var lockPath: String {
+        (configDir as NSString).appendingPathComponent(".config.lock")
+    }
+
+    func loadDevinAcuUsdRate() -> Double? {
+        guard
+            let data = try? SafeFile.read(from: configPath),
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let devin = json["devin"] as? [String: Any],
+            let rate = devin["acuUsdRate"] as? Double,
+            rate.isFinite,
+            rate > 0
+        else {
+            return nil
+        }
+        return rate
+    }
+
+    func persistDevinAcuUsdRate(_ rate: Double) {
+        guard rate.isFinite, rate > 0 else { return }
+        do {
+            try SafeFile.withExclusiveLock(at: lockPath) {
+                var existing: [String: Any] = [:]
+                if let data = try? SafeFile.read(from: configPath),
+                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    existing = parsed
+                }
+
+                var devin = existing["devin"] as? [String: Any] ?? [:]
+                devin["acuUsdRate"] = rate
+                existing["devin"] = devin
+
+                guard let data = try? JSONSerialization.data(
+                    withJSONObject: existing,
+                    options: [.prettyPrinted, .sortedKeys]
+                ) else {
+                    return
+                }
+                try SafeFile.write(data, to: configPath, mode: 0o600)
+            }
+        } catch {
+            NSLog("CodeBurn: failed to persist Devin ACU config: \(error)")
+        }
+    }
+}
+
+enum CLIDevinConfig {
+    private static let store = CodeburnCLIConfigStore()
+
+    static func loadAcuUsdRate() -> Double? {
+        store.loadDevinAcuUsdRate()
+    }
+
+    static func persistAcuUsdRate(_ rate: Double) {
+        store.persistDevinAcuUsdRate(rate)
     }
 }

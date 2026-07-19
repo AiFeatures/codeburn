@@ -337,6 +337,124 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     expect(call.deduplicationKey).toBe('opencode:sess-1:msg-2')
   })
 
+  it('normalizes opencode MCP tool names for shared MCP reporting', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+
+      insertMessage(db, 'msg-1', 'sess-1', 1700000000000, { role: 'user' })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', { type: 'text', text: 'look up the ClickUp task' })
+
+      insertMessage(db, 'msg-2', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-2', 'msg-2', 'sess-1', {
+        type: 'tool',
+        tool: 'clickup_clickup_get_task',
+        state: { status: 'completed', input: {} },
+      })
+      insertPart(db, 'part-3', 'msg-2', 'sess-1', {
+        type: 'tool',
+        tool: 'figma_get_file',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual([
+      'mcp__clickup__clickup_get_task',
+      'mcp__figma__get_file',
+    ])
+  })
+
+  it('preserves already-normalized MCP tool names', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: 'mcp__github__search_code',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['mcp__github__search_code'])
+  })
+
+  it('keeps extension tool names without a server prefix as regular tools', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: 'customtool',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['customtool'])
+  })
+
+  it('keeps malformed server-prefixed tool names as regular tools', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.05,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: '_missing_server',
+        state: { status: 'completed', input: {} },
+      })
+      insertPart(db, 'part-2', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: 'missing_',
+        state: { status: 'completed', input: {} },
+      })
+      insertPart(db, 'part-3', 'msg-1', 'sess-1', {
+        type: 'tool',
+        tool: '_',
+        state: { status: 'completed', input: {} },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual([
+      '_missing_server',
+      'missing_',
+      '_',
+    ])
+  })
+
   it('skips zero-token messages with zero cost', async () => {
     const dbPath = createTestDb(tmpDir)
     withTestDb(dbPath, (db) => {
@@ -349,6 +467,49 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
 
     const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
     expect(calls).toHaveLength(0)
+  })
+
+  it('keeps zero-usage assistant messages when router responses contain text', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-u1', 'sess-1', 1700000000000, { role: 'user' })
+      insertPart(db, 'part-u1', 'msg-u1', 'sess-1', { type: 'text', text: 'use the configured router' })
+      insertMessage(db, 'msg-a1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'edenai/router-model', cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-a1', 'msg-a1', 'sess-1', { type: 'text', text: 'router response text' })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('edenai/router-model')
+    expect(calls[0]!.inputTokens).toBe(0)
+    expect(calls[0]!.outputTokens).toBe(0)
+    expect(calls[0]!.costUSD).toBe(0)
+    expect(calls[0]!.userMessage).toBe('use the configured router')
+  })
+
+  it('keeps zero-usage assistant messages when router responses contain tool calls', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-a1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'edenai/router-model', cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-a1', 'msg-a1', 'sess-1', {
+        type: 'tool', tool: 'bash',
+        state: { status: 'completed', input: { command: 'npm test' } },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['Bash'])
+    expect(calls[0]!.bashCommands).toEqual(['npm'])
+    expect(calls[0]!.costUSD).toBe(0)
   })
 
   it('deduplicates messages across parses', async () => {
@@ -525,6 +686,103 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     expect(calls[1]!.userMessage).toBe('second question')
   })
 
+  it('attributes child and grandchild session calls back to the root session', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'root')
+      insertSession(db, 'child', { parentId: 'root' })
+      insertSession(db, 'grandchild', { parentId: 'child' })
+
+      insertMessage(db, 'msg-root-user', 'root', 1700000000000, { role: 'user' })
+      insertPart(db, 'part-root-user', 'msg-root-user', 'root', { type: 'text', text: 'root prompt' })
+      insertMessage(db, 'msg-root-assistant', 'root', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.01,
+        tokens: { input: 10, output: 20, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-root-tool', 'msg-root-assistant', 'root', {
+        type: 'tool',
+        tool: 'read',
+        state: { status: 'completed', input: {} },
+      })
+
+      insertMessage(db, 'msg-child-user', 'child', 1700000002000, { role: 'user' })
+      insertPart(db, 'part-child-user', 'msg-child-user', 'child', { type: 'text', text: 'child prompt' })
+      insertMessage(db, 'msg-child-assistant', 'child', 1700000003000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.02,
+        tokens: { input: 30, output: 40, reasoning: 5, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-child-tool', 'msg-child-assistant', 'child', {
+        type: 'tool',
+        tool: 'task',
+        state: { status: 'completed', input: {} },
+      })
+
+      insertMessage(db, 'msg-grand-user', 'grandchild', 1700000004000, { role: 'user' })
+      insertPart(db, 'part-grand-user', 'msg-grand-user', 'grandchild', { type: 'text', text: 'grandchild prompt' })
+      insertMessage(db, 'msg-grand-assistant', 'grandchild', 1700000005000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.03,
+        tokens: { input: 50, output: 60, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-grand-tool', 'msg-grand-assistant', 'grandchild', {
+        type: 'tool',
+        tool: 'bash',
+        state: { status: 'completed', input: { command: 'npm test' } },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'root')
+
+    expect(calls).toHaveLength(3)
+    expect(calls.map(call => call.sessionId)).toEqual(['root', 'root', 'root'])
+    expect(calls.map(call => call.deduplicationKey)).toEqual([
+      'opencode:root:msg-root-assistant',
+      'opencode:child:msg-child-assistant',
+      'opencode:grandchild:msg-grand-assistant',
+    ])
+    expect(calls.map(call => call.userMessage)).toEqual([
+      'root prompt',
+      'child prompt',
+      'grandchild prompt',
+    ])
+    expect(calls[0]!.tools).toEqual(['Read'])
+    expect(calls[1]!.tools).toEqual(['Agent'])
+    expect(calls[2]!.tools).toEqual(['Bash'])
+    expect(calls[2]!.bashCommands).toEqual(['npm'])
+  })
+
+  it('does not include archived child sessions in the root subtree', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'root')
+      insertSession(db, 'archived-child', { parentId: 'root', archived: 1700000002500 })
+
+      insertMessage(db, 'msg-root-assistant', 'root', 1700000001000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.01,
+        tokens: { input: 10, output: 20, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+
+      insertMessage(db, 'msg-child-assistant', 'archived-child', 1700000003000, {
+        role: 'assistant',
+        modelID: 'claude-opus-4-6',
+        cost: 0.02,
+        tokens: { input: 30, output: 40, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'root')
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.deduplicationKey).toBe('opencode:root:msg-root-assistant')
+  })
+
   it('joins multiple text parts in user messages', async () => {
     const dbPath = createTestDb(tmpDir)
     withTestDb(dbPath, (db) => {
@@ -555,4 +813,176 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
     expect(calls).toHaveLength(0)
   })
+
+  it('falls back to session-level tokens when per-message data yields nothing', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      db.exec(`ALTER TABLE session ADD COLUMN cost REAL`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_input INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_output INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN model_id TEXT`)
+
+      insertSession(db, 'sess-1')
+      db.prepare(`UPDATE session SET cost = 0.15, tokens_input = 5000, tokens_output = 2000, tokens_reasoning = 0, tokens_cache_read = 3000, tokens_cache_write = 1000, model_id = 'claude-sonnet-4-20250514' WHERE id = 'sess-1'`).run()
+
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'claude-sonnet-4-20250514',
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(5000)
+    expect(calls[0]!.outputTokens).toBe(2000)
+    expect(calls[0]!.cacheReadInputTokens).toBe(3000)
+    expect(calls[0]!.cacheCreationInputTokens).toBe(1000)
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+    expect(calls[0]!.model).toBe('claude-sonnet-4-20250514')
+    expect(calls[0]!.deduplicationKey).toBe('opencode:sess-1:session-level')
+  })
+
+  it('accepts role "model" as equivalent to "assistant"', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'model', modelID: 'gemini-2.5-pro', cost: 0.03,
+        tokens: { input: 100, output: 200, reasoning: 0, cache: { read: 0, write: 0 } },
+      } as any)
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('gemini-2.5-pro')
+  })
+
+  it('recognizes tool-call and tool_call part types', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'claude-opus-4-6',
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'tool-call', tool: 'bash',
+        state: { status: 'completed', input: { command: 'ls' } },
+      } as any)
+      insertPart(db, 'part-2', 'msg-1', 'sess-1', {
+        type: 'tool_call', tool: 'edit',
+        state: { status: 'completed', input: {} },
+      } as any)
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.tools).toEqual(['Bash', 'Edit'])
+  })
+
+  it('counts reasoning/file parts as activity even without text or tool parts', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'claude-opus-4-6',
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', {
+        type: 'reasoning',
+      } as any)
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.costUSD).toBe(0)
+    expect(calls[0]!.tools).toEqual([])
+  })
+})
+
+skipUnlessSqlite('opencode provider - env override discovery', () => {
+  // Builds a renamed/forked OpenCode-compatible DB at <root>/<subdir>/<prefix>.db
+  // (NOT under an 'opencode' subdir), mirroring a real fork like MiMoCode writing
+  // ~/.local/share/mimicode/mimicode.db with the same Drizzle schema.
+  function createForkDb(dbPath: string, sessionId: string): void {
+    const { DatabaseSync: Database } = require('node:sqlite')
+    const db = new Database(dbPath)
+    db.exec(`
+      CREATE TABLE session (
+        id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+        slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT NOT NULL,
+        version TEXT NOT NULL, time_created INTEGER, time_updated INTEGER,
+        time_archived INTEGER
+      )
+    `)
+    db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`)
+    db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, data TEXT NOT NULL)`)
+    db.prepare(`INSERT INTO session (id, project_id, slug, directory, title, version, time_created) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(sessionId, 'proj-1', 'slug-1', '/home/user/mimoproject', 'MiMo Project', '1.0', 1700000000000)
+    db.close()
+  }
+
+  it('discovers a renamed fork DB via OPENCODE_DATA_DIR + OPENCODE_DB_PREFIX', async () => {
+    const forkDir = join(tmpDir, 'mimocode')
+    await mkdir(forkDir, { recursive: true })
+    const dbPath = join(forkDir, 'mimicode.db')
+    createForkDb(dbPath, 'sess-mimo')
+
+    process.env.OPENCODE_DATA_DIR = forkDir
+    process.env.OPENCODE_DB_PREFIX = 'mimicode'
+
+    const provider = createOpenCodeProvider() // no arg — must read env
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.provider).toBe('opencode')
+    expect(sessions[0]!.path).toBe(`${dbPath}:sess-mimo`)
+  })
+
+  it('default discovery still finds opencode/opencode*.db via XDG_DATA_HOME when override is unset', async () => {
+    const dbPath = createTestDb(tmpDir) // creates tmpDir/opencode/opencode.db
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-open')
+    })
+
+    delete process.env.OPENCODE_DATA_DIR
+    delete process.env.OPENCODE_DB_PREFIX
+    process.env.XDG_DATA_HOME = tmpDir
+
+    const provider = createOpenCodeProvider() // no arg
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.path).toBe(`${dbPath}:sess-open`)
+  })
+
+  it('treats an empty OPENCODE_DB_PREFIX as unset, discovering opencode.db but not arbitrary other DBs', async () => {
+    // Regression for issue #617 follow-up: `OPENCODE_DB_PREFIX=''` (empty
+    // string, not undefined) must fall back to the default 'opencode' prefix.
+    // The default DB (matches 'opencode') carries a real session.
+    const dbPath = createTestDb(tmpDir) // tmpDir/opencode/opencode.db
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-open')
+    })
+
+    // Discriminating fixture: a sibling DB whose name does NOT start with
+    // 'opencode' but which has a VALID opencode schema + session row. Schema
+    // validation cannot exclude it (the schema is valid), so only the prefix
+    // filter can. With the empty-prefix bug, ''.startsWith('') is true for
+    // every filename, so random.db would be swept into discovery alongside
+    // opencode.db (length 2). The default 'opencode' prefix must filter it
+    // out (length 1).
+    createForkDb(join(tmpDir, 'opencode', 'random.db'), 'sess-random')
+
+    process.env.OPENCODE_DB_PREFIX = '' // empty string, NOT undefined
+    delete process.env.OPENCODE_DATA_DIR
+    process.env.XDG_DATA_HOME = tmpDir
+
+    const provider = createOpenCodeProvider() // no arg — reads env
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.path).toBe(`${dbPath}:sess-open`)
+  })
+
 })

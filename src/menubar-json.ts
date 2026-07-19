@@ -4,31 +4,60 @@
 export type PeriodData = {
   label: string
   cost: number
+  /// Counterfactual USD the same tokens would have cost on the paid
+  /// baseline configured for each local model. Stays `0` when no
+  /// `codeburn model-savings` mappings are active. Always shown
+  /// separately from `cost` so the two never get summed into a "real
+  /// spend" number by accident.
+  savingsUSD: number
+  /// Portion of `cost` priced from estimated tokens (see ParsedApiCall.isEstimated).
+  /// Display/metadata only; never summed into `cost`. Optional so PeriodData
+  /// producers predating the field keep compiling.
+  estimatedCostUSD?: number
   calls: number
   sessions: number
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
-  categories: Array<{ name: string; cost: number; turns: number; editTurns: number; oneShotTurns: number }>
-  models: Array<{ name: string; cost: number; calls: number }>
+  /// Total Codex credits consumed in the period (issues #408/#495). Optional so
+  /// non-menubar PeriodData producers don't have to compute it.
+  codexCredits?: number
+  categories: Array<{ name: string; cost: number; savingsUSD: number; turns: number; editTurns: number; oneShotTurns: number }>
+  models: Array<{ name: string; cost: number; savingsUSD: number; calls: number; estimatedCostUSD?: number }>
+  /// Models with usage in the period whose pricing lookup fails against the
+  /// current tables (#638): their calls contribute $0 to `cost`. Optional so
+  /// PeriodData producers that predate the field keep compiling.
+  unpricedModels?: Array<{ model: string; calls: number; tokens: number }>
+  projects?: Array<{ name: string; cost: number; savingsUSD: number; sessions: number; sessionDetails?: Array<{ cost: number; savingsUSD: number; calls: number; inputTokens: number; outputTokens: number; date: string; models: Array<{ name: string; cost: number; savingsUSD: number }> }> }>
+  modelEfficiency?: Array<{ name: string; costPerEdit: number | null; oneShotRate: number | null }>
+  topSessions?: Array<{ project: string; cost: number; savingsUSD: number; calls: number; date: string }>
 }
 
 export type ProviderCost = {
+  /// Internal provider id (e.g. `grok`, `cursor-agent`). Round-trips back to the
+  /// CLI as `--provider`, so it must stay the id, not the display name.
   name: string
+  displayName: string
   cost: number
 }
 import type { OptimizeResult } from './optimize.js'
+import { getCurrency } from './currency.js'
+import type { GranularHistory } from './granular-history.js'
 
 const TOP_ACTIVITIES_LIMIT = 20
 const TOP_MODELS_LIMIT = 20
 const TOP_FINDINGS_LIMIT = 10
 const HISTORY_DAYS_LIMIT = 365
 const SYNTHETIC_MODEL_NAME = '<synthetic>'
+const TOP_PROJECTS_LIMIT = 5
+const TOP_SESSIONS_LIMIT = 3
+const MODEL_EFFICIENCY_LIMIT = 5
 
 export type DailyModelBreakdown = {
   name: string
   cost: number
+  savingsUSD: number
   calls: number
   inputTokens: number
   outputTokens: number
@@ -37,12 +66,70 @@ export type DailyModelBreakdown = {
 export type DailyHistoryEntry = {
   date: string
   cost: number
+  savingsUSD: number
   calls: number
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
   topModels: DailyModelBreakdown[]
+}
+
+export type LocalModelSavings = {
+  totalUSD: number
+  calls: number
+  byModel: Array<{
+    name: string
+    calls: number
+    actualUSD: number
+    savingsUSD: number
+    baselineModel: string
+    inputTokens: number
+    outputTokens: number
+  }>
+  byProvider: Array<{ name: string; calls: number; savingsUSD: number }>
+}
+
+export type DeviceSummary = {
+  id: string
+  name: string
+  local: boolean
+  error?: string
+  cost: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreateTokens: number
+  cacheReadTokens: number
+  totalTokens: number
+}
+
+export type CombinedUsage = {
+  perDevice: DeviceSummary[]
+  combined: {
+    cost: number
+    calls: number
+    sessions: number
+    inputTokens: number
+    outputTokens: number
+    cacheCreateTokens: number
+    cacheReadTokens: number
+    totalTokens: number
+    deviceCount: number
+    reachableCount: number
+  }
+}
+
+export type ClaudeConfigOption = {
+  id: string
+  label: string
+  path: string
+}
+
+export type ClaudeConfigSelector = {
+  selectedId: string | null
+  options: ClaudeConfigOption[]
 }
 
 export type MenubarPayload = {
@@ -55,19 +142,107 @@ export type MenubarPayload = {
     oneShotRate: number | null
     inputTokens: number
     outputTokens: number
+    /// Period-scoped cache token totals. Kept separate from `history.daily`
+    /// (which is a 365-day backfill for the trend chart) so the web cache
+    /// cards read the same range as Cost/Calls/Tokens (issue #583).
+    cacheReadTokens: number
+    cacheWriteTokens: number
     cacheHitPercent: number
+    /// Codex credits consumed in the period; 0 when there is no Codex usage.
+    codexCredits: number
+    /// Portion of `cost` priced from estimated tokens (see ParsedApiCall.isEstimated).
+    /// Machine-readable signal that distinguishes guessed spend from metered spend;
+    /// display/metadata only, never summed into `cost`. Optional for compatibility
+    /// with payloads produced before the field existed.
+    estimatedCostUSD?: number
     topActivities: Array<{
       name: string
       cost: number
+      savingsUSD: number
       turns: number
       oneShotRate: number | null
     }>
     topModels: Array<{
       name: string
       cost: number
+      savingsUSD: number
+      savingsBaselineModel: string
       calls: number
+      /// Estimated portion of this model's `cost`; > 0 marks the row as priced
+      /// from estimated tokens. Optional for payload back-compat.
+      estimatedCostUSD?: number
     }>
+    /// See PeriodData.unpricedModels: usage priced at $0 for lack of pricing
+    /// data. Empty when every model in the period resolved a price. Optional
+    /// so payload producers that predate the field stay source-compatible.
+    unpricedModels?: Array<{ model: string; calls: number; tokens: number }>
+    /// Local-model savings rollup, distinct from the routing-waste /
+    /// optimize savings concepts which describe hypothetical optimization
+    /// opportunities. This block tracks counterfactual spend that was
+    /// already avoided because the user ran a local model mapped via
+    /// `codeburn model-savings`.
+    localModelSavings: LocalModelSavings
     providers: Record<string, number>
+    /// Provider identity alongside the `providers` map: `id` is the internal
+    /// provider name (round-trips as `--provider`), `label` the display name.
+    /// The `providers` map keys stay lowercased display names for compatibility.
+    providerDetails: Array<{ id: string; label: string; cost: number }>
+    topProjects: Array<{
+      name: string
+      cost: number
+      savingsUSD: number
+      sessions: number
+      avgCostPerSession: number
+      sessionDetails: Array<{
+        cost: number
+        savingsUSD: number
+        calls: number
+        inputTokens: number
+        outputTokens: number
+        date: string
+        models: Array<{ name: string; cost: number; savingsUSD: number }>
+      }>
+    }>
+    modelEfficiency: Array<{
+      name: string
+      costPerEdit: number | null
+      oneShotRate: number | null
+    }>
+    topSessions: Array<{
+      project: string
+      cost: number
+      savingsUSD: number
+      calls: number
+      date: string
+    }>
+    retryTax: {
+      totalUSD: number
+      retries: number
+      editTurns: number
+      byModel: Array<{
+        name: string
+        taxUSD: number
+        retries: number
+        retriesPerEdit: number | null
+      }>
+    }
+    routingWaste: {
+      totalSavingsUSD: number
+      baselineModel: string
+      baselineCostPerEdit: number
+      byModel: Array<{
+        name: string
+        costPerEdit: number
+        editTurns: number
+        actualUSD: number
+        counterfactualUSD: number
+        savingsUSD: number
+      }>
+    }
+    tools: Array<{ name: string; calls: number }>
+    skills: Array<{ name: string; turns: number; cost: number }>
+    subagents: Array<{ name: string; calls: number; cost: number }>
+    mcpServers: Array<{ name: string; calls: number }>
   }
   optimize: {
     findingCount: number
@@ -80,7 +255,16 @@ export type MenubarPayload = {
   }
   history: {
     daily: DailyHistoryEntry[]
+    /// Selected-period timeline for the local browser dashboard. Optional for
+    /// compatibility with older peers and non-dashboard payload producers.
+    timeline?: GranularHistory
   }
+  /// Active display currency. Payload cost values are raw USD; the client
+  /// multiplies by `rate` and prefixes `symbol` at display time. USD =
+  /// { code: 'USD', symbol: '$', rate: 1 }.
+  currency: { code: string; symbol: string; rate: number }
+  combined?: CombinedUsage
+  claudeConfigs?: ClaudeConfigSelector
 }
 
 function oneShotRateFor(editTurns: number, oneShotTurns: number): number | null {
@@ -109,6 +293,7 @@ function buildTopActivities(categories: PeriodData['categories']): MenubarPayloa
   return categories.slice(0, TOP_ACTIVITIES_LIMIT).map(cat => ({
     name: cat.name,
     cost: cat.cost,
+    savingsUSD: cat.savingsUSD,
     turns: cat.turns,
     oneShotRate: oneShotRateFor(cat.editTurns, cat.oneShotTurns),
   }))
@@ -118,7 +303,7 @@ function buildTopModels(models: PeriodData['models']): MenubarPayload['current']
   return models
     .filter(m => m.name !== SYNTHETIC_MODEL_NAME)
     .slice(0, TOP_MODELS_LIMIT)
-    .map(m => ({ name: m.name, cost: m.cost, calls: m.calls }))
+    .map(m => ({ name: m.name, cost: m.cost, calls: m.calls, savingsUSD: m.savingsUSD, savingsBaselineModel: '', estimatedCostUSD: m.estimatedCostUSD ?? 0 }))
 }
 
 function buildOptimize(optimize: OptimizeResult | null): MenubarPayload['optimize'] {
@@ -143,16 +328,73 @@ function buildProviders(providers: ProviderCost[]): Record<string, number> {
   const map: Record<string, number> = {}
   for (const p of providers) {
     if (p.cost < 0) continue
-    map[p.name.toLowerCase()] = p.cost
+    map[p.displayName.toLowerCase()] = p.cost
   }
   return map
 }
 
-function buildHistory(daily: DailyHistoryEntry[] | undefined): MenubarPayload['history'] {
-  if (!daily || daily.length === 0) return { daily: [] }
+function buildProviderDetails(providers: ProviderCost[]): MenubarPayload['current']['providerDetails'] {
+  return providers
+    .filter(p => p.cost >= 0)
+    .map(p => ({ id: p.name, label: p.displayName, cost: p.cost }))
+}
+
+function buildHistory(daily: DailyHistoryEntry[] | undefined, timeline?: GranularHistory): MenubarPayload['history'] {
+  if (!daily || daily.length === 0) return { daily: [], ...(timeline ? { timeline } : {}) }
   const sorted = [...daily].sort((a, b) => a.date.localeCompare(b.date))
   const trimmed = sorted.slice(-HISTORY_DAYS_LIMIT)
-  return { daily: trimmed }
+  return { daily: trimmed, ...(timeline ? { timeline } : {}) }
+}
+
+function buildTopProjects(projects: PeriodData['projects']): MenubarPayload['current']['topProjects'] {
+  return (projects ?? [])
+    .filter(p => p.cost > 0 || p.savingsUSD > 0)
+    .sort((a, b) => (b.cost + b.savingsUSD) - (a.cost + a.savingsUSD))
+    .slice(0, TOP_PROJECTS_LIMIT)
+    .map(p => ({
+      name: p.name,
+      cost: p.cost,
+      savingsUSD: p.savingsUSD,
+      sessions: p.sessions,
+      avgCostPerSession: p.sessions > 0 ? p.cost / p.sessions : 0,
+      sessionDetails: (p.sessionDetails ?? []).map(s => ({
+        cost: s.cost,
+        savingsUSD: s.savingsUSD,
+        calls: s.calls,
+        inputTokens: s.inputTokens,
+        outputTokens: s.outputTokens,
+        date: s.date,
+        models: s.models,
+      })),
+    }))
+}
+
+function buildModelEfficiency(models: PeriodData['modelEfficiency']): MenubarPayload['current']['modelEfficiency'] {
+  return (models ?? [])
+    .filter(m => m.costPerEdit !== null)
+    .sort((a, b) => (a.costPerEdit ?? Infinity) - (b.costPerEdit ?? Infinity))
+    .slice(0, MODEL_EFFICIENCY_LIMIT)
+    .map(m => ({ name: m.name, costPerEdit: m.costPerEdit, oneShotRate: m.oneShotRate }))
+}
+
+function buildTopSessions(sessions: PeriodData['topSessions']): MenubarPayload['current']['topSessions'] {
+  return (sessions ?? [])
+    .sort((a, b) => (b.cost + b.savingsUSD) - (a.cost + a.savingsUSD))
+    .slice(0, TOP_SESSIONS_LIMIT)
+    .map(s => ({ project: s.project, cost: s.cost, savingsUSD: s.savingsUSD, calls: s.calls, date: s.date }))
+}
+
+export type BreakdownArrays = {
+  tools?: MenubarPayload['current']['tools']
+  skills?: MenubarPayload['current']['skills']
+  subagents?: MenubarPayload['current']['subagents']
+  mcpServers?: MenubarPayload['current']['mcpServers']
+  /// Optional rollup of per-model and per-provider local-model savings.
+  /// Computed by the CLI from the parsed projects (we have raw token
+  /// + baseline info there, not in `PeriodData`). When omitted, the
+  /// menubar payload defaults to an empty savings block — keeping the
+  /// schema stable for consumers that don't care about local savings.
+  localModelSavings?: LocalModelSavings
 }
 
 export function buildMenubarPayload(
@@ -160,8 +402,13 @@ export function buildMenubarPayload(
   providers: ProviderCost[],
   optimize: OptimizeResult | null,
   dailyHistory?: DailyHistoryEntry[],
+  retryTax?: MenubarPayload['current']['retryTax'],
+  routingWaste?: MenubarPayload['current']['routingWaste'],
+  breakdowns?: BreakdownArrays,
+  claudeConfigs?: ClaudeConfigSelector,
+  granularHistory?: GranularHistory,
 ): MenubarPayload {
-  return {
+  const payload: MenubarPayload = {
     generated: new Date().toISOString(),
     current: {
       label: current.label,
@@ -171,12 +418,36 @@ export function buildMenubarPayload(
       oneShotRate: aggregateOneShotRate(current.categories),
       inputTokens: current.inputTokens,
       outputTokens: current.outputTokens,
+      cacheReadTokens: current.cacheReadTokens,
+      cacheWriteTokens: current.cacheWriteTokens,
       cacheHitPercent: cacheHitPercent(current.inputTokens, current.cacheReadTokens),
+      codexCredits: current.codexCredits ?? 0,
+      estimatedCostUSD: current.estimatedCostUSD ?? 0,
       topActivities: buildTopActivities(current.categories),
       topModels: buildTopModels(current.models),
+      unpricedModels: current.unpricedModels ?? [],
+      localModelSavings: breakdowns?.localModelSavings ?? { totalUSD: 0, calls: 0, byModel: [], byProvider: [] },
       providers: buildProviders(providers),
+      providerDetails: buildProviderDetails(providers),
+      topProjects: buildTopProjects(current.projects ?? []),
+      modelEfficiency: buildModelEfficiency(current.modelEfficiency ?? []),
+      topSessions: buildTopSessions(current.topSessions ?? []),
+      retryTax: retryTax ?? { totalUSD: 0, retries: 0, editTurns: 0, byModel: [] },
+      routingWaste: routingWaste ?? { totalSavingsUSD: 0, baselineModel: '', baselineCostPerEdit: 0, byModel: [] },
+      tools: breakdowns?.tools ?? [],
+      skills: breakdowns?.skills ?? [],
+      subagents: breakdowns?.subagents ?? [],
+      mcpServers: breakdowns?.mcpServers ?? [],
     },
     optimize: buildOptimize(optimize),
-    history: buildHistory(dailyHistory),
+    history: buildHistory(dailyHistory, granularHistory),
+    currency: (() => {
+      const c = getCurrency()
+      return { code: c.code, symbol: c.symbol, rate: c.rate }
+    })(),
   }
+  if (claudeConfigs && claudeConfigs.options.length > 1) {
+    payload.claudeConfigs = claudeConfigs
+  }
+  return payload
 }

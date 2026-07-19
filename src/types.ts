@@ -25,6 +25,33 @@ export type ApiUsage = {
   input_tokens: number
   output_tokens: number
   cache_creation_input_tokens?: number
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number
+    ephemeral_1h_input_tokens?: number
+  }
+  cache_read_input_tokens?: number
+  server_tool_use?: {
+    web_search_requests?: number
+    web_fetch_requests?: number
+  }
+  speed?: 'standard' | 'fast'
+  // Claude Code advisor tool (/advisor): per-turn sub-usage records. A record
+  // with type 'advisor_message' carries the advisor model's own tokens and is
+  // NOT included in the top-level totals above; type 'message' records mirror
+  // the main model and are already covered by the top-level totals.
+  iterations?: ApiUsageIteration[]
+}
+
+export type ApiUsageIteration = {
+  type?: string
+  model?: string
+  input_tokens?: number
+  output_tokens?: number
+  cache_creation_input_tokens?: number
+  cache_creation?: {
+    ephemeral_5m_input_tokens?: number
+    ephemeral_1h_input_tokens?: number
+  }
   cache_read_input_tokens?: number
   server_tool_use?: {
     web_search_requests?: number
@@ -72,12 +99,35 @@ export type ParsedApiCall = {
   costUSD: number
   tools: string[]
   mcpTools: string[]
+  skills: string[]
+  subagentTypes: string[]
   hasAgentSpawn: boolean
   hasPlanMode: boolean
   speed: 'standard' | 'fast'
   timestamp: string
   bashCommands: string[]
   deduplicationKey: string
+  cacheCreationOneHourTokens?: number
+  toolSequence?: ToolCall[][]
+  /// When set, `costUSD` is the actual local call (forced to 0) and
+  /// `savingsUSD` is the counterfactual cost the same tokens would have
+  /// incurred against `savingsBaselineModel`. Set by the savings
+  /// normalization step in `src/parser.ts`.
+  savingsUSD?: number
+  savingsBaselineModel?: string
+  isLocalSavings?: boolean
+  /// True when this call's `costUSD` is priced from estimated token counts or
+  /// otherwise synthesized by the provider (e.g. Warp/Kiro/Cursor derive tokens
+  /// from content length). Carried from `ParsedProviderCall.costIsEstimated`
+  /// across the parser/cache boundary. Aggregates roll the estimated portion up
+  /// as `estimatedCostUSD`; it is display/metadata only and never changes totals.
+  isEstimated?: boolean
+}
+
+export type ToolCall = {
+  tool: string
+  file?: string
+  command?: string
 }
 
 export type TaskCategory =
@@ -97,27 +147,54 @@ export type TaskCategory =
 
 export type ClassifiedTurn = ParsedTurn & {
   category: TaskCategory
+  subCategory?: string
   retries: number
   hasEdits: boolean
+}
+
+export type SessionSourceMetadata = {
+  id: string
+  label: string
+  path: string
+  kind: 'claude-config' | 'claude-desktop'
 }
 
 export type SessionSummary = {
   sessionId: string
   project: string
+  source?: SessionSourceMetadata
+  // Claude Code only: agent type of a subagent transcript session
+  // (`workflow-subagent`, `Explore`, `general-purpose`, …); undefined for
+  // ordinary sessions. Drives the Claude-scoped agent-type breakdown.
+  agentType?: string
   firstTimestamp: string
   lastTimestamp: string
   totalCostUSD: number
+  totalSavingsUSD: number
+  /// Portion of `totalCostUSD` contributed by calls whose price is estimated
+  /// (see `ParsedApiCall.isEstimated`). Optional so SessionSummary fixtures and
+  /// producers predating the field keep compiling; the parser always sets it.
+  totalEstimatedCostUSD?: number
   totalInputTokens: number
   totalOutputTokens: number
+  totalReasoningTokens: number
   totalCacheReadTokens: number
   totalCacheWriteTokens: number
   apiCalls: number
   turns: ClassifiedTurn[]
-  modelBreakdown: Record<string, { calls: number; costUSD: number; tokens: TokenUsage }>
+  modelBreakdown: Record<string, { calls: number; costUSD: number; tokens: TokenUsage; savingsUSD: number; estimatedCostUSD?: number }>
   toolBreakdown: Record<string, { calls: number }>
   mcpBreakdown: Record<string, { calls: number }>
   bashBreakdown: Record<string, { calls: number }>
-  categoryBreakdown: Record<TaskCategory, { turns: number; costUSD: number; retries: number; editTurns: number; oneShotTurns: number }>
+  categoryBreakdown: Record<TaskCategory, { turns: number; costUSD: number; savingsUSD: number; retries: number; editTurns: number; oneShotTurns: number }>
+  skillBreakdown: Record<string, { turns: number; costUSD: number; savingsUSD: number; editTurns: number; oneShotTurns: number }>
+  subagentBreakdown: Record<string, { calls: number; costUSD: number; savingsUSD: number }>
+  // Observed MCP tools available in this session, captured from
+  // `attachment.deferred_tools_delta.addedNames` entries. Union across all
+  // turns. Each name is a fully-qualified `mcp__<server>__<tool>` identifier.
+  // Built-in tools (Bash, Edit, etc.) are filtered out. Provider-agnostic field;
+  // currently populated only by the Claude parser.
+  mcpInventory?: string[]
 }
 
 export type ProjectSummary = {
@@ -125,7 +202,17 @@ export type ProjectSummary = {
   projectPath: string
   sessions: SessionSummary[]
   totalCostUSD: number
+  totalSavingsUSD: number
+  /// Portion of `totalCostUSD` priced from estimated tokens (see
+  /// `SessionSummary.totalEstimatedCostUSD`). Optional for the same reason.
+  totalEstimatedCostUSD?: number
   totalApiCalls: number
+  // Portion of `totalCostUSD` served through a subscription-backed proxy
+  // (config `proxyPaths`). `totalCostUSD` is left at the full API rate (the
+  // billable / would-be figure); this is the subscription-covered amount, so
+  // net out-of-pocket for the project is `totalCostUSD - totalProxiedCostUSD`.
+  // 0 when the project is not under a configured proxy path.
+  totalProxiedCostUSD: number
 }
 
 export type DateRange = {
