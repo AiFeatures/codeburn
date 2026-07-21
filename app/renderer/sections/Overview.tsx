@@ -12,7 +12,7 @@ import { motionEnabled, useBarGrowIn } from '../lib/motion'
 import { type Polled, usePolled } from '../hooks/usePolled'
 import { formatCompact, formatUsd } from '../lib/format'
 import { codeburn } from '../lib/ipc'
-import { contiguousDailyWindow, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
+import { contiguousDailyWindow, dataStartKey, formatChartDate, localDateKey, sliceDailyToPeriod, sliceDailyToRange } from '../lib/period'
 import type {
   ActReportJson,
   DailyHistoryEntry,
@@ -124,6 +124,88 @@ function CostPerOutcome({ outcome }: { outcome: Polled<YieldJsonReport> }) {
       <div className="ov-panel-body">
         {body}
         <p className="ov-widget-caption">Git-correlated. Reverted/abandoned = spend that didn't ship.</p>
+      </div>
+    </div>
+  )
+}
+
+// Coaching-note thresholds, mirrored from the CLI so the card and the CLI never
+// disagree (src/workflow-insights.ts buildCoachingNotes).
+const WORKFLOW_CORRECTION_RATE = 0.15
+const WORKFLOW_CORRECTION_COUNT = 3
+const WORKFLOW_CHURN_SESSIONS = 3
+const WORKFLOW_TTFE_SLOW_MS = 5 * 60 * 1000
+
+/** Median time to first edit: `<60s → Ns`, else `Nm` (src/workflow-insights.ts formatDurationShort). */
+function formatWorkflowDuration(ms: number): string {
+  if (ms >= 60_000) return `${Math.round(ms / 60_000)}m`
+  return `${Math.round(ms / 1000)}s`
+}
+
+type WorkflowRollup = NonNullable<MenubarPayload['current']['workflow']>
+type ReworkedFile = { path: string; sessions: number; edits: number }
+
+/**
+ * One coaching line derived with the CLI's thresholds and dry copy voice
+ * (src/workflow-insights.ts buildCoachingNotes): corrections, then file churn,
+ * then time-to-first-edit; the first that fires. Null when none clears its bar.
+ */
+function workflowCoachingNote(workflow: WorkflowRollup, topReworked?: ReworkedFile): string | null {
+  const { correctionRate, corrections, medianTimeToFirstEditMs } = workflow
+  if (correctionRate !== null && correctionRate >= WORKFLOW_CORRECTION_RATE && corrections >= WORKFLOW_CORRECTION_COUNT) {
+    return `You corrected the assistant on ${Math.round(correctionRate * 100)}% of prompts (${corrections} times). State the requirements in the first message to cut the back and forth.`
+  }
+  if (topReworked && topReworked.sessions >= WORKFLOW_CHURN_SESSIONS) {
+    return `${topReworked.path} was reworked across ${topReworked.sessions} sessions (${topReworked.edits} edits). A focused pass on it may cost less than the repeated churn.`
+  }
+  if (medianTimeToFirstEditMs !== null && medianTimeToFirstEditMs >= WORKFLOW_TTFE_SLOW_MS) {
+    return `Median time to first edit is ${formatWorkflowDuration(medianTimeToFirstEditMs)}. Point the assistant at the target file to cut the exploration before it starts editing.`
+  }
+  return null
+}
+
+function WorkflowCard({ current }: { current: MenubarPayload['current'] }) {
+  const workflow = current.workflow
+  const topReworked = current.topReworkedFiles?.[0]
+  // Hide when there is no real signal: never show a card of zeros.
+  const hasSignal = !!workflow && (
+    workflow.correctionRate !== null ||
+    workflow.medianTimeToFirstEditMs !== null ||
+    workflow.corrections > 0 ||
+    !!topReworked
+  )
+  if (!workflow || !hasSignal) return null
+
+  const coverage = current.pricingCoverage
+  const showCoverage = typeof coverage === 'number' && coverage < 1
+  const note = workflowCoachingNote(workflow, topReworked)
+  const { correctionRate, corrections, medianTimeToFirstEditMs } = workflow
+
+  return (
+    <div className="ov-card ov-panel ov-workflow-widget">
+      <div className="ov-panel-head">
+        <h3>Workflow</h3>
+        {showCoverage && <span className="ov-priced-chip">{Math.min(99, Math.round(coverage * 100))}% priced</span>}
+      </div>
+      <div className="ov-panel-body">
+        <div className="ov-outcome-metrics">
+          <div>
+            <span>Correction rate</span>
+            <strong>{correctionRate === null ? '—' : `${Math.round(correctionRate * 100)}%`}</strong>
+            {correctionRate !== null && <span>{corrections} {corrections === 1 ? 'correction' : 'corrections'}</span>}
+          </div>
+          <div>
+            <span>Time to first edit</span>
+            <strong>{medianTimeToFirstEditMs === null ? '—' : formatWorkflowDuration(medianTimeToFirstEditMs)}</strong>
+            <span>median</span>
+          </div>
+        </div>
+        {topReworked && (
+          <div className="ov-workflow-rework">
+            Top rework: <strong>{topReworked.path}</strong> · {topReworked.sessions} {topReworked.sessions === 1 ? 'session' : 'sessions'} · {topReworked.edits} {topReworked.edits === 1 ? 'edit' : 'edits'}
+          </div>
+        )}
+        <p className="ov-widget-caption">{note ?? 'Corrections, first-edit latency, and file churn across your sessions.'}</p>
       </div>
     </div>
   )
@@ -443,7 +525,8 @@ function ModelsTable({ models }: { models: AggregatedModel[] }) {
   )
 }
 
-function DailyChart({ daily, animateKey = '' }: { daily: DailyHistoryEntry[]; animateKey?: string }) {
+function DailyChart({ daily, dataStart = null, animateKey = '' }: { daily: DailyHistoryEntry[]; dataStart?: string | null; animateKey?: string }) {
+  const isNoData = (day: DailyHistoryEntry) => dataStart !== null && day.date < dataStart
   const max = Math.max(...daily.map(day => day.cost), 0)
   const peakIndex = daily.reduce((peak, day, index) => day.cost > (daily[peak]?.cost ?? -1) ? index : peak, 0)
   const peak = daily[peakIndex]
@@ -477,22 +560,26 @@ function DailyChart({ daily, animateKey = '' }: { daily: DailyHistoryEntry[]; an
   return (
     <>
       <div className="chart" ref={chartRef}>
-        {daily.map((day, index) => (
-          <button
-            type="button"
-            aria-label={`${day.date}: ${formatUsd(day.cost)}`}
-            className={`col${index === peakIndex ? ' hi' : ''}`}
-            key={day.date}
-            style={{ height: `${max > 0 ? Math.max(2, day.cost / max * 100) : 2}%` }}
-            data-date={day.date}
-            data-cost={day.cost}
-            data-calls={day.calls}
-            data-led={day.topModels[0]?.name ?? ''}
-            onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
-            onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
-            onMouseLeave={() => setTip(null)}
-          />
-        ))}
+        {daily.map((day, index) => {
+          const noData = isNoData(day)
+          return (
+            <button
+              type="button"
+              aria-label={`${day.date}: ${noData ? 'no data recorded' : formatUsd(day.cost)}`}
+              className={`col${index === peakIndex && !noData ? ' hi' : ''}${noData ? ' nodata' : ''}`}
+              key={day.date}
+              style={{ height: `${max > 0 ? Math.max(2, day.cost / max * 100) : 2}%` }}
+              data-date={day.date}
+              data-cost={day.cost}
+              data-calls={day.calls}
+              data-led={day.topModels[0]?.name ?? ''}
+              data-nodata={noData ? 'true' : 'false'}
+              onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
+              onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
+              onMouseLeave={() => setTip(null)}
+            />
+          )
+        })}
       </div>
       <div className="ov-xax">
         {ticks.map(day => {
@@ -513,8 +600,14 @@ function DailyChart({ daily, animateKey = '' }: { daily: DailyHistoryEntry[]; an
           role="tooltip"
         >
           <div className="chart-tip-d">{formatChartDate(tip.day.date)}</div>
-          <div className="chart-tip-v">{formatUsd(tip.day.cost)}</div>
-          <div className="chart-tip-s">{tip.day.calls} calls · {tip.day.topModels[0]?.name ?? 'No model'} led</div>
+          {isNoData(tip.day) ? (
+            <div className="chart-tip-s">No data recorded</div>
+          ) : (
+            <>
+              <div className="chart-tip-v">{formatUsd(tip.day.cost)}</div>
+              <div className="chart-tip-s">{tip.day.calls} calls · {tip.day.topModels[0]?.name ?? 'No model'} led</div>
+            </>
+          )}
         </div>,
         document.body,
       )}
@@ -645,8 +738,10 @@ export function OverviewContent({
 
       <div className="ov-card ov-panel ov-chart-widget">
         <div className="ov-panel-head"><h3>Daily spend</h3><span className="r">{topModel ? `Biggest driver: ${topModel.name}` : 'No model driver yet'}</span></div>
-        <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} animateKey={animateKey} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
+        <div className="ov-panel-body">{data.history.daily.length ? <DailyChart daily={chartDaily} dataStart={dataStartKey(data.history.daily)} animateKey={animateKey} /> : <EmptyNote>No spend yet.</EmptyNote>}</div>
       </div>
+
+      <WorkflowCard current={data.current} />
 
       <div className="ov-insight-band">
         <div className="ov-coach">

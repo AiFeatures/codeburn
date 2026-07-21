@@ -39,6 +39,40 @@ function makeCall(timestamp: string, costUSD: number, model = 'Opus 4.7', provid
   }
 }
 
+function makeSingleTurnProject(
+  assistantCalls: ReturnType<typeof makeCall>[],
+  { retries = 0, hasEdits = true }: { retries?: number; hasEdits?: boolean } = {},
+): ProjectSummary {
+  const timestamp = assistantCalls[0]!.timestamp
+  const totalCostUSD = assistantCalls.reduce((sum, call) => sum + call.costUSD, 0)
+  return makeProject({
+    sessions: [{
+      sessionId: 'multi-provider-session',
+      project: 'p',
+      firstTimestamp: timestamp,
+      lastTimestamp: assistantCalls.at(-1)!.timestamp,
+      totalCostUSD,
+      totalInputTokens: assistantCalls.reduce((sum, call) => sum + call.usage.inputTokens, 0),
+      totalOutputTokens: assistantCalls.reduce((sum, call) => sum + call.usage.outputTokens, 0),
+      totalCacheReadTokens: assistantCalls.reduce((sum, call) => sum + call.usage.cacheReadInputTokens, 0),
+      totalCacheWriteTokens: assistantCalls.reduce((sum, call) => sum + call.usage.cacheCreationInputTokens, 0),
+      apiCalls: assistantCalls.length,
+      turns: [{
+        userMessage: 'compare providers',
+        timestamp,
+        sessionId: 'multi-provider-session',
+        category: 'coding',
+        retries,
+        hasEdits,
+        assistantCalls,
+      }],
+      modelBreakdown: {}, toolBreakdown: {}, mcpBreakdown: {}, bashBreakdown: {},
+      categoryBreakdown: {} as never,
+      skillBreakdown: {} as never,
+    }],
+  })
+}
+
 describe('aggregateProjectsIntoDays', () => {
   it('buckets a whole turn (all its calls) on the turn user-message date', () => {
     // Turn-anchored bucketing: a turn whose calls straddle midnight lands wholly
@@ -134,6 +168,48 @@ describe('aggregateProjectsIntoDays', () => {
     })
   })
 
+  it('skips a timestamped empty-call turn without throwing or counting it at day level', () => {
+    const projects: ProjectSummary[] = [
+      makeProject({
+        sessions: [{
+          sessionId: 'empty-call-turn',
+          project: 'p',
+          firstTimestamp: '2026-04-09T10:00:00',
+          lastTimestamp: '2026-04-09T10:00:00',
+          totalCostUSD: 0,
+          totalInputTokens: 0,
+          totalOutputTokens: 0,
+          totalCacheReadTokens: 0,
+          totalCacheWriteTokens: 0,
+          apiCalls: 0,
+          turns: [{
+            userMessage: 'no assistant response',
+            timestamp: '2026-04-09T10:00:00',
+            sessionId: 'empty-call-turn',
+            category: 'coding',
+            retries: 0,
+            hasEdits: true,
+            assistantCalls: [],
+          }],
+          modelBreakdown: {},
+          toolBreakdown: {},
+          mcpBreakdown: {},
+          bashBreakdown: {},
+          categoryBreakdown: {} as never,
+          skillBreakdown: {} as never,
+        }],
+      }),
+    ]
+
+    let days: ReturnType<typeof aggregateProjectsIntoDays> = []
+    expect(() => { days = aggregateProjectsIntoDays(projects) }).not.toThrow()
+
+    expect(days).toHaveLength(1)
+    expect(days[0]).toMatchObject({ cost: 0, calls: 0, editTurns: 0, oneShotTurns: 0 })
+    expect(days[0]!.categories).toEqual({})
+    expect(days[0]!.providers).toEqual({})
+  })
+
   it('counts a session under its firstTimestamp date', () => {
     const projects: ProjectSummary[] = [
       makeProject({
@@ -197,8 +273,74 @@ describe('aggregateProjectsIntoDays', () => {
       inputTokens: 100, outputTokens: 200,
       cacheReadTokens: 50, cacheWriteTokens: 0,
     })
-    expect(day.providers['claude']).toEqual({ calls: 1, cost: 7, savingsUSD: 0 })
-    expect(day.providers['codex']).toEqual({ calls: 1, cost: 3, savingsUSD: 0 })
+    // Provider slices carry the full per-provider breakdown (v14) so that a
+    // carried-forward slice stays exact across daily-cache rebuilds.
+    expect(day.providers['claude']).toMatchObject({
+      calls: 1, cost: 7, savingsUSD: 0,
+      inputTokens: 100, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 0,
+    })
+    expect(day.providers['claude']!.models).toEqual({
+      'Opus 4.7': { calls: 1, cost: 7, savingsUSD: 0, inputTokens: 100, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 0 },
+    })
+    expect(day.providers['codex']).toMatchObject({
+      calls: 1, cost: 3, savingsUSD: 0,
+      inputTokens: 100, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 0,
+    })
+    expect(day.providers['codex']!.models).toEqual({
+      'gpt-5': { calls: 1, cost: 3, savingsUSD: 0, inputTokens: 100, outputTokens: 200, cacheReadTokens: 50, cacheWriteTokens: 0 },
+    })
+    // Slice categories hold only that provider's share of cost; the primary
+    // provider (the first call in this tie) owns the turn count.
+    expect(day.providers['claude']!.categories!['coding']).toMatchObject({ turns: 1, cost: 7 })
+    expect(day.providers['codex']!.categories!['coding']).toMatchObject({ turns: 0, cost: 3 })
+    // Day-level category still counts the whole turn once.
+    expect(day.categories['coding']).toMatchObject({ turns: 1, cost: 10 })
+    // Per-project rollup at day level and inside each provider slice; path is
+    // stored so display layers can derive a friendly name once sessions expire.
+    expect(day.projects!['p']).toEqual({ cost: 10, calls: 2, savingsUSD: 0, sessions: 1, path: '/p' })
+    expect(day.providers['claude']!.projects!['p']).toMatchObject({ cost: 7, calls: 1 })
+    expect(day.providers['codex']!.projects!['p']).toMatchObject({ cost: 3, calls: 1 })
+  })
+
+  it('attributes a multi-provider turn to the majority provider exactly once', () => {
+    const timestamp = '2026-04-10T10:00:00'
+    const projects = [makeSingleTurnProject([
+      makeCall(timestamp, 2, 'gpt-5', 'codex'),
+      makeCall(timestamp, 3, 'Opus 4.7', 'claude'),
+      makeCall(timestamp, 4, 'Opus 4.7', 'claude'),
+    ])]
+
+    const day = aggregateProjectsIntoDays(projects)[0]!
+    const slices = Object.values(day.providers)
+
+    expect(day.editTurns).toBe(1)
+    expect(day.oneShotTurns).toBe(1)
+    expect(day.categories['coding']!.turns).toBe(1)
+    expect(slices.reduce((sum, provider) => sum + (provider.editTurns ?? 0), 0)).toBe(1)
+    expect(slices.reduce((sum, provider) => sum + (provider.oneShotTurns ?? 0), 0)).toBe(1)
+    expect(slices.reduce((sum, provider) => sum + (provider.categories?.['coding']?.turns ?? 0), 0)).toBe(1)
+    expect(day.providers['claude']).toMatchObject({ cost: 7, editTurns: 1, oneShotTurns: 1 })
+    expect(day.providers['claude']!.categories!['coding']).toMatchObject({ turns: 1, cost: 7, editTurns: 1, oneShotTurns: 1 })
+    expect(day.providers['codex']).toMatchObject({ cost: 2, editTurns: 0, oneShotTurns: 0 })
+    expect(day.providers['codex']!.categories!['coding']).toMatchObject({ turns: 0, cost: 2, editTurns: 0, oneShotTurns: 0 })
+  })
+
+  it("breaks a provider call-count tie with the turn's first call", () => {
+    const timestamp = '2026-04-10T10:00:00'
+    const projects = [makeSingleTurnProject([
+      makeCall(timestamp, 2, 'gpt-5', 'codex'),
+      makeCall(timestamp, 7, 'Opus 4.7', 'claude'),
+    ])]
+
+    const day = aggregateProjectsIntoDays(projects)[0]!
+    const slices = Object.values(day.providers)
+
+    expect(slices.reduce((sum, provider) => sum + (provider.editTurns ?? 0), 0)).toBe(1)
+    expect(slices.reduce((sum, provider) => sum + (provider.categories?.['coding']?.turns ?? 0), 0)).toBe(1)
+    expect(day.providers['codex']).toMatchObject({ editTurns: 1, oneShotTurns: 1 })
+    expect(day.providers['codex']!.categories!['coding']).toMatchObject({ turns: 1, editTurns: 1, oneShotTurns: 1 })
+    expect(day.providers['claude']).toMatchObject({ editTurns: 0, oneShotTurns: 0 })
+    expect(day.providers['claude']!.categories!['coding']).toMatchObject({ turns: 0, editTurns: 0, oneShotTurns: 0 })
   })
 })
 

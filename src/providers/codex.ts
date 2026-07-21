@@ -76,6 +76,21 @@ function mcpToolFromShellCommand(command: unknown): string | null {
   return `mcp__${server}__${tool}`
 }
 
+// Count added/removed lines from a Codex `patch_apply_end` change's
+// `unified_diff`. A leading '+' is an added line and '-' a removed line; the
+// '+++'/'---' file headers and '@@' hunk headers are excluded. Numbers only —
+// the diff text is never stored. Rich-session-capture (capture-only).
+export function countUnifiedDiffLoc(diff: unknown): { added: number; removed: number } {
+  let added = 0
+  let removed = 0
+  if (typeof diff !== 'string') return { added, removed }
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('+') && !line.startsWith('+++')) added++
+    else if (line.startsWith('-') && !line.startsWith('---')) removed++
+  }
+  return { added, removed }
+}
+
 type CodexEntry = {
   type: string
   timestamp?: string
@@ -367,6 +382,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
       let sessionModel: string | undefined
       let sessionId = ''
+      let sessionCwd: string | undefined
       let forkedFromId = ''
       let forkCutoff = ''
       // Null sentinel rather than `0` so the FIRST event is never confused
@@ -384,6 +400,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       let pendingToolSequence: ToolCall[][] = []
       let pendingUserMessage = ''
       let pendingOutputChars = 0
+      // Rich-session-capture: edit LOC deltas and failed-patch count accumulated
+      // across a turn's patch_apply_end events, flushed onto the turn's call.
+      let pendingLocAdded = 0
+      let pendingLocRemoved = 0
+      let pendingEditFailed = 0
       let estCounter = 0
       let turnCounter = 0
       let currentTurnId = `${sessionId}:t0`
@@ -402,6 +423,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         if (entry.type === 'session_meta') {
           sessionId = entry.payload?.session_id ?? basename(source.path, '.jsonl')
+          sessionCwd = entry.payload?.cwd ?? sessionCwd
           forkedFromId = entry.payload?.forked_from_id ?? ''
           if (forkedFromId && entry.timestamp) {
             forkCutoff = new Date(new Date(entry.timestamp).getTime() + 5000).toISOString()
@@ -445,14 +467,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           pendingTools.push('Edit')
           const p = entry.payload as Record<string, unknown>
           const changes = p['changes']
-          const filePaths = typeof changes === 'object' && changes ? Object.keys(changes as object) : []
+          const changesObj = typeof changes === 'object' && changes ? changes as Record<string, unknown> : {}
+          const filePaths = Object.keys(changesObj)
           if (filePaths.length > 0) {
             for (const fp of filePaths) {
               pendingToolSequence.push([{ tool: 'Edit', file: fp }])
+              const diff = (changesObj[fp] as Record<string, unknown> | undefined)?.['unified_diff']
+              const loc = countUnifiedDiffLoc(diff)
+              pendingLocAdded += loc.added
+              pendingLocRemoved += loc.removed
             }
           } else {
             pendingToolSequence.push([{ tool: 'Edit' }])
           }
+          // Only an explicit failure counts; a missing `success` is treated as ok.
+          if (p['success'] === false) pendingEditFailed++
           continue
         }
 
@@ -508,7 +537,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             const timestamp = entry.timestamp ?? ''
             const dedupKey = `codex:${sessionId}:${timestamp}:est${estCounter++}`
 
-            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingUserMessage = ''; pendingOutputChars = 0; continue }
+            if (seenKeys.has(dedupKey)) { pendingTools = []; pendingToolSequence = []; pendingUserMessage = ''; pendingOutputChars = 0; pendingLocAdded = 0; pendingLocRemoved = 0; pendingEditFailed = 0; continue }
             seenKeys.add(dedupKey)
 
             const costUSD = calculateCost(model, estInput, estOutput, 0, 0, 0)
@@ -534,12 +563,19 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
               toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
               userMessage: pendingUserMessage,
               sessionId,
+              ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
+              ...(pendingLocAdded ? { locAdded: pendingLocAdded } : {}),
+              ...(pendingLocRemoved ? { locRemoved: pendingLocRemoved } : {}),
+              ...(pendingEditFailed ? { editFailed: pendingEditFailed } : {}),
             })
 
             pendingTools = []
             pendingToolSequence = []
             pendingUserMessage = ''
             pendingOutputChars = 0
+            pendingLocAdded = 0
+            pendingLocRemoved = 0
+            pendingEditFailed = 0
             continue
           }
 
@@ -644,12 +680,19 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
             userMessage: pendingUserMessage,
             sessionId,
+            ...(sessionCwd ? { projectPath: sessionCwd, workingDirectory: sessionCwd } : {}),
+            ...(pendingLocAdded ? { locAdded: pendingLocAdded } : {}),
+            ...(pendingLocRemoved ? { locRemoved: pendingLocRemoved } : {}),
+            ...(pendingEditFailed ? { editFailed: pendingEditFailed } : {}),
           })
 
           pendingTools = []
           pendingToolSequence = []
           pendingUserMessage = ''
           pendingOutputChars = 0
+          pendingLocAdded = 0
+          pendingLocRemoved = 0
+          pendingEditFailed = 0
         }
       }
 

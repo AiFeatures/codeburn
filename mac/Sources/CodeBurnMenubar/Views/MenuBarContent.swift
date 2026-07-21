@@ -36,6 +36,7 @@ struct MenuBarContent: View {
                             ActivitySection()
                             Divider().opacity(0.5)
                             ModelsSection()
+                            WorkflowSection()
                             Divider().opacity(0.5)
                             ToolingSection()
                             Divider().opacity(0.5)
@@ -389,7 +390,7 @@ private struct Header: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if updateChecker.updateAvailable || updateChecker.updateError != nil {
+                if updateChecker.updateAvailable || updateChecker.cliUpdateAvailable || updateChecker.updateError != nil {
                     UpdateBadge()
                 }
                 AccentPicker()
@@ -519,8 +520,8 @@ private struct UpdateBadge: View {
 
     var body: some View {
         Button {
-            if updateChecker.updateAvailable {
-                updateChecker.performUpdate()
+            if updateChecker.updateAvailable || updateChecker.cliUpdateAvailable {
+                updateChecker.performFullUpdate()
             } else {
                 Task { await updateChecker.check() }
             }
@@ -547,7 +548,7 @@ private struct UpdateBadge: View {
         .tint(Theme.brandAccent)
         .controlSize(.mini)
         .disabled(updateChecker.isUpdating)
-        .help(updateChecker.updateError ?? "Install the latest menubar build")
+        .help(updateChecker.updateError ?? "Update the CLI and menubar to the latest release")
     }
 }
 
@@ -583,6 +584,17 @@ struct CLIUpdateBanner: View {
                 Text("CLI \(updateChecker.latestCliVersion ?? "") available")
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.primary)
+
+                Button {
+                    updateChecker.performFullUpdate()
+                } label: {
+                    Text(updateChecker.isUpdating ? "Updating..." : "Update now")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.blue)
+                }
+                .buttonStyle(.plain)
+                .disabled(updateChecker.isUpdating)
+                .help("Update the CLI (and the menubar if one is available) automatically")
 
                 Button {
                     NSPasteboard.general.clearContents()
