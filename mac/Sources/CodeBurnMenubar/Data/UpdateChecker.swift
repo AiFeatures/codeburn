@@ -6,8 +6,14 @@ private let releasesAPI = "https://api.github.com/repos/getagentseal/codeburn/re
 // installer reads the same file, so the pill and the install agree on "latest".
 private let menubarFeedURL = "https://github.com/getagentseal/codeburn/releases/download/update-feeds/menubar-latest.json"
 private let menubarAssetURLPrefix = "https://github.com/getagentseal/codeburn/releases/download/mac-v"
-private let checkIntervalSeconds: TimeInterval = 2 * 24 * 60 * 60
+// Six hours puts a release on the pill within a working day for four cheap checks a day
+// (one CLI spawn plus small feed/registry reads), well under GitHub's unauthenticated
+// limit on the legacy path. A changed app or CLI version re-checks at once.
+private let checkIntervalSeconds: TimeInterval = 6 * 60 * 60
+private let pollIntervalSeconds: TimeInterval = 60 * 60
 private let lastCheckKey = "UpdateChecker.lastCheckDate"
+private let lastCheckStampKey = "UpdateChecker.lastCheckStamp"
+private let cachedEngineResultKey = "UpdateChecker.engineResult"
 private let cachedVersionKey = "UpdateChecker.latestVersion"
 private let cachedCliVersionKey = "UpdateChecker.latestCliVersion"
 private let lastNotifiedVersionsKey = "UpdateChecker.lastNotifiedVersions"
@@ -23,34 +29,112 @@ private let maxUpdateStderrBytes = 64 * 1024
 // asset) landed in CLI 0.9.9 (commit 909efcf). Older CLIs cannot perform a correct
 // `menubar --force`, so we refuse to run them and ask the user to upgrade the CLI first.
 private let minCliVersionForUpdate = "0.9.9"
+// `codeburn update --json` (src/update.ts) ships in 0.9.27; older CLIs keep the GitHub
+// scan and the npm/brew + `menubar --force` path below.
+private let minCliVersionForEngine = "0.9.27"
+private let engineCheckTimeoutSeconds: UInt64 = 60
+private let engineUpdateTimeoutSeconds: UInt64 = 900
 
 enum UpdateFailureStage: Equatable {
     case check
     case cliUpdate
     case menubarUpdate
+    case desktopUpdate
 
     var badgeLabel: String {
         switch self {
         case .check: L("Update Check Failed")
         case .cliUpdate: L("CLI Update Failed")
         case .menubarUpdate: L("Menubar Update Failed")
+        case .desktopUpdate: L("Desktop Update Failed")
         }
     }
 
     var summary: String {
         switch self {
-        case .check: L("CodeBurn could not check GitHub for updates.")
+        case .check: L("CodeBurn could not check for updates.")
         case .cliUpdate: L("CodeBurn could not update the CLI.")
         case .menubarUpdate: L("CodeBurn could not update the menubar app.")
+        case .desktopUpdate: L("CodeBurn could not update the desktop app.")
         }
     }
 
     var retryHelp: String {
         switch self {
         case .check: L("Click to retry the update check.")
-        case .cliUpdate, .menubarUpdate: L("Click to retry the update.")
+        case .cliUpdate, .menubarUpdate, .desktopUpdate: L("Click to retry the update.")
         }
     }
+}
+
+/// One stdout line of `codeburn update --json` (design 2.1, frozen): a `step` or the final
+/// `result`. Fields are optional and `code` stays a string, so a newer engine that adds a
+/// code still reads as an ordinary error with its own message.
+struct UpdateEngineLine: Codable, Equatable {
+    struct Component: Codable, Equatable {
+        let installed: String?
+        let latest: String?
+        let state: String?
+        let method: String?
+
+        var isBehind: Bool {
+            guard let installed, let latest else { return false }
+            let i = AppVersion.normalize(installed), l = AppVersion.normalize(latest)
+            guard !i.isEmpty, !l.isEmpty else { return false }
+            return l.compare(i, options: .numeric) == .orderedDescending
+        }
+    }
+
+    let type: String
+    let component: String?
+    let state: String?
+    let from: String?
+    let to: String?
+    let code: String?
+    let message: String?
+    let command: String?
+    let ok: Bool?
+    let components: [String: Component]?
+
+    static func decode(_ line: Data) -> UpdateEngineLine? {
+        try? JSONDecoder().decode(UpdateEngineLine.self, from: line)
+    }
+}
+
+/// Splits streamed stdout into JSON lines; a chunk can end mid-line.
+final class UpdateEngineLineReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending = Data()
+    private var decoded: [UpdateEngineLine] = []
+    private var finished = false
+
+    func append(_ chunk: Data) -> [UpdateEngineLine] {
+        lock.withLock {
+            guard !finished else { return [] }
+            pending.append(chunk)
+            var lines: [UpdateEngineLine] = []
+            while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
+                if let line = UpdateEngineLine.decode(pending[pending.startIndex..<newline]) { lines.append(line) }
+                pending.removeSubrange(pending.startIndex...newline)
+            }
+            decoded += lines
+            return lines
+        }
+    }
+
+    /// The unterminated tail, once; nil on every later call.
+    func finish() -> [UpdateEngineLine]? {
+        lock.withLock {
+            guard !finished else { return nil }
+            finished = true
+            let tail = UpdateEngineLine.decode(pending).map { [$0] } ?? []
+            pending = Data()
+            decoded += tail
+            return tail
+        }
+    }
+
+    var lines: [UpdateEngineLine] { lock.withLock { decoded } }
 }
 
 private final class LockedDataBuffer: @unchecked Sendable {
@@ -131,17 +215,39 @@ final class UpdateChecker {
     var isUpdating = false
     var updateError: String?
     var updateFailureStage: UpdateFailureStage?
+    /// Last `result` from `codeburn update --check --json`; nil on the legacy path.
+    var engineResult: UpdateEngineLine?
+    /// Component of the engine step in progress, for the badge.
+    var updatingComponent: String?
+    /// The engine's manual fallback for the failed step, when it gave one.
+    var updateFailureCommand: String?
+    @ObservationIgnored private var engineFailure: UpdateEngineLine?
+    /// The engine reported the menubar placed; the installer relaunches this app next.
+    @ObservationIgnored private var menubarReplaced = false
 
     var updateBadgeLabel: String {
-        if isUpdating { return L("Updating...") }
+        if isUpdating {
+            switch updatingComponent ?? "" {
+            case "cli": return L("Updating CLI...")
+            case "menubar": return L("Updating menubar...")
+            case "desktop": return L("Opening CodeBurn to update...")
+            default: return L("Updating...")
+            }
+        }
         return updateFailureStage?.badgeLabel ?? L("Update")
     }
 
     var updateHelpText: String {
         guard let error = updateError, let stage = updateFailureStage else {
-            return L("Update the CLI and menubar to the latest release")
+            return desktopUpdateAvailable
+                ? L("Update the CLI, menubar and desktop app to the latest release")
+                : L("Update the CLI and menubar to the latest release")
         }
         return "\(stage.summary)\n\n\(error)\n\n\(stage.retryHelp)"
+    }
+
+    var anyUpdateAvailable: Bool {
+        updateAvailable || cliUpdateAvailable || desktopUpdateAvailable
     }
 
     var updateAvailable: Bool {
@@ -153,12 +259,25 @@ final class UpdateChecker {
         return normalizedLatest.compare(normalizedCurrent, options: .numeric) == .orderedDescending
     }
 
+    /// On the engine path the pair is the engine's: its `cli` is the global CLI, which is not
+    /// what `installedCliVersion` probes when the menubar runs the desktop's launcher.
     var cliUpdateAvailable: Bool {
+        if let engineResult { return engineResult.components?["cli"]?.isBehind ?? false }
         guard let latest = latestCliVersion, let installed = installedCliVersion else { return false }
         let normalizedLatest = AppVersion.normalize(latest)
         let normalizedInstalled = AppVersion.normalize(installed)
         guard !normalizedInstalled.isEmpty else { return false }
         return normalizedLatest.compare(normalizedInstalled, options: .numeric) == .orderedDescending
+    }
+
+    var desktopUpdateAvailable: Bool {
+        engineResult?.components?["desktop"]?.isBehind ?? false
+    }
+
+    /// What the failure banner offers to copy: the engine's own fallback, or the
+    /// package-manager command on the legacy path.
+    var manualUpdateCommand: String? {
+        Self.usesEngine(installedCli: installedCliVersion) ? updateFailureCommand : cliUpdateCommand
     }
 
     /// True when the installed CLI predates the `menubar --force` fix and would fail to
@@ -188,13 +307,51 @@ final class UpdateChecker {
         AppVersion.normalizedBundleShortVersion
     }
 
+    /// At launch and then hourly for the life of the app; `checkIfNeeded` keeps the real
+    /// check to once per `checkIntervalSeconds` unless a version changed.
+    func poll() async {
+        while !Task.isCancelled {
+            await checkIfNeeded()
+            try? await Task.sleep(for: .seconds(pollIntervalSeconds))
+        }
+    }
+
+    nonisolated static func checkStamp(app: String, cli: String?) -> String {
+        "\(AppVersion.normalize(app))|\(AppVersion.normalize(cli ?? ""))"
+    }
+
+    /// The cached result still holds when it is recent and was taken against the same
+    /// app and CLI versions; an update by any route changes one of them.
+    nonisolated static func isCheckFresh(lastCheck: TimeInterval, now: TimeInterval, lastStamp: String?, stamp: String) -> Bool {
+        now - lastCheck < checkIntervalSeconds && now >= lastCheck && lastStamp == stamp
+    }
+
+    nonisolated static func usesEngine(installedCli: String?) -> Bool {
+        guard let installedCli else { return false }
+        let installed = AppVersion.normalize(installedCli)
+        guard !installed.isEmpty else { return false }
+        return installed.compare(minCliVersionForEngine, options: .numeric) != .orderedAscending
+    }
+
     func checkIfNeeded() async {
-        installedCliVersion = Self.queryInstalledCliVersion()
-        let lastCheck = defaults.double(forKey: lastCheckKey)
-        let now = Date().timeIntervalSince1970
-        if now - lastCheck < checkIntervalSeconds {
-            latestVersion = defaults.string(forKey: cachedVersionKey)
-            latestCliVersion = defaults.string(forKey: cachedCliVersionKey)
+        // A background check would wipe an update failure the user has not acted on yet.
+        guard !isUpdating, updateFailureStage == nil || updateFailureStage == .check else { return }
+        installedCliVersion = await Task.detached { Self.queryInstalledCliVersion() }.value
+        let stamp = Self.checkStamp(app: currentVersion, cli: installedCliVersion)
+        if Self.isCheckFresh(
+            lastCheck: defaults.double(forKey: lastCheckKey),
+            now: Date().timeIntervalSince1970,
+            lastStamp: defaults.string(forKey: lastCheckStampKey),
+            stamp: stamp
+        ) {
+            if Self.usesEngine(installedCli: installedCliVersion),
+               let data = defaults.data(forKey: cachedEngineResultKey),
+               let cached = try? JSONDecoder().decode(UpdateEngineLine.self, from: data) {
+                apply(engineResult: cached)
+            } else {
+                latestVersion = defaults.string(forKey: cachedVersionKey)
+                latestCliVersion = defaults.string(forKey: cachedCliVersionKey)
+            }
             return
         }
         await check()
@@ -209,6 +366,11 @@ final class UpdateChecker {
         updateError = nil
         updateFailureStage = nil
         installedCliVersion = Self.queryInstalledCliVersion()
+        if Self.usesEngine(installedCli: installedCliVersion) {
+            await checkWithEngine()
+            return
+        }
+        engineResult = nil
         guard let url = URL(string: releasesAPI) else { return }
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
@@ -238,7 +400,7 @@ final class UpdateChecker {
 
             latestVersion = version
             latestCliVersion = cliVersion
-            defaults.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
+            stampCheck()
             defaults.set(version, forKey: cachedVersionKey)
             if let cliVersion { defaults.set(cliVersion, forKey: cachedCliVersionKey) }
         } catch {
@@ -248,11 +410,41 @@ final class UpdateChecker {
         }
     }
 
+    private func stampCheck() {
+        defaults.set(Date().timeIntervalSince1970, forKey: lastCheckKey)
+        defaults.set(Self.checkStamp(app: currentVersion, cli: installedCliVersion), forKey: lastCheckStampKey)
+    }
+
+    /// The engine reads npm for the CLI (so a GitHub release that beats the npm publish no
+    /// longer advertises a CLI npm cannot serve) and the feeds for the menubar and desktop.
+    private func checkWithEngine() async {
+        let (status, lines, stderr) = await withCheckedContinuation { continuation in
+            Self.runEngine(["--check", "--json"], timeoutSeconds: engineCheckTimeoutSeconds) { status, lines, stderr in
+                continuation.resume(returning: (status, lines, stderr))
+            }
+        }
+        guard let result = lines.last(where: { $0.type == "result" }) else {
+            updateFailureStage = .check
+            updateError = stderr.isEmpty ? L("Update failed (exit %lld)", status) : stderr
+            NSLog("CodeBurn: update check failed (exit \(status)): \(stderr)")
+            return
+        }
+        apply(engineResult: result)
+        stampCheck()
+        if let data = try? JSONEncoder().encode(result) { defaults.set(data, forKey: cachedEngineResultKey) }
+    }
+
+    private func apply(engineResult result: UpdateEngineLine) {
+        engineResult = result
+        latestVersion = result.components?["menubar"]?.latest
+        latestCliVersion = result.components?["cli"]?.latest
+    }
+
     /// Marks the notifications a tap should install an update from. Other
     /// posters share the notification delegate.
     nonisolated static let notificationIdentifierPrefix = "UpdateChecker."
 
-    /// Posts at most one notification per new version pair; the 2-day repoll
+    /// Posts at most one notification per new version pair; the next repoll
     /// finds the same pair stamped and stays quiet.
     func notifyIfUpdateAvailable(appVersion: String?, cliVersion: String?) async {
         guard UpdateNotificationPreference.isEnabled(defaults: defaults) else { return }
@@ -413,6 +605,10 @@ final class UpdateChecker {
     func performFullUpdate() {
         installedCliVersion = Self.queryInstalledCliVersion()
         guard !isUpdating else { return }
+        if Self.usesEngine(installedCli: installedCliVersion) {
+            performEngineUpdate()
+            return
+        }
 
         if cliUpdateAvailable || cliTooOldForUpdate {
             updateError = nil
@@ -461,6 +657,147 @@ final class UpdateChecker {
         }
 
         if updateAvailable { performUpdate() }
+    }
+
+    /// One engine run covers every component: the global CLI, then the menubar (the installer
+    /// relaunches this app after the engine exits, as `menubar --force` always has), then the
+    /// desktop through its own updater. A desktop launcher CLI is fine here: the engine aims
+    /// `--cli` at the global CLI and hands the desktop to itself.
+    private func performEngineUpdate() {
+        isUpdating = true
+        updateError = nil
+        updateFailureStage = nil
+        updateFailureCommand = nil
+        updatingComponent = nil
+        engineFailure = nil
+        menubarReplaced = false
+        // Main-queue hops keep the lines in order; unstructured Tasks would not promise that.
+        Self.runEngine(["--all", "--json"], timeoutSeconds: engineUpdateTimeoutSeconds, onLine: { [weak self] line in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.handleEngineStep(line) } }
+        }, onExit: { [weak self] status, _, stderr in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.finishEngineUpdate(status: status, stderr: stderr) } }
+        })
+    }
+
+    func handleEngineStep(_ line: UpdateEngineLine) {
+        guard line.type == "step", let component = line.component else { return }
+        switch line.state {
+        case "start", "progress":
+            updatingComponent = component
+            // The pending marker is what reports the menubar's own outcome after the relaunch.
+            if component == "menubar", line.state == "start", let to = line.to {
+                defaults.set(["from": AppVersion.normalize(currentVersion), "to": AppVersion.normalize(to)], forKey: pendingUpdateKey)
+            }
+        case "done":
+            if component == "menubar" { menubarReplaced = true }
+        case "skipped":
+            if component == "menubar" { defaults.removeObject(forKey: pendingUpdateKey) }
+        case "error":
+            if component == "menubar" { failPendingUpdate(outcome: Self.engineTelemetryOutcome(code: line.code)) }
+            if engineFailure == nil { engineFailure = line }
+        default:
+            break
+        }
+    }
+
+    func finishEngineUpdate(status: Int32, stderr: String) {
+        let lastComponent = updatingComponent
+        isUpdating = false
+        updatingComponent = nil
+        if let failure = engineFailure {
+            let message = Self.sanitizeForDisplay(failure.message ?? "")
+            updateFailureStage = Self.failureStage(component: failure.component)
+            updateError = message.isEmpty ? L("Update failed (exit %lld)", status) : message
+            updateFailureCommand = failure.command.map(Self.sanitizeForDisplay)
+            NSLog("CodeBurn: update failed at \(failure.component ?? "?") (\(failure.code ?? "?")): \(message)")
+            return
+        }
+        // Once the menubar is placed the relaunch can stop this app or cut the stream before the
+        // final result; the pending marker settles the outcome in the relaunched copy.
+        guard status == 0 || menubarReplaced else {
+            updateFailureStage = Self.failureStage(component: lastComponent)
+            updateError = stderr.isEmpty ? L("Update failed (exit %lld)", status) : stderr
+            NSLog("CodeBurn: update failed (exit \(status)): \(stderr)")
+            return
+        }
+        latestVersion = nil
+        latestCliVersion = nil
+        engineResult = nil
+        // Re-check on the next poll so the pill reflects what actually landed.
+        defaults.removeObject(forKey: lastCheckKey)
+    }
+
+    nonisolated static func failureStage(component: String?) -> UpdateFailureStage {
+        switch component ?? "" {
+        case "menubar": .menubarUpdate
+        case "desktop": .desktopUpdate
+        default: .cliUpdate
+        }
+    }
+
+    /// Only the outcomes `update_result` already sends; everything else counts as install_fail.
+    nonisolated static func engineTelemetryOutcome(code: String?) -> String {
+        let code = code ?? ""
+        return code == "verify_fail" || code == "download_fail" ? code : "install_fail"
+    }
+
+    /// Streams `codeburn update <arguments>`; `onExit` runs once the process has exited and
+    /// its stdout is drained (or 2s later, should a grandchild keep the pipe open).
+    nonisolated static func runEngine(
+        _ arguments: [String],
+        timeoutSeconds: UInt64,
+        onLine: @escaping @Sendable (UpdateEngineLine) -> Void = { _ in },
+        onExit: @escaping @Sendable (Int32, [UpdateEngineLine], String) -> Void
+    ) {
+        let process = CodeburnCLI.makeProcess(subcommand: ["update"] + arguments)
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        let reader = UpdateEngineLineReader()
+        let errBuffer = LockedDataBuffer()
+        let drained = DispatchGroup()
+        drained.enter()
+        let finish: @Sendable () -> Void = {
+            guard let tail = reader.finish() else { return }
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            tail.forEach(onLine)
+            drained.leave()
+        }
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+        outPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            if chunk.isEmpty { finish() } else { reader.append(chunk).forEach(onLine) }
+        }
+        errPipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            errBuffer.append(chunk, limit: maxUpdateStderrBytes)
+        }
+        let timeoutTask = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+            if process.isRunning {
+                NSLog("CodeBurn: update subprocess timed out after %llus - terminating", timeoutSeconds)
+                process.terminate()
+            }
+        }
+        process.terminationHandler = { proc in
+            timeoutTask.cancel()
+            errPipe.fileHandleForReading.readabilityHandler = nil
+            let status = proc.terminationStatus
+            DispatchQueue.global().asyncAfter(deadline: .now() + 2) { finish() }
+            drained.notify(queue: .global()) {
+                let stderr = Self.sanitizeForDisplay(String(data: errBuffer.snapshot(), encoding: .utf8) ?? "")
+                onExit(status, reader.lines, stderr)
+            }
+        }
+        do {
+            try process.run()
+        } catch {
+            timeoutTask.cancel()
+            outPipe.fileHandleForReading.readabilityHandler = nil
+            errPipe.fileHandleForReading.readabilityHandler = nil
+            onExit(-1, [], error.localizedDescription)
+        }
     }
 
     /// Shared spawn-with-timeout-and-stderr-capture used by both update stages.

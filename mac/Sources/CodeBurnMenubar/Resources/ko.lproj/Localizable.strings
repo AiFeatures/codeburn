@@ -159,7 +159,7 @@
 "Update Check Failed" = "업데이트 확인 실패";
 "CLI Update Failed" = "CLI 업데이트 실패";
 "Menubar Update Failed" = "메뉴바 앱 업데이트 실패";
-"CodeBurn could not check GitHub for updates." = "CodeBurn이 GitHub에서 업데이트를 확인하지 못했습니다.";
+"CodeBurn could not check for updates." = "CodeBurn이 업데이트를 확인하지 못했습니다.";
 "CodeBurn could not update the CLI." = "CodeBurn이 CLI를 업데이트하지 못했습니다.";
 "CodeBurn could not update the menubar app." = "CodeBurn이 메뉴바 앱을 업데이트하지 못했습니다.";
 "Click to retry the update check." = "클릭하면 업데이트 확인을 재시도합니다.";
@@ -167,6 +167,12 @@
 "Updating..." = "업데이트 중...";
 "Update" = "업데이트";
 "Update the CLI and menubar to the latest release" = "CLI와 메뉴바 앱을 최신 버전으로 업데이트";
+"Desktop Update Failed" = "데스크톱 앱 업데이트 실패";
+"CodeBurn could not update the desktop app." = "CodeBurn이 데스크톱 앱을 업데이트하지 못했습니다.";
+"Updating CLI..." = "CLI 업데이트 중...";
+"Updating menubar..." = "메뉴바 앱 업데이트 중...";
+"Opening CodeBurn to update..." = "업데이트를 위해 CodeBurn 여는 중...";
+"Update the CLI, menubar and desktop app to the latest release" = "CLI, 메뉴바 앱, 데스크톱 앱을 최신 버전으로 업데이트";
 "CodeBurn %@ available" = "CodeBurn %@ 사용 가능";
 "App and CLI %@ updates are ready. Click to install." = "앱과 CLI %@ 업데이트가 준비되었습니다. 클릭하면 설치합니다.";
 "Click to install the update." = "클릭하면 업데이트를 설치합니다.";

@@ -166,7 +166,7 @@
 "Update Check Failed" = "Update Check Failed";
 "CLI Update Failed" = "CLI Update Failed";
 "Menubar Update Failed" = "Menubar Update Failed";
-"CodeBurn could not check GitHub for updates." = "CodeBurn could not check GitHub for updates.";
+"CodeBurn could not check for updates." = "CodeBurn could not check for updates.";
 "CodeBurn could not update the CLI." = "CodeBurn could not update the CLI.";
 "CodeBurn could not update the menubar app." = "CodeBurn could not update the menubar app.";
 "Click to retry the update check." = "Click to retry the update check.";
@@ -174,6 +174,12 @@
 "Updating..." = "Updating...";
 "Update" = "Update";
 "Update the CLI and menubar to the latest release" = "Update the CLI and menubar to the latest release";
+"Desktop Update Failed" = "Desktop Update Failed";
+"CodeBurn could not update the desktop app." = "CodeBurn could not update the desktop app.";
+"Updating CLI..." = "Updating CLI...";
+"Updating menubar..." = "Updating menubar...";
+"Opening CodeBurn to update..." = "Opening CodeBurn to update...";
+"Update the CLI, menubar and desktop app to the latest release" = "Update the CLI, menubar and desktop app to the latest release";
 "CodeBurn %@ available" = "CodeBurn %@ available";
 "App and CLI %@ updates are ready. Click to install." = "App and CLI %@ updates are ready. Click to install.";
 "Click to install the update." = "Click to install the update.";

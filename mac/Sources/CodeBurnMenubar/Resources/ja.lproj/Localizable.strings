@@ -159,7 +159,7 @@
 "Update Check Failed" = "更新の確認に失敗";
 "CLI Update Failed" = "CLIの更新に失敗";
 "Menubar Update Failed" = "メニューバーアプリの更新に失敗";
-"CodeBurn could not check GitHub for updates." = "CodeBurnはGitHubで更新を確認できませんでした。";
+"CodeBurn could not check for updates." = "CodeBurnは更新を確認できませんでした。";
 "CodeBurn could not update the CLI." = "CodeBurnはCLIを更新できませんでした。";
 "CodeBurn could not update the menubar app." = "CodeBurnはメニューバーアプリを更新できませんでした。";
 "Click to retry the update check." = "クリックして更新確認を再試行します。";
@@ -167,6 +167,12 @@
 "Updating..." = "更新中…";
 "Update" = "更新";
 "Update the CLI and menubar to the latest release" = "CLIとメニューバーアプリを最新版に更新";
+"Desktop Update Failed" = "デスクトップアプリの更新に失敗";
+"CodeBurn could not update the desktop app." = "CodeBurnはデスクトップアプリを更新できませんでした。";
+"Updating CLI..." = "CLIを更新中…";
+"Updating menubar..." = "メニューバーアプリを更新中…";
+"Opening CodeBurn to update..." = "更新のためCodeBurnを開いています…";
+"Update the CLI, menubar and desktop app to the latest release" = "CLI、メニューバーアプリ、デスクトップアプリを最新版に更新";
 "CodeBurn %@ available" = "CodeBurn %@ が利用可能";
 "App and CLI %@ updates are ready. Click to install." = "アプリとCLIの%@アップデートの準備ができました。クリックしてインストールしてください。";
 "Click to install the update." = "クリックして更新をインストールします。";

@@ -159,7 +159,7 @@
 "Update Check Failed" = "Échec de la vérification des mises à jour";
 "CLI Update Failed" = "Échec de la mise à jour de la CLI";
 "Menubar Update Failed" = "Échec de la mise à jour de l'app menu bar";
-"CodeBurn could not check GitHub for updates." = "CodeBurn n'a pas pu vérifier les mises à jour sur GitHub.";
+"CodeBurn could not check for updates." = "CodeBurn n'a pas pu vérifier les mises à jour.";
 "CodeBurn could not update the CLI." = "CodeBurn n'a pas pu mettre à jour la CLI.";
 "CodeBurn could not update the menubar app." = "CodeBurn n'a pas pu mettre à jour l'app menu bar.";
 "Click to retry the update check." = "Cliquez pour relancer la vérification des mises à jour.";
@@ -167,6 +167,12 @@
 "Updating..." = "Mise à jour…";
 "Update" = "Mettre à jour";
 "Update the CLI and menubar to the latest release" = "Mettre la CLI et l'app menu bar à jour vers la dernière version";
+"Desktop Update Failed" = "Échec de la mise à jour de l’app de bureau";
+"CodeBurn could not update the desktop app." = "CodeBurn n'a pas pu mettre à jour l’app de bureau.";
+"Updating CLI..." = "Mise à jour de la CLI…";
+"Updating menubar..." = "Mise à jour de l'app menu bar…";
+"Opening CodeBurn to update..." = "Ouverture de CodeBurn pour la mise à jour…";
+"Update the CLI, menubar and desktop app to the latest release" = "Mettre la CLI, l'app menu bar et l’app de bureau à jour vers la dernière version";
 "CodeBurn %@ available" = "CodeBurn %@ disponible";
 "App and CLI %@ updates are ready. Click to install." = "Les mises à jour %@ de l'app et de la CLI sont prêtes. Cliquez pour installer.";
 "Click to install the update." = "Cliquez pour installer la mise à jour.";

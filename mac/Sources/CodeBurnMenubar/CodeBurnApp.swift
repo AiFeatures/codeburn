@@ -172,7 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate, NSM
         setupUpdateNotifications()
         Telemetry.shared.start()
         updateChecker.settlePendingUpdate()
-        Task { await updateChecker.checkIfNeeded() }
+        Task { await updateChecker.poll() }
     }
 
     /// Delegate only: authorization is requested lazily by UpdateChecker the

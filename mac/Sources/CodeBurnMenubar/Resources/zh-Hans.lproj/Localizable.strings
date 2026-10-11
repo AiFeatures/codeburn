@@ -160,7 +160,7 @@
 "Update Check Failed" = "检查更新失败";
 "CLI Update Failed" = "命令行工具更新失败";
 "Menubar Update Failed" = "菜单栏应用更新失败";
-"CodeBurn could not check GitHub for updates." = "CodeBurn 无法从 GitHub 检查更新。";
+"CodeBurn could not check for updates." = "CodeBurn 无法检查更新。";
 "CodeBurn could not update the CLI." = "CodeBurn 无法更新命令行工具。";
 "CodeBurn could not update the menubar app." = "CodeBurn 无法更新菜单栏应用。";
 "Click to retry the update check." = "点按以重新检查更新。";
@@ -168,6 +168,12 @@
 "Updating..." = "正在更新…";
 "Update" = "更新";
 "Update the CLI and menubar to the latest release" = "将命令行工具和菜单栏应用更新到最新版本";
+"Desktop Update Failed" = "桌面应用更新失败";
+"CodeBurn could not update the desktop app." = "CodeBurn 无法更新桌面应用。";
+"Updating CLI..." = "正在更新命令行工具…";
+"Updating menubar..." = "正在更新菜单栏应用…";
+"Opening CodeBurn to update..." = "正在打开 CodeBurn 以进行更新…";
+"Update the CLI, menubar and desktop app to the latest release" = "将命令行工具、菜单栏应用和桌面应用更新到最新版本";
 "CodeBurn %@ available" = "CodeBurn %@ 可用";
 "App and CLI %@ updates are ready. Click to install." = "应用与命令行工具 %@ 更新已就绪。点按以安装。";
 "Click to install the update." = "点按以安装更新。";

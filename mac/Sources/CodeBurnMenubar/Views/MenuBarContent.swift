@@ -432,7 +432,7 @@ private struct Header: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if updateChecker.updateAvailable || updateChecker.cliUpdateAvailable || updateChecker.updateError != nil {
+                if updateChecker.anyUpdateAvailable || updateChecker.updateError != nil {
                     UpdateBadge()
                 }
                 AccentPicker()
@@ -568,7 +568,7 @@ private struct UpdateBadge: View {
         Button {
             if updateChecker.updateFailureStage == .check {
                 Task { await updateChecker.check() }
-            } else if updateChecker.updateAvailable || updateChecker.cliUpdateAvailable {
+            } else if updateChecker.anyUpdateAvailable {
                 updateChecker.performFullUpdate()
             } else {
                 Task { await updateChecker.check() }
@@ -637,20 +637,22 @@ struct CLIUpdateBanner: View {
                     .lineLimit(3)
                     .textSelection(.enabled)
 
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(updateChecker.cliUpdateCommand, forType: .string)
-                } label: {
-                    HStack(spacing: 3) {
-                        Text(updateChecker.cliUpdateCommand)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 8))
+                if let command = updateChecker.manualUpdateCommand {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(command, forType: .string)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text(command)
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 8))
+                        }
+                        .foregroundStyle(.blue)
                     }
-                    .foregroundStyle(.blue)
+                    .buttonStyle(.plain)
+                    .help(L("Copy update command to clipboard"))
                 }
-                .buttonStyle(.plain)
-                .help(L("Copy update command to clipboard"))
 
                 Spacer(minLength: 0)
             }
