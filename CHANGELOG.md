@@ -6,7 +6,7 @@
 
 ### Added
 - **One-click updates on every surface.** `codeburn update` updates the CLI, the menu bar app and the desktop app in one go. `--check` lists what is out of date, and `--json` gives a stable result for scripts. (#1740)
-- **The desktop app updates itself and its companions.** Click Update, then Restart; after the restart the CLI and the menu bar follow on their own. Replacing the app by hand does the same. (#1741)
+- **The desktop app updates itself and its companions.** Click Update: it downloads and restarts on its own, and after the restart the CLI and the menu bar follow. Replacing the app by hand does the same. (#1741)
 - **The menu bar update pill updates everything** through `codeburn update`, and checks every 6 hours. (#1742)
 - **The Windows tray updates the CLI** through `codeburn update`, for Store and installer installs. (#1743)
 - **Download links always point at the latest release.** (#1740)
