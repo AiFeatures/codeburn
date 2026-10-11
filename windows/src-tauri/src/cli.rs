@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 use tauri::AppHandle;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
 
@@ -364,6 +364,56 @@ impl CodeburnCli {
         self.run_capture(&["export", "-f", format, "-o", &path], silence_window(warm))
             .await?;
         Ok(())
+    }
+
+    /// `codeburn update <args> --json`: hands every stdout line to `on_line` as it arrives, so
+    /// the page can show progress during a minutes-long `npm install -g`. Returns whether the
+    /// CLI exited cleanly; the lines, not the exit code, say what happened to each component.
+    pub async fn run_update_json(
+        &self,
+        args: &[&str],
+        mut on_line: impl FnMut(&str),
+    ) -> Result<bool> {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(&self.extra_args)
+            .arg("update")
+            .args(args)
+            .arg("--json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| anyhow!("{}", spawn_failure_message(&self.program, &err)))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+        let activity = std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+        let stderr_task = tokio::spawn(drain(stderr, MAX_STDERR_BYTES, activity));
+
+        let mut lines = BufReader::new(stdout).lines();
+        let read = timeout(Duration::from_secs(CEILING_SECS), async {
+            while let Some(line) = lines.next_line().await? {
+                on_line(&line);
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await;
+        match read {
+            Err(_) => {
+                stop_child(&mut child).await;
+                bail!("The CLI update ran for {CEILING_SECS}s without finishing and was stopped");
+            }
+            Ok(result) => result?,
+        }
+        let status = child.wait().await?;
+        let _ = stderr_task.await;
+        Ok(status.success())
     }
 
     async fn run_capture(&self, args: &[&str], silence_secs: u64) -> Result<String> {

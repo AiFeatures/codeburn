@@ -11,7 +11,13 @@
 /// command instead. The reasoning is in the Rust module's doc comment.
 
 import { invoke } from '@tauri-apps/api/core'
+import { listen } from '@tauri-apps/api/event'
 import { openUrl } from '@tauri-apps/plugin-opener'
+
+import { t } from './i18n'
+import {
+  EMPTY_CLI_UPDATE, applyEngineLine, desktopHandedOff, updateOffered, type CliUpdateState,
+} from './cliUpdate'
 
 /// UpdateFailureStage: the check, or a one-click download that failed and fell back to manual.
 export type UpdateStage = 'check' | 'install'
@@ -52,12 +58,14 @@ export type UpdateState = {
   status: UpdateStatus | null
   checking: boolean
   downloading: boolean
+  cliUpdate: CliUpdateState
 }
 
 export const EMPTY_UPDATE: UpdateState = {
   status: null,
   checking: false,
   downloading: false,
+  cliUpdate: EMPTY_CLI_UPDATE,
 }
 
 /// Rust decides whether a check costs a request; this only decides how often it is offered
@@ -131,6 +139,36 @@ export async function downloadUpdate(): Promise<void> {
   }
 }
 
+/// Updates the global CLI through `codeburn update`, which also hands off to an installed
+/// desktop app. The engine's lines arrive as events and fold into `cliUpdate`; whatever
+/// happens, the status is asked again afterwards so the badge reflects the new CLI version.
+export async function updateCli(): Promise<void> {
+  if (state.cliUpdate.running) return
+  publish({ cliUpdate: { ...EMPTY_CLI_UPDATE, running: true } })
+  let unlisten = () => {}
+  let didNotRun = false
+  try {
+    unlisten = await listen<unknown>('codeburn://cli-update', event => {
+      publish({ cliUpdate: applyEngineLine(state.cliUpdate, event.payload) })
+    })
+    await invoke('update_cli')
+  } catch {
+    didNotRun = true
+  } finally {
+    unlisten()
+  }
+  publish({ cliUpdate: { ...state.cliUpdate, running: false, finished: true, didNotRun } })
+  void checkUpdates(false)
+}
+
+/// The Update button: the CLI and any installed desktop first, then this app's own signed
+/// download. A desktop that took the update over reinstalls this app itself, so the download
+/// is skipped rather than raced.
+export async function updateAll(): Promise<void> {
+  await updateCli()
+  if (!desktopHandedOff(state.cliUpdate)) await downloadUpdate()
+}
+
 /// Restart to Update: runs the verified installer, which relaunches the app.
 export async function installUpdate(): Promise<void> {
   await invoke('install_update')
@@ -180,6 +218,7 @@ export function subscribeUpdate(listener: Listener): () => void {
 /// install the app no longer performs.
 export function badgeLabel(state: UpdateState): string {
   const status = state.status
+  if (state.cliUpdate.running) return t('Updating the CLI...')
   if (status?.failureStage === 'check') return 'Update Check Failed'
   if (status?.updateAvailable && status.installRoute === 'oneClick') {
     if (status.readyToInstall) return 'Restart to Update'
@@ -216,31 +255,29 @@ export function helpText(state: UpdateState): string {
   }
   if (status?.cliUpdateAvailable) {
     const version = status.latestCliVersion ?? 'A newer CLI'
-    return `CLI ${version} is available. Run ${status.cliUpdateCommand} in a terminal.`
+    return `CLI ${version} is available. Click to update it.`
   }
   return 'Check GitHub for a newer release'
 }
 
-/// What a click on the badge does: a one-click update downloads, then restarts; a manual one
+/// What a click on the badge does: a one-click update updates the CLI and downloads, then restarts; a manual one
 /// opens its release page; anything else asks GitHub again.
-export function badgeAction(state: UpdateState): 'check' | 'download' | 'update' | 'restart' {
+export function badgeAction(state: UpdateState): 'check' | 'download' | 'update' | 'restart' | 'cli' {
   const status = state.status
-  if (!status?.updateAvailable) return 'check'
+  if (!status?.updateAvailable) return status?.cliUpdateAvailable ? 'cli' : 'check'
   if (status.installRoute !== 'oneClick') return 'download'
   return status.readyToInstall ? 'restart' : 'update'
 }
 
 /// The one handler every update button shares.
 export function runUpdateAction(action: ReturnType<typeof badgeAction>, status: UpdateStatus | null): void {
-  if (action === 'update') void downloadUpdate()
+  if (action === 'update') void updateAll()
+  else if (action === 'cli') void updateCli()
   else if (action === 'restart') void installUpdate()
   else if (action === 'download') void openReleasePage(status)
   else void checkUpdates(true)
 }
 
 export function badgeVisible(state: UpdateState): boolean {
-  const status = state.status
-  if (!status) return false
-  if (status.storeManaged) return false
-  return status.updateAvailable || status.cliUpdateAvailable || status.error !== null
+  return updateOffered(state.status)
 }

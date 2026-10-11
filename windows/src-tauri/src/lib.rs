@@ -302,6 +302,7 @@ pub fn run() {
             commands::check_updates,
             commands::download_update,
             commands::install_update,
+            commands::update_cli,
             commands::telemetry_track,
             commands::telemetry_status,
             commands::telemetry_set_enabled,
@@ -1549,6 +1550,16 @@ mod commands {
     #[tauri::command]
     pub async fn download_update(app: AppHandle) -> Result<(), String> {
         crate::update::download(&app)
+            .await
+            .map_err(|e| crate::update::scrub(&e.to_string()))
+    }
+
+    /// Updates the global CLI through `codeburn update` and hands off to an installed desktop
+    /// app. Progress arrives on `codeburn://cli-update`.
+    #[tauri::command]
+    pub async fn update_cli(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+        let cli = state.cli.lock().map_err(|e| e.to_string())?.clone();
+        crate::update::update_cli(&app, &cli)
             .await
             .map_err(|e| crate::update::scrub(&e.to_string()))
     }

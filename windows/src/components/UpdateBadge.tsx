@@ -6,6 +6,7 @@ import {
 } from '../lib/update'
 import { DownloadIcon, WarningIcon } from './Icons'
 import { track } from '../lib/telemetry'
+import { useI18nRevision } from '../lib/i18n'
 
 /// Port of UpdateBadge in mac/.../Views/MenuBarContent.swift: a small prominent pill in the
 /// header, there only when there is something to say. A failed check retries the check, a
@@ -14,6 +15,7 @@ import { track } from '../lib/telemetry'
 
 export function UpdateBadge() {
   const [update, setUpdate] = useState<UpdateState>(EMPTY_UPDATE)
+  useI18nRevision()
   useEffect(() => subscribeUpdate(setUpdate), [])
 
   if (!badgeVisible(update)) return null
@@ -28,7 +30,7 @@ export function UpdateBadge() {
       className="update-badge"
       title={help}
       aria-label={label}
-      disabled={update.downloading}
+      disabled={update.downloading || update.cliUpdate.running}
       onClick={() => {
         const action = badgeAction(update)
         track('update_click', { action })

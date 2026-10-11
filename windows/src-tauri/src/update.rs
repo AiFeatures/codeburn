@@ -13,20 +13,22 @@
 //! and refuses it unless the signature verifies, and `install` runs it. Without the key, and on
 //! Linux, an available update is answered with a release page and a command to run by hand.
 //!
-//! Inside a Store package nothing is offered at all: the Store owns the update, and an .msi
-//! install underneath it would be undone by the next one.
+//! Inside a Store package the app itself is never offered: the Store owns its update, and an
+//! .msi install underneath it would be undone by the next one. The global CLI is not the
+//! Store's, so it is still checked and updated, through `codeburn update`.
 //!
 //! The check runs here rather than in the page for two reasons: the answer has to survive a
 //! popover that is closed most of the time, and the webview's CSP has no business reaching
 //! api.github.com when the fetch can be made from a place that already talks HTTPS.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 use crate::cli::CodeburnCli;
@@ -77,6 +79,9 @@ const MSI_SUFFIX: &str = "_x64_en-US.msi";
 /// zip on a machine that cannot open it, so the page asks for the CLI first, exactly as the
 /// mac refuses anything below 0.9.9.
 const MIN_CLI_VERSION_FOR_UPDATE: (u32, u32, u32) = (0, 9, 21);
+
+/// The first CLI with `codeburn update`. From it on the CLI says what its own latest is.
+const MIN_CLI_VERSION_FOR_ENGINE: (u32, u32, u32) = (0, 9, 27);
 
 // The GitHub payload ---------------------------------------------------------------------
 
@@ -132,8 +137,9 @@ pub fn resolve_latest_windows_version(releases: &[GitHubRelease]) -> Option<Stri
     None
 }
 
-/// The newest CLI release. Its tags are a bare `v<version>`, so the two platform lines
-/// (`mac-v*`, `windows-v*`) are excluded by the prefix alone.
+/// The newest CLI release, asked only of a CLI older than 0.9.27, which has no engine. Its tags
+/// are a bare `v<version>`, so the two platform lines (`mac-v*`, `windows-v*`) are excluded by
+/// the prefix alone. The release can be published before npm has the tarball.
 pub fn resolve_latest_cli_version(releases: &[GitHubRelease]) -> Option<String> {
     releases
         .iter()
@@ -151,6 +157,12 @@ fn is_newer(latest: &str, current: &str) -> bool {
         (Some(latest), Some(current)) => latest > current,
         _ => false,
     }
+}
+
+fn uses_engine(installed: Option<&str>) -> bool {
+    installed
+        .and_then(crate::cli::parse_version)
+        .is_some_and(|version| version >= MIN_CLI_VERSION_FOR_ENGINE)
 }
 
 fn is_cli_too_old(installed: Option<&str>) -> bool {
@@ -226,7 +238,8 @@ pub struct UpdateStatus {
     pub failure_stage: Option<FailureStage>,
     pub error: Option<String>,
     /// Running inside an installed MSIX/AppX package, where the Store owns updates and this
-    /// checker has nothing to offer. Every update surface hides itself on it.
+    /// checker offers no app update. The app update surfaces hide themselves on it; a CLI
+    /// update is still offered.
     pub store_managed: bool,
     /// A verified update is downloaded and waits for Restart to Update.
     pub ready_to_install: bool,
@@ -378,10 +391,12 @@ async fn installed_cli_version(cli: &CodeburnCli) -> Option<String> {
 /// which is what makes this cheap to call on every mount.
 pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateStatus {
     // Inside a package the Store is the updater. Running this one there would offer an .msi
-    // install that MSIX would either refuse or quietly undo on its next update, so the check
-    // never happens: no request, no `codeburn --version` spawn, no cache file.
+    // install that MSIX would either refuse or quietly undo on its next update, so GitHub is
+    // never asked. The global CLI still gets its check, from the engine.
     if is_packaged_app() {
-        return UpdateStatus::store_managed(app.package_info().version.to_string());
+        let mut status = UpdateStatus::store_managed(app.package_info().version.to_string());
+        store_cli_check(cli, force, &mut status).await;
+        return status;
     }
 
     let mut status = UpdateStatus::new(app.package_info().version.to_string());
@@ -392,9 +407,25 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
     status.ready_to_install = pending().is_some();
 
     let cached = read_cache().unwrap_or_default();
-    if !force && is_fresh(cached.checked_at) {
+    let fresh = !force && is_fresh(cached.checked_at);
+    // None for a CLI without the engine, which keeps the GitHub `v*` scan below.
+    let engine_latest = if uses_engine(status.installed_cli_version.as_deref()) {
+        let answer = engine_cli_query(cli, fresh).await;
+        if let Some((installed, _, _)) = &answer {
+            status.installed_cli_version = installed.clone();
+        }
+        Some(engine_latest_cli(
+            answer.as_ref(),
+            fresh,
+            cached.latest_cli.clone(),
+        ))
+    } else {
+        None
+    };
+
+    if fresh {
         status.latest_version = cached.latest;
-        status.latest_cli_version = cached.latest_cli;
+        status.latest_cli_version = engine_latest.unwrap_or(cached.latest_cli);
         status.checked_at = Some(cached.checked_at);
         status.recompute();
         return status;
@@ -405,7 +436,7 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
             let fresh = Cached {
                 checked_at: now_secs(),
                 latest: resolve_latest_windows_version(&releases),
-                latest_cli: resolve_latest_cli_version(&releases),
+                latest_cli: engine_latest.unwrap_or_else(|| resolve_latest_cli_version(&releases)),
             };
             if let Err(err) = write_cache(&fresh) {
                 crate::log_line!("codeburn: failed to cache the update check: {err}");
@@ -418,7 +449,7 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
             // A failed check keeps whatever the cache knew, so a badge already on screen does
             // not vanish because the network went away for a moment.
             status.latest_version = cached.latest;
-            status.latest_cli_version = cached.latest_cli;
+            status.latest_cli_version = engine_latest.unwrap_or(cached.latest_cli);
             status.checked_at = (cached.checked_at > 0).then_some(cached.checked_at);
             status.failure_stage = Some(FailureStage::Check);
             status.error = Some(scrub(&err.to_string()));
@@ -427,6 +458,103 @@ pub async fn check(app: &AppHandle, cli: &CodeburnCli, force: bool) -> UpdateSta
     }
     status.recompute();
     status
+}
+
+/// The global CLI's `(installed, latest, code)` from the `result` line of
+/// `codeburn update --check --cli --json`. None when no result came back: a CLI that predates
+/// the engine, which is then offered nothing.
+type EngineCli = (Option<String>, Option<String>, String);
+
+fn engine_cli_check(lines: &[serde_json::Value]) -> Option<EngineCli> {
+    let result = lines.iter().rev().find(|line| line["type"] == "result")?;
+    let cli = &result["components"]["cli"];
+    let text = |key: &str| cli[key].as_str().map(str::to_owned);
+    Some((
+        text("installed"),
+        text("latest"),
+        text("code").unwrap_or_default(),
+    ))
+}
+
+/// `codeburn update --check --cli --json`. With a fresh cache the cache answers `latest` and
+/// `--local` (no network) reads what is installed, so opening the popover does not cost an npm
+/// registry hit.
+async fn engine_cli_query(cli: &CodeburnCli, fresh: bool) -> Option<EngineCli> {
+    let args: &[&str] = if fresh {
+        &["--check", "--local", "--cli"]
+    } else {
+        &["--check", "--cli"]
+    };
+    let mut lines = Vec::new();
+    if let Err(err) = cli
+        .run_update_json(args, |line| {
+            if let Ok(value) = serde_json::from_str(line) {
+                lines.push(value);
+            }
+        })
+        .await
+    {
+        crate::log_line!("codeburn: CLI update check failed: {err}");
+    }
+    engine_cli_check(&lines)
+}
+
+/// The global CLI's latest from the engine: npm's, or the formula for a Homebrew CLI. A CLI
+/// bundled with another app (`managed`) is offered nothing. `known` stands when the cache is
+/// fresh (`--local` reports only the running CLI's own version), when the registry did not
+/// answer, and when no result came back at all.
+fn engine_latest_cli(
+    answer: Option<&EngineCli>,
+    fresh: bool,
+    known: Option<String>,
+) -> Option<String> {
+    match answer {
+        Some((_, _, code)) if code == "managed" => None,
+        Some((_, Some(latest), _)) if !fresh => Some(latest.clone()),
+        _ => known,
+    }
+}
+
+/// The Store branch's CLI check.
+async fn store_cli_check(cli: &CodeburnCli, force: bool, status: &mut UpdateStatus) {
+    let cached = read_cache().unwrap_or_default();
+    let fresh = !force && is_fresh(cached.checked_at);
+    apply_store_cli_check(status, engine_cli_query(cli, fresh).await, fresh, &cached);
+    if !fresh && status.latest_cli_version.is_some() && status.checked_at.is_none() {
+        let checked_at = now_secs();
+        let entry = Cached {
+            checked_at,
+            latest: None,
+            latest_cli: status.latest_cli_version.clone(),
+        };
+        if let Err(err) = write_cache(&entry) {
+            crate::log_line!("codeburn: failed to cache the update check: {err}");
+        }
+        status.checked_at = Some(checked_at);
+    }
+}
+
+/// Pure half of `store_cli_check`. A CLI bundled with another app (`managed`) is never offered;
+/// a registry that could not be read keeps whatever the cache knew.
+fn apply_store_cli_check(
+    status: &mut UpdateStatus,
+    check: Option<EngineCli>,
+    fresh: bool,
+    cached: &Cached,
+) {
+    let Some((installed, latest, code)) = check else {
+        return;
+    };
+    status.installed_cli_version = installed;
+    if code == "managed" {
+        status.latest_cli_version = None;
+    } else if fresh || latest.is_none() {
+        status.latest_cli_version = cached.latest_cli.clone();
+        status.checked_at = (cached.checked_at > 0).then_some(cached.checked_at);
+    } else {
+        status.latest_cli_version = latest;
+    }
+    status.recompute();
 }
 
 // One-click install ----------------------------------------------------------------------------
@@ -564,6 +692,64 @@ fn download_outcome(err: &anyhow::Error) -> &'static str {
     }
 }
 
+// The CLI through the engine ------------------------------------------------------------------
+
+/// Each `--json` line from `codeburn update`, re-emitted for the page to decode.
+const CLI_UPDATE_EVENT: &str = "codeburn://cli-update";
+
+static CLI_UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+struct RunningGuard;
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        CLI_UPDATE_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// One engine line as the page may see it: a `step` or `result` object, with the free text
+/// scrubbed like every other message that reaches a window. Anything else is dropped.
+fn engine_line(line: &str) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object_mut()?;
+    if !matches!(
+        object.get("type").and_then(|t| t.as_str()),
+        Some("step" | "result")
+    ) {
+        return None;
+    }
+    for key in ["message", "command"] {
+        if let Some(text) = object.get(key).and_then(|v| v.as_str()) {
+            let scrubbed = scrub(text);
+            object.insert(key.into(), scrubbed.into());
+        }
+    }
+    Some(value)
+}
+
+/// `codeburn update --cli --desktop --json`: the global CLI, and the hand-off to an installed
+/// desktop app that the engine decides on. Progress goes out as events; the engine's lines are
+/// the only account of the outcome, so an old CLI with no `update` command (no result line)
+/// is an error here and the page falls back to the manual command.
+pub async fn update_cli(app: &AppHandle, cli: &CodeburnCli) -> Result<()> {
+    if CLI_UPDATE_RUNNING.swap(true, Ordering::SeqCst) {
+        bail!("An update is already running.");
+    }
+    let _guard = RunningGuard;
+    let mut saw_result = false;
+    cli.run_update_json(&["--cli", "--desktop"], |line| {
+        if let Some(value) = engine_line(line) {
+            saw_result |= value["type"] == "result";
+            let _ = app.emit(CLI_UPDATE_EVENT, value);
+        }
+    })
+    .await?;
+    if !saw_result {
+        bail!("The CLI did not report a result.");
+    }
+    Ok(())
+}
+
 // Scrubbing -----------------------------------------------------------------------------------
 
 fn token_len(text: &str) -> usize {
@@ -672,6 +858,145 @@ mod tests {
         assert_eq!(status.latest_version, None);
         assert_eq!(status.checked_at, None);
         assert_eq!(status.failure_stage, None);
+    }
+
+    #[test]
+    fn a_store_install_still_offers_the_global_cli() {
+        let lines: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type":"step","component":"cli","state":"skipped","code":"ok"}),
+            serde_json::json!({"type":"result","ok":true,"components":{"cli":{"installed":"0.9.26","latest":"0.9.27","state":"skipped","code":"ok","method":"npm"}}}),
+        ];
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(
+            &mut status,
+            engine_cli_check(&lines),
+            false,
+            &Cached::default(),
+        );
+        assert!(status.store_managed);
+        assert_eq!(status.install_route, InstallRoute::Store);
+        assert!(!status.update_available);
+        assert!(status.cli_update_available);
+        assert_eq!(status.latest_cli_version.as_deref(), Some("0.9.27"));
+    }
+
+    #[test]
+    fn a_store_cli_check_uses_the_cache_when_fresh_and_skips_managed_or_old_clis() {
+        let cached = Cached {
+            checked_at: 1,
+            latest: None,
+            latest_cli: Some("0.9.27".into()),
+        };
+        let local = |code: &str| {
+            Some((
+                Some("0.9.26".to_owned()),
+                Some("0.9.26".to_owned()),
+                code.to_owned(),
+            ))
+        };
+
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(&mut status, local("up_to_date"), true, &cached);
+        assert!(status.cli_update_available);
+
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(&mut status, local("managed"), true, &cached);
+        assert!(!status.cli_update_available);
+
+        // The registry did not answer: the cache still stands.
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(
+            &mut status,
+            Some((Some("0.9.26".into()), None, "download_fail".into())),
+            false,
+            &cached,
+        );
+        assert!(status.cli_update_available);
+
+        // A CLI without the engine prints no result line.
+        let mut status = UpdateStatus::store_managed("0.9.27".into());
+        apply_store_cli_check(
+            &mut status,
+            engine_cli_check(&[serde_json::json!({"type":"other"})]),
+            false,
+            &cached,
+        );
+        assert!(!status.cli_update_available);
+        assert_eq!(status.installed_cli_version, None);
+    }
+
+    #[test]
+    fn only_a_cli_from_0_9_27_is_asked_through_the_engine() {
+        assert!(!uses_engine(None));
+        assert!(!uses_engine(Some("0.9.26")));
+        assert!(uses_engine(Some("0.9.27")));
+        assert!(uses_engine(Some("0.10.0")));
+    }
+
+    /// The 0.9.26 release order: GitHub had `v0.9.27` before npm did. The engine answers with
+    /// npm, so nothing is offered until the click can install it.
+    #[test]
+    fn an_engine_cli_takes_npm_latest_not_the_github_release() {
+        let releases: Vec<GitHubRelease> = serde_json::from_value(serde_json::json!([
+            {"tag_name": "v0.9.27", "assets": []}
+        ]))
+        .unwrap();
+        let answer = (
+            Some("0.9.26".to_owned()),
+            Some("0.9.26".to_owned()),
+            "up_to_date".to_owned(),
+        );
+        let latest_cli = |engine_latest: Option<Option<String>>| {
+            let mut status = UpdateStatus::new("0.9.27".into());
+            status.installed_cli_version = Some("0.9.26".into());
+            status.latest_cli_version =
+                engine_latest.unwrap_or_else(|| resolve_latest_cli_version(&releases));
+            status.recompute();
+            status
+        };
+
+        let engine = latest_cli(Some(engine_latest_cli(Some(&answer), false, None)));
+        assert_eq!(engine.latest_cli_version.as_deref(), Some("0.9.26"));
+        assert!(!engine.cli_update_available);
+
+        let older = latest_cli(None);
+        assert_eq!(older.latest_cli_version.as_deref(), Some("0.9.27"));
+        assert!(older.cli_update_available);
+    }
+
+    #[test]
+    fn engine_latest_keeps_the_cache_unless_the_registry_answered() {
+        let known = || Some("0.9.27".to_owned());
+        let answer = |latest: Option<&str>, code: &str| {
+            (
+                Some("0.9.26".to_owned()),
+                latest.map(str::to_owned),
+                code.to_owned(),
+            )
+        };
+
+        let npm = answer(Some("0.9.28"), "ok");
+        assert_eq!(
+            engine_latest_cli(Some(&npm), false, known()).as_deref(),
+            Some("0.9.28")
+        );
+        // `--local` reports the running CLI's own version, not npm's.
+        assert_eq!(
+            engine_latest_cli(Some(&npm), true, known()).as_deref(),
+            Some("0.9.27")
+        );
+        let offline = answer(None, "download_fail");
+        assert_eq!(
+            engine_latest_cli(Some(&offline), false, known()).as_deref(),
+            Some("0.9.27")
+        );
+        assert_eq!(
+            engine_latest_cli(None, false, known()).as_deref(),
+            Some("0.9.27")
+        );
+        let bundled = answer(None, "managed");
+        assert_eq!(engine_latest_cli(Some(&bundled), false, known()), None);
+        assert_eq!(engine_latest_cli(Some(&bundled), true, known()), None);
     }
 
     /// This test binary is an ordinary .exe, which is the branch every developer machine and
@@ -902,6 +1227,20 @@ mod tests {
             download_outcome(&anyhow::anyhow!("no newer release")),
             "download_fail"
         );
+    }
+
+    #[test]
+    fn engine_lines_are_filtered_and_scrubbed() {
+        let step = engine_line(
+            r#"{"type":"step","component":"cli","state":"error","code":"permission","message":"EACCES sk-ant-api03-AbCd_1234-xyz","command":"npm i -g codeburn"}"#,
+        )
+        .expect("a step passes");
+        assert_eq!(step["message"], "EACCES sk-ant-***");
+        assert_eq!(step["command"], "npm i -g codeburn");
+        assert!(engine_line(r#"{"type":"result","ok":true,"components":{}}"#).is_some());
+        assert!(engine_line(r#"{"type":"other"}"#).is_none());
+        assert!(engine_line("npm WARN deprecated").is_none());
+        assert!(engine_line("[1,2]").is_none());
     }
 
     #[test]
