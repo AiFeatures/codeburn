@@ -119,7 +119,7 @@ describe.skipIf(!isSqliteAvailable())('background Cursor sync', () => {
   })
 
   it('a one-shot JSON report answers before cursor.com does, and the next run shows the import', async () => {
-    const args = ['report', '--format', 'json', '--provider', 'cursor', '--period', 'today']
+    const args = ['report', '--format', 'json', '--provider', 'cursor', '--period', 'week']
     const first = start(args)
     await until(() => first.stdout().trim().endsWith('}'), 'the first answer')
     expect(cursorCalls(first.stdout())).toBe(0)
@@ -145,7 +145,7 @@ describe.skipIf(!isSqliteAvailable())('background Cursor sync', () => {
       expect(found!.ok).toBe(true)
       return found as { output: string; generation: { n: number } }
     }
-    const args = ['report', '--format', 'json', '--provider', 'cursor', '--period', 'today']
+    const args = ['report', '--format', 'json', '--provider', 'cursor', '--period', 'week']
     try {
       await until(() => lines.some(l => l.includes('"ready"')), 'serve ready')
       expect(cursorCalls((await answer(1, args)).output)).toBe(0)
