@@ -4,6 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { CliError, DESKTOP_COLD_TIMEOUT_MS, PROGRESS_LINE_PREFIX, type ActionResult, type SpawnPriority } from './cli'
+import type { CompanionUpdateStatus } from './companion-update'
 import type { CompanionStatus, MenubarCompanion } from './menubar'
 import { NO_MAC_MENUBAR, type MacMenubar } from './mac-menubar'
 import { readOptimizeSnapshot, sameLocalDay, writeOptimizeSnapshot, type OptimizeBlock, type OptimizeSnapshot } from './optimize-store'
@@ -436,6 +437,10 @@ export type Deps = {
   /** One-click update download and restart; absent where updates are a download link. */
   downloadUpdate?: () => Promise<UpdateStatus>
   installUpdate?: () => void
+  /** The menubar app and global CLI against the desktop's version; null until the first check. */
+  companionUpdateStatus?: () => CompanionUpdateStatus | null
+  /** Run the companion update; progress arrives on the push channel. */
+  updateCompanions?: () => unknown
   /** The bundled tray app and Capacity Dock; absent off Windows and under tests. */
   companion?: Pick<
     MenubarCompanion,
@@ -923,6 +928,11 @@ export function createBridgeHandlers(deps: Deps): Record<string, Handler> {
     'codeburn:downloadUpdate': async () => ({ ok: true, value: deps.downloadUpdate ? await deps.downloadUpdate() : NO_UPDATE_STATUS }),
     'codeburn:installUpdate': async () => {
       deps.installUpdate?.()
+      return { ok: true, value: true }
+    },
+    'codeburn:companionUpdateStatus': async () => ({ ok: true, value: deps.companionUpdateStatus?.() ?? null }),
+    'codeburn:updateCompanions': async () => {
+      void deps.updateCompanions?.()
       return { ok: true, value: true }
     },
     // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the

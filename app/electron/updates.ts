@@ -31,6 +31,8 @@ export type UpdateStatus = {
   storeManaged?: boolean
   /** One-click update state (auto-update.ts); absent where the banner links to a download instead. */
   install?: 'available' | 'downloading' | 'ready'
+  /** The restart into a downloaded update did not happen; the banner offers a retry. */
+  installFailed?: boolean
 }
 
 type GitHubRelease = { tag_name?: string }

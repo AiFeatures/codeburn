@@ -15,7 +15,8 @@ vi.mock('electron', () => ({
   shell: { openExternal: vi.fn() },
 }))
 
-import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers, externalUrlToOpen, readProjectFilter, writeProjectFilter } from './main'
+import { createApplicationMenuTemplate, createBeforeQuitHandler, createBridgeHandlers, createQuitPath, externalUrlToOpen, handOffUpdate, readProjectFilter, writeProjectFilter } from './main'
+import { createAutoUpdateChecker, type Updater } from './auto-update'
 import { CliError } from './cli'
 import { Telemetry } from './telemetry'
 
@@ -90,6 +91,8 @@ const CHANNELS = [
   'codeburn:getUpdateStatus',
   'codeburn:downloadUpdate',
   'codeburn:installUpdate',
+  'codeburn:companionUpdateStatus',
+  'codeburn:updateCompanions',
   'codeburn:companionStatus',
   'codeburn:companionInstall',
   'codeburn:companionOpen',
@@ -510,6 +513,92 @@ describe('createBeforeQuitHandler', () => {
     } finally {
       rmSync(stateDir, { recursive: true, force: true })
     }
+  })
+})
+
+describe('createQuitPath (quitAndInstall)', () => {
+  function fakeUpdater(onQuitAndInstall: () => void) {
+    const listeners: Record<string, (err: Error) => void> = {}
+    return {
+      autoDownload: true,
+      checkForUpdates: vi.fn(async () => ({ updateInfo: { version: '0.9.27' } })),
+      downloadUpdate: vi.fn(async () => { listeners['update-downloaded']?.(new Error('unused')) }),
+      quitAndInstall: vi.fn(onQuitAndInstall),
+      on: vi.fn((event: 'update-downloaded' | 'error', listener: (err: Error) => void) => { listeners[event] = listener }),
+    } satisfies Updater
+  }
+
+  it('flushes first, bounded, and then lets the quit quitAndInstall starts pass untouched', async () => {
+    vi.useFakeTimers()
+    try {
+      const trackClose = vi.fn()
+      const flush = vi.fn(() => new Promise<boolean>(() => {}))
+      const appQuit = vi.fn()
+      const killAll = vi.fn()
+      const quitPath = createQuitPath({ getTelemetry: () => ({ trackClose, flush }), killAll, quit: appQuit })
+      // Electron: quitAndInstall closes the windows and quits, which emits before-quit.
+      const updateQuit = { preventDefault: vi.fn() }
+      const updater = fakeUpdater(() => quitPath.beforeQuit(updateQuit))
+      const checker = createAutoUpdateChecker({ updater, currentVersion: '0.9.26', onChange: () => {}, beforeQuit: quitPath.beforeInstall })
+
+      await checker.check()
+      await checker.download()
+      expect(trackClose).toHaveBeenCalledOnce()
+      expect(killAll).toHaveBeenCalledOnce()
+
+      await vi.advanceTimersByTimeAsync(1499)
+      expect(updater.quitAndInstall).not.toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(updater.quitAndInstall).toHaveBeenCalledOnce()
+      expect(updateQuit.preventDefault).not.toHaveBeenCalled()
+      expect(appQuit).not.toHaveBeenCalled()
+      expect(trackClose).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a failed install puts the flush back on the next quit', async () => {
+    const appQuit = vi.fn()
+    const killAll = vi.fn()
+    const quitPath = createQuitPath({ getTelemetry: () => null, killAll, quit: appQuit })
+    await quitPath.beforeInstall()
+    const passThrough = { preventDefault: vi.fn() }
+    quitPath.beforeQuit(passThrough)
+    expect(passThrough.preventDefault).not.toHaveBeenCalled()
+
+    quitPath.cancelInstall()
+    const later = { preventDefault: vi.fn() }
+    quitPath.beforeQuit(later)
+    expect(later.preventDefault).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(appQuit).toHaveBeenCalledOnce())
+    expect(killAll).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the bounded flush on an ordinary quit', async () => {
+    const appQuit = vi.fn()
+    const quitPath = createQuitPath({ getTelemetry: () => null, killAll: vi.fn(), quit: appQuit })
+    const event = { preventDefault: vi.fn() }
+    quitPath.beforeQuit(event)
+    expect(event.preventDefault).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(appQuit).toHaveBeenCalledOnce())
+  })
+})
+
+describe('handOffUpdate (--codeburn-update)', () => {
+  it('checks, pushes the status, then downloads; without a checker it does nothing', async () => {
+    const order: string[] = []
+    const status = { currentVersion: '0.9.26', latestVersion: '0.9.27', updateAvailable: true, tag: 'desktop-v0.9.27', install: 'available' as const }
+    const checker = {
+      check: vi.fn(async () => { order.push('check'); return status }),
+      download: vi.fn(async () => { order.push('download'); return status }),
+    }
+    const onStatus = vi.fn(() => { order.push('status') })
+    await handOffUpdate(checker, onStatus)
+    expect(order).toEqual(['check', 'status', 'download'])
+    expect(onStatus).toHaveBeenCalledWith(status)
+
+    await expect(handOffUpdate(null, onStatus)).resolves.toBeUndefined()
   })
 })
 

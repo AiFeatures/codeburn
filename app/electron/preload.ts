@@ -102,6 +102,14 @@ const bridge = {
   },
   downloadUpdate: () => invoke('codeburn:downloadUpdate'),
   installUpdate: () => invoke('codeburn:installUpdate'),
+  // The menubar app and global CLI following the desktop's version: a read, a push, and a run.
+  getCompanionUpdate: () => invoke('codeburn:companionUpdateStatus'),
+  onCompanionUpdate: (cb: (status: unknown) => void) => {
+    const listener = (_e: unknown, status: unknown) => cb(status)
+    ipcRenderer.on('codeburn:companionUpdate', listener)
+    return () => { ipcRenderer.removeListener('codeburn:companionUpdate', listener) }
+  },
+  updateCompanions: () => invoke('codeburn:updateCompanions'),
   // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
   // whole status, so the sidebar renders what took rather than what it asked for.
   companionStatus: () => invoke('codeburn:companionStatus'),

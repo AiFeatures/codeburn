@@ -481,7 +481,7 @@ there, after the live-asset check passes. Release order is in `RELEASING.md`.
 
 Who updates itself (`app/electron/auto-update.ts`):
 
-- macOS, signed release builds: Update, then Restart to update. Ad-hoc local
+- macOS, signed release builds: one Update click downloads, then restarts into it. Ad-hoc local
   builds fail the Squirrel signature check and fall back to the download link.
 - Linux AppImage only (`APPIMAGE` is set). deb, rpm, snap and Flathub keep the
   link banner or their store.

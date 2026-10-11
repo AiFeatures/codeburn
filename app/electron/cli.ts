@@ -312,7 +312,7 @@ export function nodeManagerDirs(): string[] {
 
 /** The dirs searched for a `codeburn` executable. `CODEBURN_PATH_DIRS` overrides
  *  the whole search space (delimiter-separated) — used by tests and advanced setups. */
-function searchDirs(): string[] {
+export function searchDirs(): string[] {
   const override = process.env.CODEBURN_PATH_DIRS
   if (override !== undefined) return override.split(delimiter).filter(Boolean)
   const pathDirs = (process.env.PATH || '').split(delimiter).filter(Boolean)
