@@ -9,6 +9,7 @@ import {
   fetchLatestMacReleaseAssets,
   formatGitHubReleaseLookupError,
   hasRunnableRecordedCli,
+  isFallbackUpgrade,
   isMissingDirectAssetError,
   leftoverBundleLines,
   resolveLatestMenubarReleaseAssets,
@@ -19,11 +20,13 @@ import {
   resolveMenubarReleaseAssets,
   resolvePersistentCodeburnPathFromWhichOutput,
   resolveProxyUrlForUrl,
+  resolveReleaseBase,
   resolveVersionedMenubarReleaseAssets,
   shouldFallbackToReleaseApi,
   verifyBundleSignature,
   verifyChecksum,
   MAC_FEED_URL,
+  WINDOWS_RELEASE,
   type ReleaseApiFetch,
   type ReleaseResponse,
 } from '../src/menubar-installer.js'
@@ -862,11 +865,58 @@ describe('fetchLatestMacReleaseAssets', () => {
     expect(assets.release.tag_name).toBe('mac-v0.9.29')
   })
 
+  it('never takes a fallback release older than, or equal to, the installed bundle', async () => {
+    // The 0.9.26 release window: CLI 0.9.27 is out, mac-v0.9.27 is not, and the feed still
+    // names 0.9.26 while 0.9.27 was already installed by hand.
+    const feed: ReleaseApiFetch = async () => json(200, {
+      version: '0.9.26',
+      url: 'https://github.com/getagentseal/codeburn/releases/download/mac-v0.9.26/CodeBurnMenubar-v0.9.26.zip',
+    })
+    const assets = await fetchLatestMacReleaseAssets(feed)
+    expect(isFallbackUpgrade(assets, '0.9.27')).toBe(false)
+    expect(isFallbackUpgrade(assets, '0.9.26')).toBe(false)
+    expect(isFallbackUpgrade(assets, '0.9.25')).toBe(true)
+    expect(isFallbackUpgrade(assets, null)).toBe(true)
+    const scanOnly: ReleaseApiFetch = async (url) => url === MAC_FEED_URL ? json(404, null) : json(200, scan)
+    expect(isFallbackUpgrade(await fetchLatestMacReleaseAssets(scanOnly), '0.9.30')).toBe(false)
+    expect(isFallbackUpgrade(await fetchLatestMacReleaseAssets(scanOnly), '0.9.28')).toBe(true)
+    expect(isFallbackUpgrade(resolveVersionedMenubarReleaseAssets('0.9.9', WINDOWS_RELEASE), '0.9.10', WINDOWS_RELEASE)).toBe(false)
+  })
+
   it('ignores a feed whose url points anywhere but the matching mac-v release asset', async () => {
     const fetchImpl: ReleaseApiFetch = async (url) => url === MAC_FEED_URL
       ? json(200, { version: '0.9.30', url: 'https://evil.test/CodeBurnMenubar-v0.9.30.zip' })
       : json(200, scan)
     const assets = await fetchLatestMacReleaseAssets(fetchImpl)
     expect(assets.release.tag_name).toBe('mac-v0.9.29')
+  })
+})
+
+describe('resolveReleaseBase', () => {
+  const DEFAULT = 'https://github.com/getagentseal/codeburn/releases/download'
+
+  it('takes only loopback http with a port or a GitHub releases/download base', () => {
+    expect(resolveReleaseBase('http://127.0.0.1:8787')).toBe('http://127.0.0.1:8787')
+    expect(resolveReleaseBase('https://github.com/someone/codeburn-fork/releases/download')).toBe('https://github.com/someone/codeburn-fork/releases/download')
+  })
+
+  it.each([
+    undefined,
+    '',
+    'https://evil.example',
+    'http://127.0.0.1:8787/',
+    'http://127.0.0.1',
+    'http://127.0.0.1:0',
+    'http://127.0.0.1:70000',
+    'http://localhost:8787',
+    'http://127.0.0.1.evil.example:8787',
+    'https://127.0.0.1:8787',
+    'http://github.com/getagentseal/codeburn/releases/download',
+    'https://github.com.evil.example/a/b/releases/download',
+    'https://github.com/getagentseal/codeburn/releases/download/',
+    'https://github.com/getagentseal/codeburn/releases/download/../../x',
+    'https://github.com/a/b/releases/download?x=1',
+  ])('ignores %s', value => {
+    expect(resolveReleaseBase(value)).toBe(DEFAULT)
   })
 })

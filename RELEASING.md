@@ -37,6 +37,22 @@ Verify that the build completes without errors:
 npm run build
 ```
 
+## Release Order
+
+Every surface's updater reads its own channel, and the menubar and `codeburn update` install the CLI from npm first. Publish in this order, so nothing points at a version a later step has not published yet. 0.9.26 went out the other way round, and menubars that checked in between were told to install a CLI npm did not have yet (npm 404):
+
+1. `npm publish`.
+2. Wait until the tarball downloads: run `npm pack codeburn@<version>` in a temp directory until it writes `codeburn-<version>.tgz`.
+3. Homebrew: `brew bump-formula-pr` (see "Homebrew Core") and bump the tap (CLI step 5b).
+4. GitHub `v<version>` release.
+5. Push `mac-v<version>` (writes `menubar-latest.json`).
+6. Push `windows-v<version>` (writes `windows-latest.json`).
+7. Publish the `desktop-v<version>` release (writes `latest*.yml`).
+
+Push tags one at a time and wait for each workflow to start. GitHub drops the push events when more than three tags arrive in one push, so `git push --tags` can leave a release with no workflow run.
+
+The README and the website link to `https://codeburn.app/download/<target>`, which redirects to whatever the update feeds name. Neither needs a version bump per release.
+
 ## CLI Release Process
 
 ### 1. Update the Version

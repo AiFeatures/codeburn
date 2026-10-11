@@ -1,6 +1,7 @@
 import { isAbsolute } from 'path'
 import { Command, Option } from 'commander'
 import { installMenubarApp, uninstallMenubarApp } from './menubar-installer.js'
+import { COMPONENTS, defaultUpdateDeps, runUpdate, type Component } from './update.js'
 import { exportCsv, exportJson, type PeriodExport } from './export.js'
 import { findUnpricedModels, modelRowKey, loadPricing, sanitizeModelForDisplay, setModelAliases, setPriceOverrides, setLocalModelSavings, setFlatRateModels, setFlatRateRemoved, setProxyPaths, normalizeProxyPath, unpricedModelHint, isBuiltInFlatRateModel, isSameFlatRateModel, getProxyPathsConfigHash, getModelAliasesConfigHash, getPriceOverridesConfigHash, getLocalModelSavingsConfigHash, getFlatRateModelsConfigHash, getPricingGenerationKey } from './models.js'
 import { cachedProjectIdentitiesForRange } from './daily-cache.js'
@@ -1622,6 +1623,26 @@ program
       console.error(`\n  Menubar ${opts.uninstall ? 'uninstall' : 'install'} failed: ${message}\n`)
       process.exit(1)
     }
+  })
+
+program
+  .command('update')
+  .description('Update the global CLI, the menubar app and the desktop app')
+  .option('--check', 'Report what is out of date; change nothing')
+  .option('--cli', 'The global codeburn command (npm or Homebrew)')
+  .option('--menubar', 'The macOS menubar app, to this CLI\'s version')
+  .option('--desktop', 'The desktop app, by handing off to its own updater')
+  .option('--all', 'Every component (the default)')
+  .option('--local', 'With --check: no network, compare against this CLI\'s version')
+  .option('--json', 'One JSON object per line on stdout')
+  .action(async (opts: Partial<Record<Component | 'all' | 'check' | 'local' | 'json', boolean>>) => {
+    const picked = COMPONENTS.filter(c => opts[c])
+    process.exitCode = await runUpdate({
+      components: opts.all || picked.length === 0 ? COMPONENTS : picked,
+      check: opts.check,
+      local: opts.local,
+      json: opts.json,
+    }, defaultUpdateDeps(version))
   })
 
 program
