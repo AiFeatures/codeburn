@@ -4,7 +4,10 @@ import { dirname, join, resolve } from 'path'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { getCurrency, convertCost, roundForActiveCurrency } from './currency.js'
 import { dateKey } from './day-aggregator.js'
+import { behavioralCallWeight, behavioralTurnCount } from './behavioral-weight.js'
 import { aggregateModelEfficiency } from './model-efficiency.js'
+import { callBillableOutputTokens, countSessions, sessionModelBillableOutputTokens } from './session-output.js'
+import { findUnpricedModels } from './models.js'
 
 function escCsv(s: string): string {
   const sanitized = /^[\t\r=+\-@]/.test(s) ? `'${s}` : s
@@ -14,16 +17,22 @@ function escCsv(s: string): string {
   return sanitized
 }
 
-type Row = Record<string, string | number | undefined>
+type Row = Record<string, string | number | boolean | undefined>
 
 function rowsToCsv(rows: Row[]): string {
   if (rows.length === 0) return ''
   const headers = Object.keys(rows[0])
   const lines = [headers.map(escCsv).join(',')]
   for (const row of rows) {
-    lines.push(headers.map(h => escCsv(String(row[h] ?? ''))).join(','))
+    lines.push(headers.map(h => escCsv(csvCell(row[h]))).join(','))
   }
   return lines.join('\n') + '\n'
+}
+
+// Unrounded costs must not reach a spreadsheet as 0.24076000000000003 or 1e-7.
+function csvCell(v: Row[string]): string {
+  if (typeof v !== 'number' || Number.isInteger(v)) return String(v ?? '')
+  return v.toFixed(8).replace(/\.?0+$/, '')
 }
 
 function round2(n: number): number {
@@ -50,18 +59,23 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const turn of session.turns) {
-        if (!turn.timestamp) continue
-        const day = dateKey(turn.timestamp)
-        if (!daily[day]) {
-          daily[day] = { cost: 0, savings: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, sessions: new Set() }
-        }
-        daily[day].sessions.add(session.sessionId)
+        const turnTs = turn.timestamp || turn.assistantCalls[0]?.timestamp || ''
         for (const call of turn.assistantCalls) {
+          // Same per-call day rule as aggregateProjectsIntoDays, so the daily
+          // rows sum to the summary and land on the days the history shows.
+          const day = dateKey(Number.isNaN(new Date(call.timestamp).getTime()) ? turnTs : call.timestamp)
+          if (!daily[day]) {
+            daily[day] = { cost: 0, savings: 0, calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, sessions: new Set() }
+          }
+          daily[day].sessions.add(session.sessionId)
           daily[day].cost += call.costUSD
           daily[day].savings += call.savingsUSD ?? 0
-          daily[day].calls++
+          // Same weight rule as aggregateProjectsIntoDays: a supplementary
+          // accounting call carries cost/tokens but is not a distinct request,
+          // so daily.csv call counts must reconcile with summary.csv.
+          daily[day].calls += behavioralCallWeight(call)
           daily[day].input += call.usage.inputTokens
-          daily[day].output += call.usage.outputTokens
+          daily[day].output += callBillableOutputTokens(call)
           daily[day].cacheRead += call.usage.cacheReadInputTokens
           daily[day].cacheWrite += call.usage.cacheCreationInputTokens
         }
@@ -85,6 +99,16 @@ function buildDailyRows(projects: ProjectSummary[], period: string): Row[] {
 
 function buildRecordRows(projects: ProjectSummary[]): Row[] {
   const rows: Row[] = []
+  const unpricedModels = new Map<string, boolean>()
+  const isUnpriced = (model: string, cost: number): boolean => {
+    if (cost > 0) return false
+    let unpriced = unpricedModels.get(model)
+    if (unpriced === undefined) {
+      unpriced = findUnpricedModels([{ model, calls: 1, cost: 0 }]).length > 0
+      unpricedModels.set(model, unpriced)
+    }
+    return unpriced
+  }
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const turn of session.turns) {
@@ -102,8 +126,16 @@ function buildRecordRows(projects: ProjectSummary[]): Row[] {
             reasoningTokens: call.usage.reasoningTokens,
             cacheWriteTokens: call.usage.cacheCreationInputTokens,
             cacheReadTokens: Math.max(call.usage.cacheReadInputTokens, call.usage.cachedInputTokens),
-            cost: roundForActiveCurrency(convertCost(call.costUSD)),
-            savings: roundForActiveCurrency(convertCost(call.savingsUSD ?? 0)),
+            cost: convertCost(call.costUSD),
+            savings: convertCost(call.savingsUSD ?? 0),
+            // Records are the raw serve ledger and keep every supplementary
+            // accounting row; the marker is how a "one row per API call"
+            // consumer tells them apart. Key present on every row (undefined
+            // when false) so rowsToCsv, which reads headers off the first row,
+            // always emits the column; JSON drops the undefined ones.
+            supplementary: call.supplementaryAccounting ? true : undefined,
+            estimated: call.isEstimated ? true : undefined,
+            unpriced: isUnpriced(call.model, call.costUSD) ? true : undefined,
           })
         }
       }
@@ -139,17 +171,25 @@ function buildActivityRows(projects: ProjectSummary[], period: string): Row[] {
 function buildModelRows(projects: ProjectSummary[], period: string): Row[] {
   const modelTotals: Record<string, { calls: number; cost: number; savings: number; input: number; output: number; cacheRead: number; cacheWrite: number }> = {}
   const modelEfficiency = aggregateModelEfficiency(projects)
+  const ensure = (model: string) => {
+    if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    return modelTotals[model]
+  }
   for (const project of projects) {
     for (const session of project.sessions) {
       for (const [model, d] of Object.entries(session.modelBreakdown)) {
-        if (!modelTotals[model]) modelTotals[model] = { calls: 0, cost: 0, savings: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
-        modelTotals[model].calls += d.calls
-        modelTotals[model].cost += d.costUSD
-        modelTotals[model].savings += d.savingsUSD
-        modelTotals[model].input += d.tokens.inputTokens
-        modelTotals[model].output += d.tokens.outputTokens
-        modelTotals[model].cacheRead += d.tokens.cacheReadInputTokens ?? 0
-        modelTotals[model].cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
+        const acc = ensure(model)
+        acc.calls += d.calls
+        acc.cost += d.costUSD
+        acc.savings += d.savingsUSD
+        acc.input += d.tokens.inputTokens
+        acc.cacheRead += d.tokens.cacheReadInputTokens ?? 0
+        acc.cacheWrite += d.tokens.cacheCreationInputTokens ?? 0
+      }
+      // Output must be billed per call while provider identity is still known.
+      // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+      for (const [model, output] of Object.entries(sessionModelBillableOutputTokens(session))) {
+        ensure(model).output += output
       }
     }
   }
@@ -270,7 +310,7 @@ function buildSessionRows(projects: ProjectSummary[]): Row[] {
         [`Cost (${code})`]: roundForActiveCurrency(convertCost(s.totalCostUSD)),
         [`Saved (${code})`]: roundForActiveCurrency(convertCost(s.totalSavingsUSD)),
         'API Calls': s.apiCalls,
-        Turns: s.turns.length,
+        Turns: behavioralTurnCount(s.turns),
         subagentType: s.agentType?.trim() || undefined,
         model: models.size === 1 ? [...models][0] : undefined,
       })
@@ -290,7 +330,7 @@ function buildSummaryRows(periods: PeriodExport[]): Row[] {
     const cost = p.projects.reduce((s, proj) => s + proj.totalCostUSD, 0)
     const savings = p.projects.reduce((s, proj) => s + proj.totalSavingsUSD, 0)
     const calls = p.projects.reduce((s, proj) => s + proj.totalApiCalls, 0)
-    const sessions = p.projects.reduce((s, proj) => s + proj.sessions.length, 0)
+    const sessions = countSessions(p.projects)
     const projectCount = p.projects.filter(proj => proj.totalCostUSD > 0 || proj.totalSavingsUSD > 0).length
     return {
       Period: p.label,
@@ -320,7 +360,11 @@ function buildReadme(periods: PeriodExport[]): string {
     '  daily.csv             Day-by-day breakdown, Period column distinguishes the window.',
     '  activity.csv          Time spent per task category (Coding, Debugging, Exploration, etc.).',
     '  models.csv            Spend per model with token totals and cache usage.',
-    '  records.csv           One row per API call, including optional subagentType and model.',
+    '  records.csv           One row per served call, with optional subagentType and model.',
+    '                        supplementary marks accounting-only rows: recovered tokens/cost that',
+    '                        are not distinct requests. estimated marks costs priced from',
+    '                        estimated or missing token counts; unpriced marks $0 rows whose',
+    '                        model has no known price. cost is unrounded.',
     '  projects.csv          Spend per project folder for the selected detail period.',
     '  sessions.csv          One row per session for the selected detail period.',
     '  tools.csv             Tool invocations and share for the selected detail period.',
@@ -363,6 +407,15 @@ export async function exportCsv(periods: PeriodExport[], outputPath: string): Pr
   let folder = resolve(outputPath)
   if (folder.toLowerCase().endsWith('.csv')) {
     folder = folder.slice(0, -4)
+  }
+
+  // The desktop app (and any `-o <existing dir>`) hands us a real folder like the
+  // Desktop, not a slot to fill: writing our ~11 files straight in would trip the
+  // reuse guard below. Nest the export in a dated subfolder of our own and let the
+  // guard apply to that. A folder we made earlier (marker present) is reused as-is.
+  const targetStat = await stat(folder).catch(() => null)
+  if (targetStat?.isDirectory() && !(await isCodeburnExportFolder(folder))) {
+    folder = join(folder, `codeburn-export-${new Date().toISOString().slice(0, 10)}`)
   }
 
   const existingStat = await stat(folder).catch(() => null)
@@ -424,7 +477,17 @@ export async function exportJson(periods: PeriodExport[], outputPath: string): P
     shellCommands: buildBashRows(thirtyDayProjects),
   }
 
-  const target = resolve(outputPath.toLowerCase().endsWith('.json') ? outputPath : `${outputPath}.json`)
+  // The desktop app (and any `-o <existing dir>`) hands us a real folder, not a slot to
+  // fill: appending `.json` to it wrote a sibling *of* the folder. Name a dated file
+  // inside it instead, the same name exportCsv gives its dated subfolder. A path written
+  // with a trailing separator says folder just as plainly, whether or not it exists yet.
+  const namedAsFolder = /[\\/]$/.test(outputPath)
+  let target = resolve(outputPath)
+  if (namedAsFolder || (await stat(target).catch(() => null))?.isDirectory()) {
+    target = join(target, `codeburn-export-${new Date().toISOString().slice(0, 10)}.json`)
+  } else if (!target.toLowerCase().endsWith('.json')) {
+    target = `${target}.json`
+  }
   // Refuse to overwrite an existing file that wasn't produced by codeburn
   // export. CSV path has the same guard via the .codeburn-export marker; JSON
   // was missing it, so a stray `-o ~/important.json` would silently clobber.

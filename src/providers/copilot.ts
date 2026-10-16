@@ -40,6 +40,7 @@
 //   CODEBURN_COPILOT_WS_STORAGE_DIR — Override VS Code workspaceStorage
 //   CODEBURN_COPILOT_GLOBAL_STORAGE_DIR — Override VS Code globalStorage
 //   CODEBURN_COPILOT_JETBRAINS_DIR — Override the JetBrains github-copilot root
+//   CODEBURN_COPILOT_SESSION_STORE_DB — Override the ~/.copilot/session-store.db path
 //
 // ARCHITECTURE:
 //   discoverSessions() returns OTel sessions and legacy JSONL sessions. When
@@ -61,17 +62,704 @@ import { readdir, stat } from 'fs/promises'
 import { homedir, platform } from 'os'
 import { join, basename, dirname, posix, win32 } from 'path'
 import { existsSync } from 'fs'
+import { getEditorDataDir } from '../editor-data-dir.js'
 import { createHash } from 'crypto'
 import { readSessionFile } from '../fs-utils.js'
-import { calculateCost } from '../models.js'
+import { calculateCost, modelKeyMatches } from '../models.js'
+import { NANO_AIU_PER_CREDIT, creditsToUsd, nanoAiuToCredits } from '../copilot-aiu.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { estimateTokens } from '../context-tree.js'
 import type {
   Provider,
+  ProbeRoot,
   SessionSource,
   SessionParser,
   ParsedProviderCall,
 } from './types.js'
+
+const COPILOT_OPENAI_AUTO = 'copilot-openai-auto'
+const COPILOT_ANTHROPIC_AUTO = 'copilot-anthropic-auto'
+
+const transcriptToolCallModelHints: Array<{ prefix: string; model: string }> = [
+  // Anthropic tool-call ID variants observed in Copilot transcript logs.
+  { prefix: 'toolu_bdrk_', model: COPILOT_ANTHROPIC_AUTO },
+  { prefix: 'toolu_vrtx_', model: COPILOT_ANTHROPIC_AUTO },
+  { prefix: 'tooluse_', model: COPILOT_ANTHROPIC_AUTO },
+  { prefix: 'toolu_', model: COPILOT_ANTHROPIC_AUTO },
+  // OpenAI tool-call IDs.
+  { prefix: 'call_', model: COPILOT_OPENAI_AUTO },
+]
+
+// ---------------------------------------------------------------------------
+// Legacy chat-session JSON format helpers
+// ---------------------------------------------------------------------------
+
+// Legacy ids arrive as "copilot/claude-sonnet-4.5"; dotted ids price through the aliases in models.ts.
+function stripCopilotPrefix(raw: string): string {
+  return raw.replace(/^(?:copilot|github\.copilot-chat)\//, '').trim()
+}
+
+const CHARS_PER_TOKEN_LEGACY = 4
+
+/**
+ * A leaf text node inside a VSCode render tree.
+ * These appear at arbitrary depths; `type === 2` marks a concrete text segment.
+ */
+interface LegacyRenderNode {
+  type?: number
+  text?: string
+  children?: LegacyRenderNode[]
+}
+
+// Types below are trimmed from https://github.com/microsoft/vscode-copilot-chat/
+
+interface ChatCompletionContentPartText {
+  /**
+   * The text content.
+   */
+  text: string;
+  /**
+   * The type of the content part.
+   */
+  type: ChatCompletionContentPartKind.Text;
+}
+
+interface ChatCompletionContentPartCacheBreakpoint {
+  type: ChatCompletionContentPartKind.CacheBreakpoint
+}
+
+export enum ChatCompletionContentPartKind {
+  Image,
+  Text,
+  Opaque,
+  CacheBreakpoint,
+  Document,
+}
+
+type ChatCompletionContentPart = ChatCompletionContentPartText | ChatCompletionContentPartCacheBreakpoint
+
+interface ThinkingData {
+  text: string | string[]
+  tokens?: number
+}
+
+interface IToolCall {
+  name: string
+  arguments: string
+  id: string
+}
+
+interface IToolCallRound {
+  response: string
+  toolCalls: IToolCall[]
+  thinking?: ThinkingData
+}
+
+// (native VScode types are hidden behind a `vscode` import, these are relevant bits)
+interface LanguageModelToolResult {
+  content?: Array<{
+    value?: string | { node?: LegacyRenderNode }
+  }>
+}
+
+interface IResultMetadata {
+  metadata?: {
+    renderedUserMessage?: ChatCompletionContentPart[]
+    renderedGlobalContext?: ChatCompletionContentPart[]
+    toolCallRounds?: readonly IToolCallRound[]
+    /**
+     * Keyed by the tool call ID from toolCallRounds[].toolCalls[].id.
+     * Each entry holds the rendered result the model receives as tool-use
+     * input for its next reasoning step (file contents, command output, etc.).
+     * content[x].value is either a plain string ($mid:21 form) or an object
+     * with a .node render tree ($mid:23 form).
+     */
+    toolCallResults?: Record<string, LanguageModelToolResult>
+  }
+  details?: string
+}
+
+interface IParsedChatRequest {
+  readonly text: string
+}
+
+// https://github.com/microsoft/vscode/blob/main/src/vs/workbench/contrib/chat/common/model/chatModel.ts#L1648
+interface SerializedChatResponsePart {
+  kind?: string
+  value?: string
+  invocationMessage?: string
+  toolSpecificData?: unknown
+}
+
+/** Shape of a single request entry in the legacy chatSessions JSON. */
+interface LegacyChatRequest {
+  requestId: string
+  message?: string | IParsedChatRequest
+  variableData?: unknown
+  response?: SerializedChatResponsePart[]
+  timestamp?: number
+  modelId?: string
+  result?: IResultMetadata
+  promptTokens?: number
+  completionTokens?: number
+  outputTokens?: number
+  modelTotals?: unknown
+  copilotCredits?: unknown
+}
+
+interface LegacyChatSession {
+  sessionId?: string
+  customTitle?: string
+  creationDate?: number
+  lastMessageDate?: number
+  requests?: LegacyChatRequest[]
+  inputState?: {
+    selectedModel?: {
+      identifier?: string
+      metadata?: {
+        version?: string
+        family?: string
+      }
+    }
+  }
+}
+
+/**
+ * Recursively collect all text strings from a VSCode render-tree node.
+ *
+ * The render tree stores content as leaf nodes with `type === 2` and a `.text`
+ * string at arbitrary nesting depth via `.children[]` arrays. Every tool
+ * result (file reads, terminal output, edit confirmations, …) uses this shape,
+ * regardless of the root `ctorName` (`tse`, `Wy`, etc.).
+ */
+function extractRenderNodeTexts(node: LegacyRenderNode | null | undefined): string {
+  if (!node || typeof node !== 'object') return ''
+  let out = ''
+  if (node.type === 2 && typeof node.text === 'string') {
+    out += node.text
+  }
+  if (Array.isArray(node.children)) {
+    for (const child of node.children) {
+      out += extractRenderNodeTexts(child)
+    }
+  }
+  return out
+}
+
+/**
+ * Extract text from a toolCallResults entry's content array.
+ * Handles two observed shapes:
+ *  - $mid:21: value is a plain string (terminal output, error messages)
+ *  - $mid:23: value is an object with a .node render tree (edit confirmations, etc.)
+ */
+function extractToolCallResultContent(
+  results: NonNullable<NonNullable<LegacyChatRequest['result']>['metadata']>['toolCallResults'],
+): string {
+  if (!results) return ''
+  let out = ''
+  for (const result of Object.values(results)) {
+    for (const item of result.content ?? []) {
+      if (typeof item.value === 'string') {
+        out += item.value + '\n'
+      } else if (item.value && typeof item.value === 'object' && 'node' in item.value) {
+        out += extractRenderNodeTexts(item.value.node) + '\n'
+      }
+    }
+  }
+  return out
+}
+
+/**
+ * Extract the model's output text from toolCallRounds.
+ * This is more accurate than scanning req.response, because req.response also
+ * embeds terminal output (toolSpecificData.terminalCommandOutput.text) via its
+ * generic .text key — which inflates the apparent output size with content that
+ * is actually a tool result fed back as input, not model-generated output.
+ *
+ * Sources included:
+ *  - toolCallRounds[x].response  — the model's text reply per reasoning round
+ *  - toolCallRounds[x].toolCalls[x].arguments  — JSON args the model emitted
+ *  - response[x].invocationMessage  — short narration strings ("Using 'Run in Terminal'")
+ */
+
+interface LegacyResponsePart {
+  kind?: string
+  value?: string | string[]
+  content?: string | { value?: string }
+  toolCallId?: string
+  toolId?: string
+  toolSpecificData?: {
+    terminalCommandOutput?: {
+      text?: string
+    }
+  }
+  resultDetails?: {
+    output?: {
+      type?: string
+      mimeType?: string
+      base64Data?: string
+    }
+  }
+}
+
+function inferModelFromLegacySession(session: LegacyChatSession): string {
+  // 1. Try to find the first request that has a non-empty, non-auto modelId
+  for (const req of session.requests ?? []) {
+    if (req.modelId) {
+      const stripped = stripCopilotPrefix(req.modelId)
+      if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto' && stripped !== 'unknown') {
+        return stripped
+      }
+    }
+  }
+
+  // 1.5. Look in inputState.selectedModel
+  const selectedModel = session.inputState?.selectedModel
+  if (selectedModel) {
+    const version = selectedModel.metadata?.version || selectedModel.metadata?.family || selectedModel.identifier
+    if (version) {
+      const stripped = stripCopilotPrefix(version)
+      if (stripped && stripped !== 'copilot/auto' && stripped !== 'auto' && stripped !== 'copilot-auto') {
+        return stripped
+      }
+    }
+  }
+
+  // 2. Try to find if there are any tool calls or IDs that hint at the model
+  for (const req of session.requests ?? []) {
+    const rawRounds = (req.result?.metadata as Record<string, unknown> | undefined)?.['toolCallRounds'] ??
+      (isRecord(req.result) ? (req.result as Record<string, unknown>)['toolCallRounds'] : null)
+    const rounds: IToolCallRound[] = Array.isArray(rawRounds) ? rawRounds : []
+    for (const round of rounds) {
+      for (const tc of round.toolCalls ?? []) {
+        const id = tc.id ?? ''
+        for (const hint of transcriptToolCallModelHints) {
+          if (id.startsWith(hint.prefix)) {
+            return hint.model
+          }
+        }
+      }
+    }
+    const response = req.response
+    for (const item of response ?? []) {
+      if (item && typeof item === 'object') {
+        const itemTyped = item as LegacyResponsePart
+        const id = itemTyped.toolCallId ?? ''
+        for (const hint of transcriptToolCallModelHints) {
+          if (id.startsWith(hint.prefix)) {
+            return hint.model
+          }
+        }
+      }
+    }
+  }
+
+  return 'unknown'
+}
+
+function extractToolCallResultContentFromParts(response: LegacyChatRequest['response']): string {
+  if (!response) return ''
+  let out = ''
+  for (const item of response) {
+    if (!item || typeof item !== 'object') continue
+    if (item.kind === 'toolInvocationSerialized') {
+      const itemTyped = item as LegacyResponsePart
+      const spec = itemTyped.toolSpecificData
+      if (spec) {
+        // Handle terminal commands output
+        if (spec.terminalCommandOutput && typeof spec.terminalCommandOutput.text === 'string') {
+          out += spec.terminalCommandOutput.text + '\n'
+        }
+      }
+
+      // Handle resultDetails containing base64 data. Images and other binary
+      // outputs are not tokenised as text, so only text payloads count.
+      const resultDetails = itemTyped.resultDetails
+      if (resultDetails && typeof resultDetails === 'object') {
+        if (resultDetails.output && resultDetails.output.type === 'data' && resultDetails.output.mimeType?.startsWith('text/')) {
+          const base64 = resultDetails.output.base64Data
+          if (typeof base64 === 'string') {
+            const decoded = Buffer.from(base64, 'base64').toString('utf8')
+            out += decoded + '\n'
+          }
+        }
+      }
+    }
+  }
+  return out
+}
+
+interface LegacyOutputs {
+  outputText: string
+  reasoningText: string
+  recordedReasoningTokens: number
+}
+
+// Prefer toolCallRounds over req.response: response also embeds terminal output, which is model input.
+function extractLegacyOutputs(req: LegacyChatRequest): LegacyOutputs {
+  let outputText = ''
+  let reasoningText = ''
+  let recordedReasoningTokens = 0
+
+  const rounds = req.result?.metadata?.toolCallRounds
+  const response = req.response
+
+  if (rounds && rounds.length > 0) {
+    for (const round of rounds) {
+      if (typeof round.response === 'string' && round.response) {
+        outputText += round.response + '\n'
+      }
+      for (const tc of round.toolCalls ?? []) {
+        if (typeof tc.arguments === 'string' && tc.arguments) {
+          outputText += tc.arguments + '\n'
+        }
+      }
+      if (numberOrZero(round.thinking?.tokens) > 0) {
+        recordedReasoningTokens += round.thinking!.tokens!
+      } else if (round.thinking) {
+        const text = round.thinking.text
+        if (typeof text === 'string' && text) {
+          reasoningText += text + '\n'
+        } else if (Array.isArray(text)) {
+          reasoningText += text.join('\n') + '\n'
+        }
+      }
+    }
+  } else if (response && response.length > 0) {
+    // Fallback: extract from response parts
+    for (const itemRaw of response) {
+      if (!itemRaw || typeof itemRaw !== 'object') continue
+      const item = itemRaw as LegacyResponsePart
+
+      // Plain IMarkdownString or item.kind === 'markdownContent' or item.kind === 'markdownVuln'
+      if ('value' in item && typeof item.value === 'string' && !('kind' in item)) {
+        outputText += item.value + '\n'
+      } else if ((item.kind === 'markdownContent' || item.kind === 'markdownVuln') && item.content) {
+        if (typeof item.content === 'string') {
+          outputText += item.content + '\n'
+        } else if (typeof item.content === 'object' && item.content !== null && 'value' in item.content && typeof item.content.value === 'string') {
+          outputText += item.content.value + '\n'
+        }
+      } else if (item.kind === 'thinking' && item.value) {
+        if (typeof item.value === 'string') {
+          reasoningText += item.value + '\n'
+        } else if (Array.isArray(item.value)) {
+          reasoningText += item.value.join('\n') + '\n'
+        }
+      } else if (item.kind === 'textEditGroup') {
+        const edits = (item as { edits?: unknown[] }).edits
+        if (Array.isArray(edits)) {
+          for (const edit of edits) {
+            if (Array.isArray(edit)) {
+              for (const e of edit) {
+                if (e && typeof e === 'object' && 'text' in e && typeof (e as { text: unknown }).text === 'string') {
+                  outputText += (e as { text: string }).text + '\n'
+                }
+              }
+            } else if (edit && typeof edit === 'object' && 'text' in edit && typeof (edit as { text: unknown }).text === 'string') {
+              outputText += (edit as { text: string }).text + '\n'
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // invocationMessage strings are model narration in the UI ("Checking terminal output",
+  // "Using 'Multi-Replace String'", etc.); short but part of model output.
+  for (const item of response ?? []) {
+    if (item && typeof item === 'object') {
+      const inv = (item as { invocationMessage?: unknown }).invocationMessage
+      if (typeof inv === 'string' && inv) {
+        outputText += inv + '\n'
+      } else if (inv && typeof inv === 'object' && 'value' in inv && typeof (inv as { value: unknown }).value === 'string') {
+        outputText += (inv as { value: string }).value + '\n'
+      }
+    }
+  }
+
+  return { outputText, reasoningText, recordedReasoningTokens }
+}
+
+function extractModelFromRequest(req: LegacyChatRequest, session: LegacyChatSession): string {
+  const result = isRecord(req.result) ? (req.result as Record<string, unknown>) : undefined
+  const metadata = isRecord(result?.['metadata']) ? (result?.['metadata'] as Record<string, unknown>) : undefined
+
+  // 1. Check resolved model from result metadata
+  const resolvedMeta = readString(metadata?.['resolvedModel']) || readString(metadata?.['model'])
+  if (resolvedMeta) {
+    const stripped = stripCopilotPrefix(resolvedMeta)
+    if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+      return stripped
+    }
+  }
+
+  // 2. Check resolved model directly on result
+  const resultResolved = readString(result?.['resolvedModel']) || readString(result?.['model'])
+  if (resultResolved) {
+    const stripped = stripCopilotPrefix(resultResolved)
+    if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+      return stripped
+    }
+  }
+
+  // 3. Check response parts for autoModeResolution or model info
+  for (const part of req.response ?? []) {
+    if (part && typeof part === 'object') {
+      const p = part as Record<string, unknown>
+      if (p['kind'] === 'autoModeResolution') {
+        const resolved = readString(p['resolvedModel']) || readString(p['model']) || readString(p['modelId'])
+        if (resolved) {
+          const stripped = stripCopilotPrefix(resolved)
+          if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+            return stripped
+          }
+        }
+      }
+    }
+  }
+
+  // 4. Check request modelId
+  if (req.modelId) {
+    const stripped = stripCopilotPrefix(req.modelId)
+    if (stripped && stripped !== 'auto' && stripped !== 'copilot-auto') {
+      return stripped
+    }
+  }
+
+  // 5. Inferred session model or fallback
+  const inferred = inferModelFromLegacySession(session)
+  if (inferred && inferred !== 'auto' && inferred !== 'copilot-auto' && inferred !== 'unknown') {
+    return inferred
+  }
+
+  return 'unknown'
+}
+
+// An agent-mode request makes one model call per tool round, but
+// result.metadata.promptTokens/outputTokens describe only the last one.
+// modelTotals sums every round per model. Its inputTokens includes the cached
+// part when it comes from the Copilot engine and excludes it when it comes from
+// the Claude SDK; an input below the cached count can only be the latter.
+function chatSessionModelTotals(raw: unknown): { inputTokens: number; cacheReadTokens: number; outputTokens: number } | undefined {
+  if (!Array.isArray(raw)) return undefined
+  let input = 0
+  let cached = 0
+  let output = 0
+  let found = false
+  for (const entry of raw) {
+    if (!isRecord(entry)) continue
+    found = true
+    input += numberOrZero(entry['inputTokens'])
+    cached += numberOrZero(entry['cachedTokens'])
+    output += numberOrZero(entry['outputTokens'])
+  }
+  if (!found) return undefined
+  return { inputTokens: input >= cached ? input - cached : input, cacheReadTokens: cached, outputTokens: output }
+}
+
+// copilotCredits is GitHub's billed total_nano_aiu / 1e9 for the whole request,
+// subagents included, so it prices the request where the last-round prompt
+// tokens cannot.
+function chatSessionNanoAiu(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isFinite(raw) && raw >= 0 ? Math.round(raw * NANO_AIU_PER_CREDIT) : undefined
+}
+
+function parseLegacyChatSession(
+  session: LegacyChatSession,
+  sessionId: string,
+  project: string,
+  seenKeys: Set<string>,
+): ParsedProviderCall[] {
+  if (!session || !Array.isArray(session.requests)) return []
+
+  const results: ParsedProviderCall[] = []
+
+  for (const [reqIndex, req] of session.requests.entries()) {
+    const resultObj = isRecord(req.result) ? (req.result as Record<string, unknown>) : null
+    const meta = isRecord(resultObj?.['metadata']) ? (resultObj?.['metadata'] as Record<string, unknown>) : null
+    const usage = isRecord(resultObj?.['usage']) ? (resultObj?.['usage'] as Record<string, unknown>) : null
+
+    const totals = chatSessionModelTotals(req.modelTotals)
+    const nanoAiu = chatSessionNanoAiu(req.copilotCredits)
+
+    // Exact token extraction: check metadata, result, root req, and usage independently
+    const exactPromptTokens = totals ? totals.inputTokens : (
+      numberOrZero(meta?.['promptTokens']) ||
+      numberOrZero(resultObj?.['promptTokens']) ||
+      numberOrZero(req.promptTokens) ||
+      numberOrZero(usage?.['promptTokens']) ||
+      numberOrZero(usage?.['prompt_tokens']) ||
+      undefined
+    )
+
+    // Root completionTokens is summed over every round; metadata holds the last.
+    const exactOutputTokens = totals ? totals.outputTokens : (
+      numberOrZero(req.completionTokens) ||
+      numberOrZero(meta?.['outputTokens']) ||
+      numberOrZero(resultObj?.['outputTokens']) ||
+      numberOrZero(req.outputTokens) ||
+      numberOrZero(usage?.['completionTokens']) ||
+      numberOrZero(usage?.['completion_tokens']) ||
+      undefined
+    )
+
+    const exactCacheRead = totals ? totals.cacheReadTokens :
+      numberOrZero(meta?.['cacheReadTokens']) ||
+      numberOrZero(meta?.['cachedTokens']) ||
+      numberOrZero(resultObj?.['cacheReadTokens']) ||
+      numberOrZero(resultObj?.['cachedTokens']) ||
+      numberOrZero(usage?.['cacheReadTokens']) ||
+      numberOrZero(usage?.['cache_read_tokens']) ||
+      numberOrZero(usage?.['cachedTokens']) ||
+      numberOrZero(usage?.['cached_tokens']) ||
+      0
+
+    const exactCacheCreation = totals ? 0 :
+      numberOrZero(meta?.['cacheCreationTokens']) ||
+      numberOrZero(meta?.['cacheWriteTokens']) ||
+      numberOrZero(resultObj?.['cacheCreationTokens']) ||
+      numberOrZero(resultObj?.['cacheWriteTokens']) ||
+      numberOrZero(usage?.['cacheCreationTokens']) ||
+      numberOrZero(usage?.['cache_creation_tokens']) ||
+      numberOrZero(usage?.['cacheWriteTokens']) ||
+      numberOrZero(usage?.['cache_write_tokens']) ||
+      0
+
+    const hasExactTokens = exactPromptTokens !== undefined || exactOutputTokens !== undefined
+
+    const model = extractModelFromRequest(req, session)
+
+    const rawRounds = (meta?.['toolCallRounds'] ?? resultObj?.['toolCallRounds'])
+    const extracted = extractChatSessionTools({ toolCallRounds: rawRounds })
+    const toolNamesSet = new Set(extracted.tools)
+    for (const item of req.response ?? []) {
+      const part = item as LegacyResponsePart
+      if (part?.kind === 'toolInvocationSerialized' && typeof part.toolId === 'string' && part.toolId.trim()) {
+        toolNamesSet.add(normalizeTool(part.toolId.trim()))
+      }
+    }
+    const tools = [...toolNamesSet]
+
+    const msgText = typeof req.message === 'string' ? req.message : (req.message?.text ?? '')
+    const { outputText, reasoningText, recordedReasoningTokens } = extractLegacyOutputs(req)
+
+    let totalInputTokens: number
+    let outputTokens: number
+    let cacheReadInputTokens = exactCacheRead
+    let cacheCreationInputTokens = exactCacheCreation
+    let reasoningTokens = 0
+    let isEstimated = false
+
+    if (hasExactTokens) {
+      totalInputTokens = exactPromptTokens ?? 0
+      outputTokens = exactOutputTokens ?? 0
+      isEstimated = false
+    } else {
+      isEstimated = true
+
+      // Exact output counts already include reasoning, so thinking is only estimated here.
+      reasoningTokens = recordedReasoningTokens + Math.ceil(reasoningText.length / CHARS_PER_TOKEN_LEGACY)
+
+      const globalParts = ((meta?.['renderedGlobalContext'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartText => isRecord(p) && p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string'
+      )
+      const userParts = ((meta?.['renderedUserMessage'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartText => isRecord(p) && p.type === ChatCompletionContentPartKind.Text && typeof p.text === 'string'
+      )
+      const globalCacheMarkers = ((meta?.['renderedGlobalContext'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartCacheBreakpoint => isRecord(p) && p.type === ChatCompletionContentPartKind.CacheBreakpoint
+      )
+      const userCacheMarkers = ((meta?.['renderedUserMessage'] as unknown[]) ?? []).filter(
+        (p): p is ChatCompletionContentPartCacheBreakpoint => isRecord(p) && p.type === ChatCompletionContentPartKind.CacheBreakpoint
+      )
+
+      let inputTokens = 0
+      const hasRenderedMetadata = globalParts.length > 0 || userParts.length > 0
+
+      if (hasRenderedMetadata) {
+        const globalText = globalParts.map((p) => p.text).join('\n')
+        const userText = userParts.map((p) => p.text).join('\n')
+
+        if (globalCacheMarkers.length > 0 || userCacheMarkers.length > 0) {
+          if (globalCacheMarkers.length > 0) {
+            cacheReadInputTokens = Math.ceil(globalText.length / CHARS_PER_TOKEN_LEGACY)
+          } else {
+            inputTokens = Math.ceil(globalText.length / CHARS_PER_TOKEN_LEGACY)
+          }
+
+          const attachmentText = userText.replace(msgText, '')
+          if (userCacheMarkers.length > 0 && attachmentText.length > 0) {
+            cacheCreationInputTokens = Math.ceil(attachmentText.length / CHARS_PER_TOKEN_LEGACY)
+          } else if (userCacheMarkers.length === 0) {
+            inputTokens += Math.ceil(userText.length / CHARS_PER_TOKEN_LEGACY)
+            inputTokens -= Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
+          }
+          inputTokens += Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
+        } else {
+          inputTokens = Math.ceil((globalText + '\n' + userText).length / CHARS_PER_TOKEN_LEGACY)
+        }
+      } else {
+        inputTokens = Math.ceil(msgText.length / CHARS_PER_TOKEN_LEGACY)
+      }
+
+      let toolResultText = extractToolCallResultContent(meta?.['toolCallResults'] as NonNullable<NonNullable<LegacyChatRequest['result']>['metadata']>['toolCallResults'])
+      if (!toolResultText) {
+        toolResultText = extractToolCallResultContentFromParts(req.response)
+      }
+      const toolResultTokens = Math.ceil(toolResultText.length / CHARS_PER_TOKEN_LEGACY)
+
+      totalInputTokens = inputTokens + toolResultTokens
+      outputTokens = Math.ceil(outputText.length / CHARS_PER_TOKEN_LEGACY)
+
+      if (outputTokens === 0 && totalInputTokens === 0 && cacheCreationInputTokens === 0 && reasoningTokens === 0) {
+        continue
+      }
+    }
+
+    const reqId = readString(req.requestId) || `request-${reqIndex}`
+    const dedupKey = `copilot-chatsession:${sessionId}:${reqId}`
+    if (seenKeys.has(dedupKey)) continue
+    seenKeys.add(dedupKey)
+
+    const costUSD = nanoAiu !== undefined ? creditsToUsd(nanoAiuToCredits(nanoAiu)) : calculateCost(
+      model,
+      totalInputTokens,
+      outputTokens + reasoningTokens,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+      0,
+    )
+
+    const ts = timestampToISO(req.timestamp) || timestampToISO(session.creationDate)
+
+    results.push({
+      provider: 'copilot',
+      model,
+      inputTokens: totalInputTokens,
+      outputTokens,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+      cachedInputTokens: 0,
+      reasoningTokens,
+      webSearchRequests: 0,
+      costUSD,
+      costIsEstimated: isEstimated && nanoAiu === undefined,
+      tools,
+      bashCommands: extracted.bashCommands,
+      skills: extracted.skills.length > 0 ? extracted.skills : undefined,
+      timestamp: ts,
+      speed: 'standard',
+      deduplicationKey: dedupKey,
+      userMessage: msgText,
+      sessionId,
+      project,
+      ...(nanoAiu !== undefined ? { nanoAiu, costFromBilling: true } : {}),
+    })
+  }
+
+  return results
+}
 
 // ---------------------------------------------------------------------------
 // Model display names (unchanged from original)
@@ -185,7 +873,9 @@ type UserMessageData = {
 type AssistantMessageData = {
   messageId: string
   model?: string       // present in newer copilot-agent format
-  outputTokens: number
+  // Absent from CLI 1.0.8x and the VS Code agent host; their output only
+  // reaches the session.shutdown rollup.
+  outputTokens?: number
   interactionId?: string
   toolRequests?: ToolRequest[]
 }
@@ -194,6 +884,9 @@ type SubagentSelectedData = {
   agentName: string
   agentDisplayName?: string
   tools?: string[]
+  // Present on subagent.started/completed (CLI ≥ ~1.0.7x): the delegation
+  // tool call that launched the run, used to pair completed with started.
+  toolCallId?: string
 }
 
 // Per-model usage rollup the CLI writes into session.shutdown. inputTokens is
@@ -207,8 +900,19 @@ type ShutdownModelUsage = {
 }
 
 type SessionShutdownData = {
-  modelMetrics?: Record<string, { usage?: ShutdownModelUsage }>
+  modelMetrics?: Record<string, { usage?: ShutdownModelUsage; totalNanoAiu?: number }>
   sessionStartTime?: number
+}
+
+// In-session compaction. The CLI emits compaction_start when it decides to
+// summarize and compaction_complete when the summarization call returns; only
+// the latter carries `success`, and only a successful one resets the
+// session.shutdown rollup counters. Every other field here is read
+// tolerantly - the payload also carries token counts, the summarization
+// call's own usage (compactionTokensUsed), messagesRemoved, model, requestId
+// and a manual/background `trigger`, none of which this parser needs.
+type SessionCompactionCompleteData = {
+  success?: boolean
 }
 
 type CopilotEvent =
@@ -217,7 +921,11 @@ type CopilotEvent =
   | { type: 'user.message'; data: UserMessageData; timestamp?: string }
   | { type: 'assistant.message'; data: AssistantMessageData; timestamp?: string }
   | { type: 'subagent.selected'; data: SubagentSelectedData; timestamp?: string }
+  | { type: 'subagent.started'; data: SubagentSelectedData; timestamp?: string }
+  | { type: 'subagent.completed'; data: SubagentSelectedData; timestamp?: string }
   | { type: 'session.shutdown'; data: SessionShutdownData; timestamp?: string }
+  | { type: 'session.compaction_start'; data: Record<string, unknown>; timestamp?: string }
+  | { type: 'session.compaction_complete'; data: SessionCompactionCompleteData; timestamp?: string }
 
 type ChatJournalPathSegment = string | number
 type ChatSessionRequest = Record<string, unknown>
@@ -257,6 +965,10 @@ function getCopilotSessionStateDir(override?: string): string {
   return override ?? process.env['CODEBURN_COPILOT_SESSION_STATE_DIR'] ?? join(homedir(), '.copilot', 'session-state')
 }
 
+function getSessionStoreDbPath(override?: string): string {
+  return override ?? process.env['CODEBURN_COPILOT_SESSION_STORE_DB'] ?? join(homedir(), '.copilot', 'session-store.db')
+}
+
 /**
  * Locate the agent-traces.db file.
  *
@@ -272,33 +984,8 @@ function getAgentTracesDbPath(): string | null {
     return existsSync(envOverride) ? envOverride : null
   }
 
-  const home = homedir()
-  const candidates: string[] = []
-
-  const p = platform()
-  if (p === 'darwin') {
-    // macOS: VS Code, VS Code Insiders, VSCodium
-    candidates.push(
-      join(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-      join(home, 'Library', 'Application Support', 'Code - Insiders', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-      join(home, 'Library', 'Application Support', 'VSCodium', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-    )
-  } else if (p === 'linux') {
-    // Linux: VS Code, VS Code Insiders, VSCodium
-    candidates.push(
-      join(home, '.config', 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-      join(home, '.config', 'Code - Insiders', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-      join(home, '.config', 'VSCodium', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-    )
-  } else if (p === 'win32') {
-    // Windows
-    const appdata = process.env['APPDATA'] ?? join(home, 'AppData', 'Roaming')
-    candidates.push(
-      join(appdata, 'Code', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-      join(appdata, 'Code - Insiders', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-      join(appdata, 'VSCodium', 'User', 'globalStorage', 'github.copilot-chat', 'agent-traces.db'),
-    )
-  }
+  const candidates = getVSCodeGlobalStorageDirs(homedir(), platform())
+    .map(dir => join(dir, 'github.copilot-chat', 'agent-traces.db'))
 
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
@@ -375,7 +1062,7 @@ function loadSpanAttributesFromTable(
         try {
           // Try to parse numeric values
           const numValue = Number(row.value)
-          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue) 
+          attrs[row.key as keyof SpanAttributes] = Number.isNaN(numValue)
             ? row.value
             : numValue
         } catch {
@@ -567,18 +1254,51 @@ function modelFromChatSessionRequest(req: ChatSessionRequest, metadata: Record<s
   return modelId || 'unknown'
 }
 
-function extractChatSessionTools(metadata: Record<string, unknown>): string[] {
+function parseStructuredArguments(raw: unknown): Record<string, unknown> | null {
+  const payload = typeof raw === 'string'
+    ? (() => {
+        try {
+          return JSON.parse(raw) as unknown
+        } catch {
+          return null
+        }
+      })()
+    : raw
+  return isRecord(payload) ? payload : null
+}
+
+function extractStructuredSkill(raw: unknown): string | null {
+  const payload = parseStructuredArguments(raw)
+  if (!payload) return null
+  const skill = payload['skill']
+  return typeof skill === 'string' && skill.trim() ? skill.trim() : null
+}
+
+function extractChatSessionTools(metadata: Record<string, unknown>): { tools: string[]; skills: string[]; bashCommands: string[] } {
   const rounds = metadata['toolCallRounds']
-  if (!Array.isArray(rounds)) return []
+  if (!Array.isArray(rounds)) return { tools: [], skills: [], bashCommands: [] }
 
   const names = new Set<string>()
+  const skills = new Set<string>()
+  const bashCommands: string[] = []
   const addName = (raw: unknown): void => {
     if (typeof raw === 'string' && raw.trim()) names.add(normalizeTool(raw))
   }
   const addFromRecord = (record: Record<string, unknown>): void => {
-    addName(record['toolName'])
-    addName(record['name'])
-    addName(record['tool'])
+    const rawNames = ['toolName', 'name', 'tool'].map(key => record[key])
+    for (const raw of rawNames) {
+      addName(raw)
+      if (typeof raw !== 'string' || normalizeTool(raw) !== 'Skill') continue
+      const skill = extractStructuredSkill(record['arguments'])
+        ?? extractStructuredSkill(record['input'])
+      if (skill) skills.add(skill)
+    }
+    if (rawNames.some(raw => typeof raw === 'string' && BASH_TOOL_NAMES.has(raw))) {
+      const args = parseStructuredArguments(record['arguments'])
+        ?? parseStructuredArguments(record['input'])
+      const command = args?.['command']
+      if (typeof command === 'string') bashCommands.push(...extractBashCommands(command))
+    }
   }
 
   for (const round of rounds) {
@@ -598,7 +1318,7 @@ function extractChatSessionTools(metadata: Record<string, unknown>): string[] {
     }
   }
 
-  return [...names]
+  return { tools: [...names], skills: [...skills], bashCommands }
 }
 
 /**
@@ -693,56 +1413,80 @@ function inferTranscriptModel(lines: string[]): string {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL parser (handles both regular session-state events and VS Code
-// transcript format via session.start { producer: 'copilot-agent' })
+// JSONL parser (handles both regular CLI session-state events and the VS Code
+// transcript format — the same event vocabulary, but transcripts carry no
+// token counts and no session.shutdown rollup)
 // ---------------------------------------------------------------------------
 
+/**
+ * `isTranscript` comes from discovery (where the file lives), never from
+ * content: the Copilot CLI writes the same session.start producer
+ * ('copilot-agent') that VS Code transcripts carry, so producer sniffing
+ * misread every CLI session as a transcript and dropped its session.shutdown
+ * input/cache rollup (#944).
+ */
 function createJsonlParser(
   source: SessionSource,
-  seenKeys: Set<string>
+  seenKeys: Set<string>,
+  isTranscript: boolean
 ): SessionParser {
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const content = await readSessionFile(source.path)
       if (!content) return
-      const sessionId = basename(dirname(source.path))
+      // CLI session-state files live at <sessionId>/events.jsonl; transcripts
+      // at transcripts/<sessionId>.jsonl — keying the latter on the parent dir
+      // would collapse every transcript into one "transcripts" session (and
+      // one shared dedup namespace).
+      const sessionId = isTranscript
+        ? basename(source.path, '.jsonl')
+        : basename(dirname(source.path))
       const lines = content.split('\n').filter((l) => l.trim())
 
-      // Detect VS Code transcript format: the first session.start event has
-      // { producer: 'copilot-agent' } and no outputTokens in messages.
-      let isTranscript = false
       let currentModel = ''
       let pendingUserMessage = ''
-      // Track the active subagent for this session (from subagent.selected events).
-      // Resets when a new subagent is selected.
-      let currentSubagentType: string | undefined
-
-      // First pass: detect format and infer transcript model if needed.
-      for (const line of lines) {
-        try {
-          const ev = JSON.parse(line) as CopilotEvent
-          if (ev.type === 'session.start') {
-            const data = ev.data as SessionStartData & { producer?: string }
-            if (data.producer === 'copilot-agent') {
-              isTranscript = true
-            }
-            break
-          }
-          if (ev.type === 'session.model_change') break // regular format
-        } catch {
-          continue
-        }
-      }
+      // Subagent attribution. Older CLIs write subagent.selected — sticky
+      // until replaced, never cleared. CLI ≥ ~1.0.7x brackets each run with
+      // started/completed instead; runs can nest or overlap, so completed
+      // removes ONLY its own toolCallId's entry and the label falls back to
+      // the still-active run (or the sticky selected value) rather than
+      // wiping attribution for everything in flight.
+      let selectedSubagentType: string | undefined
+      const activeSubagents: Array<{ toolCallId: string; name: string }> = []
+      const currentSubagentType = (): string | undefined =>
+        activeSubagents[activeSubagents.length - 1]?.name ?? selectedSubagentType
 
       if (isTranscript) {
+        // Tool-call-id prefix inference seeds the model; it must not gate the
+        // whole file, or a transcript carrying explicit model info
+        // (session.model_change / per-message model) but no tool calls would
+        // yield nothing. Messages that still end up modelless are skipped
+        // individually below.
         currentModel = inferTranscriptModel(lines)
-        if (!currentModel) return // no toolCallIds to infer model from
       }
 
       // Shutdown rollups may lack their own timestamp; remember the last
       // stamped event so the supplementary call is never left with an empty
       // timestamp, which the date-range filters silently drop.
       let lastEventTimestamp = ''
+
+      // Stamp of the most recent SUCCESSFUL session.compaction_complete seen so
+      // far. Carried onto each shutdown leg because a compaction resets the
+      // rollup counters, so the leg only describes requests after this point.
+      let lastCompactionTs = ''
+
+      // A resumed session appends one session.shutdown PER LEG, each carrying
+      // CUMULATIVE per-model totals. Emitting each rollup whole would need the
+      // cache to update a prior call in place — the durable merge is
+      // append-only by dedup key — so we emit per-leg DELTAS keyed by
+      // occurrence (`:n`): re-parses of a growing file append only the new
+      // leg, and each leg lands on its own timestamp. Discovery only yields
+      // `<sid>/events.jsonl`, so two journals cannot share a session id.
+      const prevShutdownUsage = new Map<string, Required<ShutdownModelUsage> & { nanoAiu: number }>()
+      const shutdownCountByModel = new Map<string, number>()
+      // Whether this leg's assistant.message events carried outputTokens. When
+      // none did, the rollup is the only record of output and must carry it.
+      let legHasPerTurnOutput = false
 
       for (const line of lines) {
         let event: CopilotEvent
@@ -765,8 +1509,55 @@ function createJsonlParser(
           continue
         }
 
+        // In-session compaction RESETS the session.shutdown rollup counters,
+        // so a leg that contains one describes only its post-compaction
+        // requests. Carrying the compaction's stamp onto the leg lets the
+        // serve-time reconciliation start that leg's store-row interval here
+        // instead of at the previous leg, which is the difference between
+        // subtracting only the requests the rollup actually covers and
+        // subtracting the whole pre-compaction conversation from it.
+        // compaction_start is recognized but carries nothing we need: only a
+        // COMPLETE with success:true reset anything (a failed or abandoned
+        // compaction leaves the counters alone).
+        if (event.type === 'session.compaction_complete') {
+          const data = event.data as SessionCompactionCompleteData | undefined
+          const ts = typeof event.timestamp === 'string' ? event.timestamp : ''
+          if (data?.success === true && ts && !Number.isNaN(new Date(ts).getTime())) {
+            lastCompactionTs = ts
+          }
+          continue
+        }
+        if (event.type === 'session.compaction_start') continue
+
         if (event.type === 'subagent.selected') {
-          currentSubagentType = (event.data as SubagentSelectedData).agentName
+          selectedSubagentType = (event.data as SubagentSelectedData).agentName
+          continue
+        }
+
+        if (event.type === 'subagent.started') {
+          const data = event.data as SubagentSelectedData
+          activeSubagents.push({ toolCallId: data.toolCallId ?? '', name: data.agentName })
+          continue
+        }
+
+        if (event.type === 'subagent.completed') {
+          const id = (event.data as SubagentSelectedData).toolCallId ?? ''
+          if (!id) {
+            // ID-less completion (transitional CLIs that key nothing, like
+            // subagent.selected): end the most recently started run; explicit
+            // no-op on an empty stack.
+            activeSubagents.pop()
+            continue
+          }
+          for (let i = activeSubagents.length - 1; i >= 0; i--) {
+            if (activeSubagents[i]!.toolCallId === id) {
+              activeSubagents.splice(i, 1)
+              break
+            }
+          }
+          // A non-empty id that matches nothing refers to a run we never saw
+          // start — leave the active runs alone rather than evicting an
+          // unrelated one.
           continue
         }
 
@@ -783,54 +1574,122 @@ function createJsonlParser(
           // is gated to the CLI (non-transcript) format, leaving VS Code,
           // JetBrains and OTel sources untouched.
           //
-          // We emit one supplementary call per model carrying ONLY the
-          // input/cache tokens the per-turn events lack; output is excluded so
-          // the assistant.message output (and its cost) is not double-counted.
-          // Combined with the per-turn output cost, this yields the full,
-          // CLI-measured session cost.
+          // We emit one supplementary call per model PER SHUTDOWN LEG (resumed
+          // sessions write one cumulative rollup per leg; see the delta
+          // tracking above) carrying ONLY the input/cache tokens the per-turn
+          // events lack; output is excluded so the assistant.message output
+          // (and its cost) is not double-counted. Combined with the per-turn
+          // output cost, this yields the full, CLI-measured session cost.
+          // CLI 1.0.8x and the VS Code agent host write no per-turn output,
+          // so for their legs the rollup carries output too.
           if (isTranscript) continue
+          // When session-store.db holds per-request usage rows for this
+          // session, those rows are authoritative for input/cache: written
+          // per request instead of only on clean shutdown, and they describe
+          // the SAME tokens this rollup lumps together. That precedence is
+          // enforced at SERVE time, not here: this rollup is always parsed
+          // and cached, and the reconciliation in parseProviderSources
+          // decides per (session, model) — store rows replace the rollup,
+          // with any usage the rollup carried beyond the rows' sum served as
+          // a residual (see reconcileCopilotCalls there). Read-time
+          // precedence over one coherent serve set cannot be raced by
+          // writers between a coverage probe and this parse, and a briefly
+          // unreadable store never blocks this file.
           const shutdownData = event.data as SessionShutdownData
           const modelMetrics = shutdownData.modelMetrics
           if (!isRecord(modelMetrics)) continue
 
+          // Prefer lastEventTimestamp over sessionStartTime. sessionStartTime
+          // is identical for every stampless leg of a resumed session, so
+          // using it for the call timestamp (or, previously, the key) collapsed
+          // those legs onto one date. lastEventTimestamp is the last stamped
+          // event in this journal — distinct per leg when intervening events
+          // are stamped, and still a real time when they are not.
+          //
+          // Fallback order matters for accounting, not just display: this
+          // stamp anchors the leg's interval in the serve-time reconciliation,
+          // which subtracts the store rows written up to it. A shutdown
+          // happens at the END of a leg, so the last event seen is the
+          // nearest true anchor; sessionStartTime is BEFORE every row, and
+          // anchoring there would leave the leg covering nothing and re-mint
+          // its whole usage as a residual beside the rows it duplicates.
           const shutdownTimestamp =
-            (event.timestamp ?? '') || timestampToISO(shutdownData.sessionStartTime) || lastEventTimestamp
+            (event.timestamp ?? '') || lastEventTimestamp || timestampToISO(shutdownData.sessionStartTime)
 
           for (const [model, metrics] of Object.entries(modelMetrics)) {
             if (!model || !isRecord(metrics)) continue
             const usage = metrics['usage']
             if (!isRecord(usage)) continue
 
-            const cacheReadTokens = numberOrZero(usage['cacheReadTokens'])
-            const cacheWriteTokens = numberOrZero(usage['cacheWriteTokens'])
-            const reasoningTokens = numberOrZero(usage['reasoningTokens'])
+            const hasNanoAiu = typeof metrics['totalNanoAiu'] === 'number'
+            const cumulative = {
+              inputTokens: numberOrZero(usage['inputTokens']),
+              outputTokens: numberOrZero(usage['outputTokens']),
+              cacheReadTokens: numberOrZero(usage['cacheReadTokens']),
+              cacheWriteTokens: numberOrZero(usage['cacheWriteTokens']),
+              reasoningTokens: numberOrZero(usage['reasoningTokens']),
+              nanoAiu: numberOrZero(metrics['totalNanoAiu']),
+            }
+            const prevRaw = prevShutdownUsage.get(model)
+            prevShutdownUsage.set(model, cumulative)
+            const n = (shutdownCountByModel.get(model) ?? 0) + 1
+            shutdownCountByModel.set(model, n)
+
+            // A cumulative total BELOW the previous rollup means the CLI reset
+            // its counters (a fresh accounting epoch): delta from zero, else
+            // this leg's post-reset usage would be clamped away entirely.
+            // inputTokens is the monotonic sentinel — it is cache-inclusive,
+            // so any usage at all grows it. In-session COMPACTION is a
+            // confirmed reset trigger (CLI 1.0.78: a clean single-process
+            // 107-request session's sole rollup covered exactly its five
+            // post-compaction requests), so rollup-only accounting
+            // undercounts any compacted session — usage between the last
+            // pre-reset rollup and the reset is simply never written here.
+            // Only the per-request session-store rows record it; that is why
+            // they are authoritative for covered sessions.
+            const prev =
+              prevRaw && cumulative.inputTokens < numberOrZero(prevRaw.inputTokens)
+                ? undefined
+                : prevRaw
+
+            // This leg's contribution: cumulative minus the previous rollup.
+            // The clamp guards any remaining non-monotonic field.
+            const delta = (k: keyof typeof cumulative): number =>
+              Math.max(0, cumulative[k] - numberOrZero(prev?.[k]))
+            const outputTokens = legHasPerTurnOutput ? 0 : delta('outputTokens')
+            const nanoAiu = hasNanoAiu
+              ? Math.max(0, cumulative.nanoAiu - (prevRaw && cumulative.nanoAiu >= prevRaw.nanoAiu ? prevRaw.nanoAiu : 0))
+              : undefined
+            const cacheReadTokens = delta('cacheReadTokens')
+            const cacheWriteTokens = delta('cacheWriteTokens')
+            const reasoningTokens = delta('reasoningTokens')
             // usage.inputTokens is cache-INCLUSIVE (input + cache_read +
             // cache_write). calculateCost expects the uncached input alone with
             // cache tokens billed separately, so subtract the cache components.
             // Clamp at 0 in case a future schema reports input non-inclusively.
             const inputTokens = Math.max(
               0,
-              numberOrZero(usage['inputTokens']) - cacheReadTokens - cacheWriteTokens
+              delta('inputTokens') - cacheReadTokens - cacheWriteTokens
             )
 
             // Nothing this call would add over the per-turn events, so skip it
-            // to avoid an empty $0 row (output is intentionally excluded).
-            if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0) continue
+            // to avoid an empty $0 row.
+            if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0 && !nanoAiu) continue
 
-            const dedupKey = `copilot:${sessionId}:shutdown:${model}`
+            const dedupKey = `copilot:${sessionId}:shutdown:${model}:${n}`
             if (seenKeys.has(dedupKey)) continue
             seenKeys.add(dedupKey)
 
             // Tokens are real counts written by the CLI, so this cost is
             // measured, not char-estimated: costIsEstimated is false.
-            const costUSD = calculateCost(model, inputTokens, 0, cacheWriteTokens, cacheReadTokens, 0)
+            const costUSD = calculateCost(model, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens, 0)
 
             yield {
               provider: 'copilot',
               sessionId,
               model,
               inputTokens,
-              outputTokens: 0,
+              outputTokens,
               cacheCreationInputTokens: cacheWriteTokens,
               cacheReadInputTokens: cacheReadTokens,
               cachedInputTokens: 0,
@@ -844,21 +1703,27 @@ function createJsonlParser(
               speed: 'standard' as const,
               deduplicationKey: dedupKey,
               userMessage: '',
+              ...(lastCompactionTs ? { compactedAt: lastCompactionTs } : {}),
+              ...(nanoAiu !== undefined ? { nanoAiu } : {}),
             }
           }
+          legHasPerTurnOutput = false
           continue
         }
 
         if (event.type === 'assistant.message') {
           const msgData = event.data as AssistantMessageData
           const { messageId, model: msgModel, outputTokens = 0 } = msgData
+          const hasOutputField = typeof msgData.outputTokens === 'number'
+          if (hasOutputField) legHasPerTurnOutput = true
           const rawRequests = (msgData as { toolRequests?: unknown }).toolRequests
           const toolRequests = coerceToolRequests(rawRequests)
 
           // model may be carried per-message in newer copilot-agent format
           if (msgModel) currentModel = msgModel
-          // Regular JSONL: skip zero-token messages; transcripts don't have tokens
-          if (!isTranscript && outputTokens === 0) continue
+          // Older CLIs: skip zero-token messages. A message with no outputTokens
+          // field still counts as a request; its tokens arrive with the rollup.
+          if (!isTranscript && hasOutputField && outputTokens === 0) continue
           if (!currentModel) continue
 
           const dedupKey = `copilot:${sessionId}:${messageId}`
@@ -898,6 +1763,7 @@ function createJsonlParser(
           // Cost will be lower than actual API cost. This is the original
           // behaviour — OTel data (below) replaces it when available.
           const costUSD = calculateCost(currentModel, 0, outputTokens, 0, 0, 0)
+          const subagentType = currentSubagentType()
 
           yield {
             provider: 'copilot',
@@ -911,10 +1777,14 @@ function createJsonlParser(
             reasoningTokens: 0,
             webSearchRequests: 0,
             costUSD,
+            // A transcript with no token count has unknown usage, not zero. A
+            // counted output is measured; the shutdown rollup or store rows
+            // carry the input (and, for tokenless CLI messages, the output).
+            ...(isTranscript && outputTokens === 0 ? { costIsEstimated: true } : {}),
             tools,
             bashCommands,
             skills: skills.length > 0 ? skills : undefined,
-            subagentTypes: currentSubagentType ? [currentSubagentType] : undefined,
+            subagentTypes: subagentType ? [subagentType] : undefined,
             timestamp: event.timestamp ?? '',
             speed: 'standard' as const,
             deduplicationKey: dedupKey,
@@ -936,6 +1806,18 @@ function createChatSessionParser(
       const content = await readSessionFile(source.path)
       if (!content) return
 
+      if (source.path.endsWith('.json')) {
+        let session: LegacyChatSession
+        try {
+          session = JSON.parse(content) as LegacyChatSession
+        } catch {
+          return
+        }
+        const sessionId = readString(session.sessionId) || basename(source.path, '.json')
+        yield* parseLegacyChatSession(session, sessionId, source.project, seenKeys)
+        return
+      }
+
       const root = replayChatSessionJournal(content)
       if (!isRecord(root)) return
 
@@ -952,11 +1834,15 @@ function createChatSessionParser(
         const rawMetadata = resultRecord?.['metadata']
         const metadata = isRecord(rawMetadata) ? rawMetadata : createReplayObject()
 
-        const inputTokens = numberOrZero(metadata['promptTokens'])
-        const metadataOutputTokens = numberOrZero(metadata['outputTokens'])
-        const outputTokens = metadataOutputTokens || numberOrZero(rawReq['completionTokens'])
+        // VS Code also serializes usage on the request itself, with output
+        // summed over every round. Same precedence as the legacy JSON parser.
+        const totals = chatSessionModelTotals(rawReq['modelTotals'])
+        const nanoAiu = chatSessionNanoAiu(rawReq['copilotCredits'])
+        const inputTokens = totals ? totals.inputTokens : numberOrZero(metadata['promptTokens']) || numberOrZero(rawReq['promptTokens'])
+        const outputTokens = totals ? totals.outputTokens : numberOrZero(rawReq['completionTokens']) || numberOrZero(metadata['outputTokens'])
+        const cacheReadTokens = totals?.cacheReadTokens ?? 0
 
-        if (inputTokens === 0 && outputTokens === 0) continue
+        if (inputTokens === 0 && outputTokens === 0 && cacheReadTokens === 0 && !nanoAiu) continue
 
         const requestId = readString(rawReq['requestId']) || `request-${index}`
         const dedupKey = `copilot-chatsession:${sessionId}:${requestId}`
@@ -964,8 +1850,13 @@ function createChatSessionParser(
         seenKeys.add(dedupKey)
 
         const model = modelFromChatSessionRequest(rawReq, metadata)
-        const costUSD = calculateCost(model, inputTokens, outputTokens, 0, 0, 0)
+        const costUSD = nanoAiu !== undefined
+          ? creditsToUsd(nanoAiuToCredits(nanoAiu))
+          : calculateCost(model, inputTokens, outputTokens, 0, cacheReadTokens, 0)
         const timestamp = timestampToISO(rawReq['timestamp']) || sessionCreatedAt
+        const userMessage = isRecord(rawReq['message']) ? readString(rawReq['message']['text']) : ''
+
+        const extracted = extractChatSessionTools(metadata)
 
         yield {
           provider: 'copilot',
@@ -975,17 +1866,19 @@ function createChatSessionParser(
           inputTokens,
           outputTokens,
           cacheCreationInputTokens: 0,
-          cacheReadInputTokens: 0,
+          cacheReadInputTokens: cacheReadTokens,
           cachedInputTokens: 0,
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD,
-          tools: extractChatSessionTools(metadata),
-          bashCommands: [],
+          tools: extracted.tools,
+          bashCommands: extracted.bashCommands,
+          skills: extracted.skills.length > 0 ? extracted.skills : undefined,
           timestamp,
           speed: 'standard' as const,
           deduplicationKey: dedupKey,
-          userMessage: '',
+          userMessage,
+          ...(nanoAiu !== undefined ? { nanoAiu, costFromBilling: true } : {}),
         }
       }
     },
@@ -1008,11 +1901,22 @@ function createChatSessionParser(
 // Known JetBrains Copilot model tokens, longest-first so we match the most
 // specific name (e.g. "gpt-4.1-mini" before "gpt-4.1").
 const JETBRAINS_MODEL_TOKENS = [
+  'claude-opus-4.8',
+  'claude-opus-4.7',
+  'claude-opus-4.6',
   'claude-opus-4.5',
   'claude-opus-4.1',
   'claude-opus-4',
+  'claude-sonnet-4.6',
   'claude-sonnet-4.5',
   'claude-sonnet-4',
+  'claude-haiku-4.5',
+  'gpt-5.6-luna',
+  'gpt-5.6-terra',
+  'gpt-5.6',
+  'gpt-5.5',
+  'gpt-5.4-mini',
+  'gpt-5.4',
   'gpt-5.3-codex',
   'gpt-5.3',
   'gpt-5.2',
@@ -1044,11 +1948,15 @@ function normalizeJetBrainsModelName(raw: string): string {
 }
 
 /** Match a known model token at an alnum boundary anywhere in a string. */
-function findJetBrainsModelToken(s: string): string {
+export function findJetBrainsModelToken(s: string): string {
   for (const token of JETBRAINS_MODEL_TOKENS) {
     const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    // "o3" etc. must not match inside words like "iso3166".
-    if (new RegExp(`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])`).test(s)) {
+    // "o3" etc. must not match inside words like "iso3166". A dot followed by
+    // a digit is a version continuation and is rejected too: `gpt-5` must not
+    // capture `gpt-5.6-luna`, nor `claude-opus-4` capture `claude-opus-4.8` —
+    // that is a different version (#1530). A bare trailing dot (end of
+    // sentence, file extension) is not a version and stays a boundary.
+    if (new RegExp(`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9]|\\.\\d)`).test(s)) {
       return normalizeJetBrainsModelName(token)
     }
   }
@@ -1084,7 +1992,9 @@ function inferJetBrainsProject(raw: string): string | undefined {
     let p = m[1]
     try { p = decodeURIComponent(p) } catch { /* leave as-is */ }
     const dir = p.slice(0, p.lastIndexOf('/'))
-    if (dir.startsWith('/')) seen.add(dir)
+    // A Windows URL is file:///C:/repo/One.ts, so the captured path carries a
+    // leading slash that is part of the URL, not of the drive path.
+    if (dir.startsWith('/')) seen.add(dir.replace(/^\/(?=[a-zA-Z]:\/)/, ''))
   }
   if (seen.size === 0) return undefined
 
@@ -1593,7 +2503,7 @@ function createJetBrainsParser(
 // ---------------------------------------------------------------------------
 
 function createOtelParser(
-  source: SessionSource,
+  source: OTelSessionSource,
   seenKeys: Set<string>
 ): SessionParser {
   return {
@@ -1615,7 +2525,7 @@ function createOtelParser(
         }>(
           `SELECT DISTINCT
              sa_conv.value AS conversation_id,
-             COALESCE(sa_repo.value, 'copilot-chat') AS project,
+             sa_repo.value AS project,
              MIN(s.start_time_ms) AS min_start
            FROM spans s
            LEFT JOIN span_attributes sa_conv
@@ -1643,7 +2553,7 @@ function createOtelParser(
           const spanIdRows = db.query<{ span_id: string; trace_id: string }>(
             `SELECT DISTINCT s.span_id, s.trace_id
              FROM spans s
-             INNER JOIN span_attributes sa 
+             INNER JOIN span_attributes sa
                ON s.span_id = sa.span_id AND sa.key = 'gen_ai.conversation.id' AND sa.value = ?
              ORDER BY s.start_time_ms ASC`,
             [conversationId]
@@ -1664,6 +2574,24 @@ function createOtelParser(
           // spans table once per chat span below (avoids an N+1).
           const traceIdArr = [...traceIds]
           const tracePlaceholders = traceIdArr.map(() => '?').join(',')
+
+          if (!convRow.project && source.workspaceBySessionId?.size) {
+            const sessionIds = db.query<{ value: string }>(
+              `SELECT DISTINCT sa.value FROM spans s
+               JOIN span_attributes sa ON s.span_id = sa.span_id
+               WHERE s.trace_id IN (${tracePlaceholders})
+                 AND sa.key IN ('copilot_chat.chat_session_id', 'copilot_chat.parent_chat_session_id')
+               ORDER BY sa.key, sa.value`,
+              traceIdArr
+            ).map(r => r.value)
+            for (const id of [conversationId, ...sessionIds]) {
+              const workspace = source.workspaceBySessionId.get(id)
+              if (workspace) {
+                project = workspace
+                break
+              }
+            }
+          }
           const traceSpans = db.query<{
             span_id: string
             trace_id: string
@@ -1690,6 +2618,7 @@ function createOtelParser(
           // subagent's own chat spans, so attributing the agent name per-trace
           // labels exactly the subagent's calls.
           const toolsByTrace = new Map<string, string[]>()
+          const skillsByTrace = new Map<string, string[]>()
           const bashByTrace = new Map<string, string[]>()
           const subagentsByTrace = new Map<string, string[]>()
           const chatSpanIds: string[] = []
@@ -1709,9 +2638,19 @@ function createOtelParser(
               const attrs = loadSpanAttributesFromTable(db, span.span_id)
               const rawToolName = attrs['gen_ai.tool.name'] as string | undefined
               if (rawToolName) {
+                const normalizedTool = normalizeTool(rawToolName)
                 const existing = toolsByTrace.get(span.trace_id) ?? []
-                existing.push(normalizeTool(rawToolName))
+                existing.push(normalizedTool)
                 toolsByTrace.set(span.trace_id, existing)
+
+                if (normalizedTool === 'Skill') {
+                  const skill = extractStructuredSkill(attrs['gen_ai.tool.call.arguments'])
+                  if (skill) {
+                    const skills = skillsByTrace.get(span.trace_id) ?? []
+                    skills.push(skill)
+                    skillsByTrace.set(span.trace_id, skills)
+                  }
+                }
 
                 // For shell tools, extract command names via the OTEL-specific
                 // normaliser (handles the full multi-line scripts the OTEL store
@@ -1742,6 +2681,19 @@ function createOtelParser(
               }
             }
           }
+
+          // Attribute trace-level tool/skill/bash metadata to a single chat
+          // span. execute_tool spans happen ONCE in a trace, not once per chat
+          // span, so re-reading them for every span billed a 5-span trace's one
+          // skill call ~5x turns/cost (and split it across periods when the
+          // trace crossed midnight). Order spans by start time and credit the
+          // first one that actually yields, so the metadata lands on exactly one
+          // call in the trace's opening period. Subagent names stay per-trace:
+          // every chat span in a subagent's trace is genuinely that subagent's
+          // call, so all of them are correctly labelled.
+          chatSpanIds.sort((a, b) =>
+            (spanMetaById.get(a)?.start_time_ms ?? 0) - (spanMetaById.get(b)?.start_time_ms ?? 0))
+          const creditedTraces = new Set<string>()
 
           // Yield one ParsedProviderCall per chat span
           for (const spanId of chatSpanIds) {
@@ -1779,8 +2731,11 @@ function createOtelParser(
               seenKeys.add(jsonlDedupKey)
             }
 
-            const tools = toolsByTrace.get(spanMetadata.trace_id) ?? []
-            const bashCommands = bashByTrace.get(spanMetadata.trace_id) ?? []
+            const ownsTraceMetadata = !creditedTraces.has(spanMetadata.trace_id)
+            if (ownsTraceMetadata) creditedTraces.add(spanMetadata.trace_id)
+            const tools = ownsTraceMetadata ? (toolsByTrace.get(spanMetadata.trace_id) ?? []) : []
+            const skills = ownsTraceMetadata ? (skillsByTrace.get(spanMetadata.trace_id) ?? []) : []
+            const bashCommands = ownsTraceMetadata ? (bashByTrace.get(spanMetadata.trace_id) ?? []) : []
             const subagentTypes = subagentsByTrace.get(spanMetadata.trace_id)
             const timestamp = epochToISO(spanMetadata.start_time_ms)
 
@@ -1791,7 +2746,7 @@ function createOtelParser(
               outputTokens,
               cacheCreationTokens,
               cacheReadTokens,
-              0 // reasoningTokens — not exposed in current OTel schema
+              0 // webSearchRequests — not applicable to OTel spans
             )
 
             yield {
@@ -1809,6 +2764,7 @@ function createOtelParser(
               costUSD,
               tools,
               bashCommands,
+              skills: skills.length > 0 ? skills : undefined,
               subagentTypes: subagentTypes && subagentTypes.length > 0 ? subagentTypes : undefined,
               timestamp,
               speed: 'standard' as const,
@@ -1825,16 +2781,342 @@ function createOtelParser(
 }
 
 // ---------------------------------------------------------------------------
+// Session-store SQLite parser — per-request usage rows from session-store.db
+// ---------------------------------------------------------------------------
+//
+// The Copilot CLI and the GitHub Copilot desktop app both write
+// ~/.copilot/session-store.db unconditionally. Its assistant_usage_events
+// table records one row per API request AS IT HAPPENS, where the
+// session.shutdown rollup in events.jsonl is written only on clean shutdown
+// (a crash loses the whole session's input/cache accounting) and lumps a
+// session leg into one per-model total. The DB rows are therefore
+// authoritative for input/cache tokens; the serve-time reconciliation in
+// parseProviderSources replaces the covered (session, model) rollup calls
+// with the rows plus a residual for anything the rollup carried beyond them.
+//
+// Each emitted call carries the row's own output_tokens. Older CLIs ALSO write
+// per-turn outputTokens on assistant.message, so where a row pairs with a
+// per-turn call that carries output, the serve-time reconciliation in
+// parseProviderSources serves the row with output 0 (decided there because
+// only the full serve set knows both sides). CLI 1.0.8x and ACP hosts write no
+// per-turn output, and an ACP session often never writes session.shutdown, so
+// the row is the only record of that output. The `initiator='compaction'` row
+// never pairs: it has no assistant.message anywhere in events.jsonl.
+// The per-request billing
+// metadata (total_nano_aiu, request_multiplier) is captured onto the cached
+// calls but not priced or displayed — that design is upstream #890; the
+// throughput/latency columns are deliberately not read yet.
+
+// The one REQUIRED usage query, shared verbatim between the discovery probe
+// and the parser so the two can never diverge on schema: discovery runs it
+// LIMIT 1 (prepare validates every table and column it touches) before
+// emitting the source, so a store whose shape the parser cannot read is
+// classified absent — its sessions keep their shutdown rollups — instead of
+// surfacing a source that could only ever fail.
+const SESSION_STORE_USAGE_COLUMNS = `e.id, e.session_id, e.model,
+       e.input_tokens, e.cache_read_tokens, e.cache_write_tokens,
+       e.reasoning_tokens, e.created_at,
+       s.cwd, s.repository, s.created_at AS session_created_at`
+const SESSION_STORE_USAGE_FROM = `
+  FROM assistant_usage_events e
+  LEFT JOIN sessions s ON s.id = e.session_id`
+const SESSION_STORE_USAGE_SELECT = `SELECT ${SESSION_STORE_USAGE_COLUMNS}${SESSION_STORE_USAGE_FROM}`
+
+// OPTIONAL enrichment: the billing-metadata columns plus `initiator`, tried
+// first at parse time and never probed at discovery — older CLI stores predate
+// them, and requiring them would classify a perfectly readable store as
+// absent. A `no such column` failure falls back to the base select above, so
+// an old store parses identically, just without the enrichment.
+//
+// `initiator` names what caused the request. The one value that changes
+// accounting is 'compaction': that row is the CLI summarizing its own context,
+// not a user turn, so it has no assistant.message to pair with and it belongs
+// to the compaction that resets the shutdown rollup. It is optional in the
+// strongest sense — on a real 2,509-row store 1,504 rows carried NULL here
+// (the column exists, the CLI just did not always populate it), so every rule
+// below prefers the label when present and falls back to the timestamp
+// geometry when it is not.
+// Widest first, then narrower, then the discovery-validated base. Each step
+// drops the newest optional column, so a store that has the billing columns
+// but not `initiator` keeps its billing metadata instead of falling all the
+// way back — the columns arrived in different CLI releases and a single
+// all-or-nothing enrichment would lose the older one.
+//
+// `output_tokens` rides on the SAME rung as `initiator`: both arrived after the
+// billing columns, and a store without them serves rows with output 0, leaving
+// output to the per-turn calls and the rollup residual as before.
+const SESSION_STORE_USAGE_SELECTS = [
+  `SELECT ${SESSION_STORE_USAGE_COLUMNS},
+       e.total_nano_aiu, e.request_multiplier, e.initiator, e.output_tokens${SESSION_STORE_USAGE_FROM}`,
+  `SELECT ${SESSION_STORE_USAGE_COLUMNS},
+       e.total_nano_aiu, e.request_multiplier${SESSION_STORE_USAGE_FROM}`,
+  SESSION_STORE_USAGE_SELECT,
+]
+
+// Type alias, not interface: db.query's Row constraint needs the implicit
+// index signature only anonymous object types carry.
+type SessionStoreUsageRow = {
+  id: number
+  session_id: string
+  model: string
+  input_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  reasoning_tokens: number | null
+  created_at: string | null
+  cwd: string | null
+  repository: string | null
+  session_created_at: string | null
+  // Present only when the billing select succeeded (schema has the columns).
+  total_nano_aiu?: number | null
+  request_multiplier?: number | null
+  initiator?: string | null
+  output_tokens?: number | null
+}
+
+// FNV-1a 64-bit over the row's identifying content, base36. Collisions only
+// matter between two rows sharing the SAME session_id and row id — i.e. a
+// same-path DB reset that happens to reuse an id — where the content strings
+// differ; 64 bits keeps even adversarial token tuples from aliasing (32-bit
+// FNV collisions between plausible tuples are constructible).
+function fnv1a64(s: string): string {
+  let h = 0xcbf29ce484222325n
+  const prime = 0x100000001b3n
+  const mask = 0xffffffffffffffffn
+  for (let i = 0; i < s.length; i++) {
+    h ^= BigInt(s.charCodeAt(i))
+    h = (h * prime) & mask
+  }
+  return h.toString(36)
+}
+
+function createSessionStoreParser(
+  source: SessionStoreSessionSource,
+  seenKeys: Set<string>
+): SessionParser {
+  return {
+    async *parse(): AsyncGenerator<ParsedProviderCall> {
+      // Lazy-load the SQLite module (same pattern as the OTel source)
+      const { openDatabase, isSqliteBusyError } = await import('../sqlite.js')
+
+      // The open sits inside the same classify-and-defer boundary as the
+      // query: discovery validated this store moments ago, so a failure HERE
+      // (EACCES/CANTOPEN/EMFILE race) is transient-shaped — letting it
+      // propagate raw would cache a failed marker at the current fingerprint
+      // and zero the covered sessions until the file next changes.
+      let db: ReturnType<typeof openDatabase>
+      try {
+        db = openDatabase(source.path)
+      } catch (err) {
+        if (isSqliteBusyError(err)) throw err
+        throw Object.assign(
+          new Error('copilot session-store.db unreadable at open; deferring'),
+          { code: 'SQLITE_BUSY' }
+        )
+      }
+      try {
+        let rows: SessionStoreUsageRow[] | undefined
+        try {
+          for (const select of SESSION_STORE_USAGE_SELECTS) {
+            try {
+              rows = db.query<SessionStoreUsageRow>(`${select} ORDER BY e.id ASC`)
+              break
+            } catch (selectErr) {
+              // Only an OPTIONAL column may be missing (older store schema):
+              // step down to the next narrower select. The last entry is the
+              // discovery-validated base, so a `no such column` there is a
+              // real shape change and re-throws with everything else.
+              const msg = selectErr instanceof Error ? selectErr.message : String(selectErr)
+              if (!/no such column/i.test(msg) || select === SESSION_STORE_USAGE_SELECT) throw selectErr
+            }
+          }
+          if (!rows) throw new Error('copilot session-store.db: no usable select')
+        } catch (err) {
+          // Discovery prepare-validated this exact query moments ago, so any
+          // failure here means the store became unreadable or changed shape
+          // mid-run. Yielding nothing would cache an EMPTY success at this
+          // fingerprint while the covered sessions' rollups stay suppressed
+          // — a silent under-count that persists until the file changes.
+          // Every failure defers instead: parseProviderSources
+          // skips-and-retries on the busy shape without writing the cache.
+          if (isSqliteBusyError(err)) throw err
+          throw Object.assign(
+            new Error('copilot session-store.db unreadable mid-parse; deferring'),
+            { code: 'SQLITE_BUSY' }
+          )
+        }
+
+        // created_at defaults to SQLite's datetime('now') — UTC but
+        // timezone-less ('2026-08-07 17:56:38', or with fractional seconds
+        // under 'subsec'), which Date.parse reads as LOCAL time and would
+        // shift the request onto the wrong day. The CLI writes explicit
+        // ISO-Z strings (audited: every observed row), so this normalizes
+        // only the defensive zoneless shapes to UTC; anything carrying its
+        // own zone/offset passes through untouched.
+        const normalizeTimestamp = (raw: string | null): string =>
+          raw
+            ? timestampToISO(
+                /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(raw)
+                  ? raw.replace(' ', 'T') + 'Z'
+                  : raw
+              )
+            : ''
+        let prevTimestamp = ''
+
+        for (const row of rows) {
+          if (!row.session_id) continue
+
+          // A call with an empty timestamp is invisible to every date-range
+          // filter, so never emit one: fall back from the row's own
+          // created_at to the previous row's timestamp, then to the
+          // session's created_at. The previous row deliberately outranks the
+          // session's own created_at even across sessions — ids are GLOBALLY
+          // insertion-ordered, so the previous row is the nearest earlier
+          // clock reading, while a resumed session's created_at can be days
+          // stale. Both columns carry SQLite defaults, so an empty chain is
+          // unreachable outside a hand-built store; such a row is skipped,
+          // and if that desert covers a whole session its rollup simply
+          // stays unsuppressed at serve time.
+          const timestamp =
+            normalizeTimestamp(row.created_at) ||
+            prevTimestamp ||
+            normalizeTimestamp(row.session_created_at)
+          if (!timestamp) continue
+          prevTimestamp = timestamp
+          // TEXT NOT NULL still admits '': a billable row must NEVER be
+          // dropped for an unnameable model — its session's rollup was
+          // suppressed on the promise that every billable row is emitted
+          // (the coverage predicate does not know about models). Price as
+          // 'unknown' instead; the pricing engine reports unknown models at
+          // $0 with a fix-it hint rather than silently losing the tokens.
+          const model = row.model || 'unknown'
+
+          const cacheReadTokens = numberOrZero(row.cache_read_tokens)
+          const cacheWriteTokens = numberOrZero(row.cache_write_tokens)
+          const reasoningTokens = numberOrZero(row.reasoning_tokens)
+          // input_tokens is cache-INCLUSIVE (input + cache_read + cache_write),
+          // the same convention the shutdown rollup uses — confirmed against
+          // token_details_json, whose tokenType:"input" entries hold exactly
+          // this difference. calculateCost expects the uncached remainder with
+          // cache tokens billed separately, so subtract; clamp guards a future
+          // schema that reports input non-inclusively.
+          const inputTokens = Math.max(
+            0,
+            numberOrZero(row.input_tokens) - cacheReadTokens - cacheWriteTokens
+          )
+
+          const outputTokens = numberOrZero(row.output_tokens)
+
+          // Nothing this call would add over the per-turn events, so skip it to
+          // avoid an empty $0 row.
+          if (inputTokens === 0 && cacheReadTokens === 0 && cacheWriteTokens === 0 && reasoningTokens === 0 && outputTokens === 0) continue
+
+          // `id` is AUTOINCREMENT: stable across re-parses and never reused
+          // WITHIN one database lifetime — but recreating the DB at the same
+          // path restarts the sequence, and a bare `<sid>:<id>` key would then
+          // make the durable union swallow the new row as "already cached"
+          // while its usage differs. A content discriminator (raw created_at
+          // + token counts + model) makes a genuinely different request under
+          // a reused id a NEW key; a byte-identical re-insert (backup restore,
+          // VACUUM INTO) still collapses to the same key.
+          const dedupKey = `copilot-store:${row.session_id}:${row.id}:${fnv1a64(
+            `${row.created_at ?? ''}|${row.input_tokens ?? ''}|${row.cache_read_tokens ?? ''}|${row.cache_write_tokens ?? ''}|${row.reasoning_tokens ?? ''}|${row.model}`
+          )}`
+          if (seenKeys.has(dedupKey)) continue
+          seenKeys.add(dedupKey)
+
+          // One DB spans every project, so the project must ride each call
+          // (the per-source fallback would lump them all together). Prefer
+          // the label discovery derived from the session's own session-state
+          // dir (workspace.yaml cwd — the same one its per-turn output calls
+          // carry, so the session never splits across two projects); the
+          // store's sessions.cwd/repository names only sessions with no
+          // session-state dir on this machine.
+          const project =
+            source.projectsBySessionId?.get(row.session_id) ??
+            (row.cwd
+              ? basename(row.cwd)
+              : row.repository
+                ? basename(row.repository.replace(/\.git$/, ''))
+                : row.session_id)
+
+          // Tokens are real per-request counts written by the CLI, so this
+          // cost is measured, not char-estimated. reasoning_tokens rides as
+          // metadata only, never as a cost line: it is a SUBSET of the row's
+          // output_tokens (the row's own token_details_json prices exactly
+          // input/cache_read/cache_write/output, no reasoning entry), and
+          // output — reasoning included — is billed once, on whichever call
+          // owns it (see the header). Pricing reasoning here would double-count.
+          const costUSD = calculateCost(model, inputTokens, outputTokens, cacheWriteTokens, cacheReadTokens, 0)
+
+          yield {
+            provider: 'copilot',
+            sessionId: row.session_id,
+            project,
+            model,
+            inputTokens,
+            outputTokens,
+            cacheCreationInputTokens: cacheWriteTokens,
+            cacheReadInputTokens: cacheReadTokens,
+            cachedInputTokens: 0,
+            reasoningTokens,
+            webSearchRequests: 0,
+            costUSD,
+            costIsEstimated: false,
+            tools: [],
+            bashCommands: [],
+            timestamp,
+            speed: 'standard' as const,
+            deduplicationKey: dedupKey,
+            userMessage: '',
+            // Billing metadata rides as capture-only fields (deliberately
+            // OUTSIDE the dedup-key content hash: it identifies a charge, not
+            // the request). Omitted when the schema predates the columns.
+            ...(typeof row.total_nano_aiu === 'number' ? { nanoAiu: row.total_nano_aiu } : {}),
+            ...(typeof row.request_multiplier === 'number' ? { requestMultiplier: row.request_multiplier } : {}),
+            ...(row.initiator ? { initiator: row.initiator } : {}),
+          }
+        }
+      } finally {
+        db.close()
+      }
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Extended SessionSource for OTel sessions
 // ---------------------------------------------------------------------------
 
 interface OTelSessionSource extends SessionSource {
   conversationId?: string
   sourceType: 'otel'
+  // VS Code chat session id -> workspace name, for spans that carry no
+  // repository attribute (see mapChatSessionWorkspaces).
+  workspaceBySessionId?: Map<string, string>
 }
 
 interface JsonlSessionSource extends SessionSource {
   sourceType: 'jsonl'
+}
+
+// The Copilot CLI / GitHub desktop-app session store (~/.copilot/session-store.db).
+// One source per DB file; the parser iterates every session's usage rows in a
+// single DB open, mirroring the OTel source.
+interface SessionStoreSessionSource extends SessionSource {
+  sourceType: 'session-store'
+  // sessionId → project label derived from the session-state dirs
+  // (workspace.yaml cwd), attached at discovery. The store's own
+  // sessions.cwd can lag or miss what the session actually ran in, and the
+  // per-turn output calls already carry the jsonl-derived label — using the
+  // same one keeps a session's store rows and output calls in one session.
+  projectsBySessionId?: Map<string, string>
+}
+
+// A VS Code workspaceStorage transcript. Distinct from 'jsonl' (CLI
+// session-state) so classification rides provenance, not file contents (#944).
+interface TranscriptSessionSource extends SessionSource {
+  sourceType: 'transcript'
 }
 
 interface ChatSessionSource extends SessionSource {
@@ -1872,6 +3154,14 @@ function isChatSessionSource(source: SessionSource): source is ChatSessionSource
 
 function isJetBrainsSource(source: SessionSource): source is JetBrainsSessionSource {
   return (source as JetBrainsSessionSource).sourceType === 'jetbrains'
+}
+
+function isTranscriptSource(source: SessionSource): source is TranscriptSessionSource {
+  return (source as TranscriptSessionSource).sourceType === 'transcript'
+}
+
+function isSessionStoreSource(source: SessionSource): source is SessionStoreSessionSource {
+  return (source as SessionStoreSessionSource).sourceType === 'session-store'
 }
 
 // ---------------------------------------------------------------------------
@@ -1933,6 +3223,69 @@ async function discoverOtelSessions(
     return []
   }
   return [{ path: dbPath, project: 'copilot-chat', provider: 'copilot', sourceType: 'otel' }]
+}
+
+// ---------------------------------------------------------------------------
+// Session discovery: session-store SQLite
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe session-store.db. This decides only whether a store SOURCE exists;
+ * which sessions it covers is decided at serve time from what its parse
+ * actually cached (see reconcileCopilotCalls in parseProviderSources), so
+ * nothing a writer does between this probe and the parse can change
+ * accounting.
+ *
+ * Permanent absence — no file, no sqlite driver, or a schema the parser's
+ * own query cannot prepare against ("no such table": CLI builds before the
+ * store existed; "no such column": a future migration) — returns null: no
+ * source, no suppression, and the shutdown-rollup path carries the sessions
+ * exactly as before.
+ *
+ * EVERY other failure still emits the source. Measured against the real
+ * driver (node:sqlite, WAL store): a write lock never blocks readers and a
+ * hot -wal without its -shm reads fine, so the reachable failures here are
+ * corruption-class — SQLITE_CORRUPT (11), SQLITE_NOTADB (26, e.g. mid
+ * atomic-replace), SQLITE_CANTOPEN (14, deleted after the stat) — plus the
+ * classic busy/locked pair and stat-level EACCES/EIO. None of those prove
+ * the store is gone, so the path must stay discovered: the parse raises the
+ * busy shape parseProviderSources skips-and-retries, previously cached rows
+ * keep serving, and serve-time suppression keeps holding from the cache
+ * instead of flapping the covered sessions' rollups back in.
+ */
+async function discoverSessionStoreSource(
+  dbPath: string
+): Promise<SessionStoreSessionSource | null> {
+  const source: SessionStoreSessionSource = {
+    path: dbPath,
+    project: 'copilot',
+    provider: 'copilot',
+    sourceType: 'session-store',
+    // The store IS the durable record: while it sits on disk, its cached rows
+    // must never age out (crash-only rows have no rollup to fall back to).
+    // Journal-style sources keep the ordinary durable age-out.
+    retainWhilePresent: true,
+  }
+  try {
+    await stat(dbPath)
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    return code === 'ENOENT' || code === 'ENOTDIR' ? null : source
+  }
+  const { openDatabase, isSqliteAvailable } = await import('../sqlite.js')
+  if (!isSqliteAvailable()) return null
+  try {
+    const db = openDatabase(dbPath)
+    try {
+      db.query(`${SESSION_STORE_USAGE_SELECT} LIMIT 1`)
+    } finally {
+      db.close()
+    }
+    return source
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return /no such (table|column)/i.test(message) ? null : source
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,73 +3423,79 @@ async function resolveJetBrainsProjectNames(
  * (Code, Code Insiders, VSCodium) on the given platform. Used to discover
  * transcript sessions written by the Copilot Chat extension.
  *
- * Accepts explicit `home` and `os` arguments so callers (and tests) can pass
- * custom values without relying on process-level globals.
+ * Accepts explicit `home` and `os` arguments for the platform fallback.
+ * APPDATA and XDG_CONFIG_HOME still come from the process environment.
  */
 export function getVSCodeWorkspaceStorageDirs(home: string, os: string): string[] {
   const j = os === 'win32' ? win32.join : posix.join
-  if (os === 'darwin') {
-    return [
-      j(home, 'Library', 'Application Support', 'Code', 'User', 'workspaceStorage'),
-      j(home, 'Library', 'Application Support', 'Code - Insiders', 'User', 'workspaceStorage'),
-      j(home, 'Library', 'Application Support', 'VSCodium', 'User', 'workspaceStorage'),
-    ]
-  }
-  if (os === 'linux') {
-    return [
-      j(home, '.config', 'Code', 'User', 'workspaceStorage'),
-      j(home, '.config', 'Code - Insiders', 'User', 'workspaceStorage'),
-      j(home, '.config', 'VSCodium', 'User', 'workspaceStorage'),
-    ]
-  }
-  // win32
-  return [
-    j(home, 'AppData', 'Roaming', 'Code', 'User', 'workspaceStorage'),
-    j(home, 'AppData', 'Roaming', 'Code - Insiders', 'User', 'workspaceStorage'),
-    j(home, 'AppData', 'Roaming', 'VSCodium', 'User', 'workspaceStorage'),
-  ]
+  return ['Code', 'Code - Insiders', 'VSCodium']
+    .map(editor => j(getEditorDataDir(editor, home, os), 'User', 'workspaceStorage'))
 }
 
 export function getVSCodeGlobalStorageDirs(home: string, os: string): string[] {
   const j = os === 'win32' ? win32.join : posix.join
-  if (os === 'darwin') {
-    return [
-      j(home, 'Library', 'Application Support', 'Code', 'User', 'globalStorage'),
-      j(home, 'Library', 'Application Support', 'Code - Insiders', 'User', 'globalStorage'),
-      j(home, 'Library', 'Application Support', 'VSCodium', 'User', 'globalStorage'),
-    ]
+  return ['Code', 'Code - Insiders', 'VSCodium']
+    .map(editor => j(getEditorDataDir(editor, home, os), 'User', 'globalStorage'))
+}
+
+// workspace.json holds `folder` (single root) or `workspace` (a multi-root
+// .code-workspace file); either is a URI, local (file://) or remote
+// (vscode-remote://wsl%2Bubuntu/...). Untitled multi-root workspaces point at
+// an internal .../Workspaces/<id>/workspace.json that names nothing.
+async function readWorkspaceName(wsDir: string, hashDir: string): Promise<string | null> {
+  try {
+    const wsJson = await readSessionFile(join(wsDir, hashDir, 'workspace.json'))
+    if (!wsJson) return null
+    const data = JSON.parse(wsJson) as { folder?: unknown; workspace?: unknown }
+    const uri = typeof data.folder === 'string' ? data.folder : typeof data.workspace === 'string' ? data.workspace : null
+    if (!uri) return null
+    const name = decodeURIComponent(basename(uri.replace(/^file:\/\//, '').replace(/\/+$/, '')))
+    if (!name || name === 'workspace.json') return null
+    return name.replace(/\.code-workspace$/, '') || null
+  } catch {
+    return null
   }
-  if (os === 'linux') {
-    return [
-      j(home, '.config', 'Code', 'User', 'globalStorage'),
-      j(home, '.config', 'Code - Insiders', 'User', 'globalStorage'),
-      j(home, '.config', 'VSCodium', 'User', 'globalStorage'),
-    ]
-  }
-  return [
-    j(home, 'AppData', 'Roaming', 'Code', 'User', 'globalStorage'),
-    j(home, 'AppData', 'Roaming', 'Code - Insiders', 'User', 'globalStorage'),
-    j(home, 'AppData', 'Roaming', 'VSCodium', 'User', 'globalStorage'),
-  ]
 }
 
 async function resolveWorkspaceProject(wsDir: string, hashDir: string): Promise<string> {
-  let project = hashDir
-  try {
-    const wsJson = await readSessionFile(join(wsDir, hashDir, 'workspace.json'))
-    if (wsJson) {
-      const data = JSON.parse(wsJson) as { folder?: string }
-      if (typeof data.folder === 'string') {
-        // folder is a URI like 'file:///home/user/myapp' or 'file:///C:/Users/...'
-        const folder = data.folder.replace(/^file:\/\//, '').replace(/\/+$/, '')
-        const name = basename(folder)
-        if (name) project = name
+  return (await readWorkspaceName(wsDir, hashDir)) ?? hashDir
+}
+
+// VS Code chat session id -> workspace name. The session id is the
+// chatSessions/<id>.jsonl (or legacy .json) file name, and Copilot Chat puts
+// the same id on its OTel spans as gen_ai.conversation.id and
+// copilot_chat.chat_session_id. VS Code copies a session file when a
+// workspace's storage id changes, so an id found in two workspaces goes to the
+// most recently written copy.
+async function mapChatSessionWorkspaces(workspaceStorageDirs: string[]): Promise<Map<string, string>> {
+  const found = new Map<string, { project: string; mtimeMs: number }>()
+  for (const wsDir of workspaceStorageDirs) {
+    let hashDirs: string[]
+    try {
+      hashDirs = await readdir(wsDir)
+    } catch {
+      continue
+    }
+    for (const hashDir of hashDirs) {
+      let files: string[]
+      try {
+        files = await readdir(join(wsDir, hashDir, 'chatSessions'))
+      } catch {
+        continue
+      }
+      const project = await readWorkspaceName(wsDir, hashDir)
+      if (!project) continue
+      for (const file of files) {
+        const id = file.replace(/\.jsonl?$/, '')
+        if (id === file) continue
+        const s = await stat(join(wsDir, hashDir, 'chatSessions', file)).catch(() => null)
+        if (!s?.isFile()) continue
+        const prev = found.get(id)
+        if (!prev || s.mtimeMs > prev.mtimeMs) found.set(id, { project, mtimeMs: s.mtimeMs })
       }
     }
-  } catch {
-    // workspace.json may be absent or malformed
   }
-  return project
+  return new Map([...found].map(([id, v]) => [id, v.project]))
 }
 
 async function hasChatSessionFiles(chatSessionsDir: string): Promise<boolean> {
@@ -2148,7 +3507,7 @@ async function hasChatSessionFiles(chatSessionsDir: string): Promise<boolean> {
   }
 
   for (const file of files) {
-    if (!file.endsWith('.jsonl')) continue
+    if (!file.endsWith('.jsonl') && !file.endsWith('.json')) continue
     const s = await stat(join(chatSessionsDir, file)).catch(() => null)
     if (s?.isFile()) return true
   }
@@ -2183,7 +3542,7 @@ async function discoverWorkspaceChatSessions(
 
       const project = await resolveWorkspaceProject(wsDir, hashDir)
       for (const file of files) {
-        if (!file.endsWith('.jsonl')) continue
+        if (!file.endsWith('.json') && !file.endsWith('.jsonl')) continue
         const path = join(chatSessionsDir, file)
         const s = await stat(path).catch(() => null)
         if (!s?.isFile()) continue
@@ -2215,7 +3574,7 @@ async function discoverEmptyWindowChatSessions(
     }
 
     for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue
+      if (!file.endsWith('.json') && !file.endsWith('.jsonl')) continue
       const path = join(chatSessionsDir, file)
       const s = await stat(path).catch(() => null)
       if (!s?.isFile()) continue
@@ -2242,8 +3601,8 @@ async function discoverEmptyWindowChatSessions(
  */
 async function discoverTranscriptSessions(
   workspaceStorageDirs: string[]
-): Promise<JsonlSessionSource[]> {
-  const sources: JsonlSessionSource[] = []
+): Promise<TranscriptSessionSource[]> {
+  const sources: TranscriptSessionSource[] = []
 
   for (const wsDir of workspaceStorageDirs) {
     let hashDirs: string[]
@@ -2275,7 +3634,7 @@ async function discoverTranscriptSessions(
           path: join(transcriptsDir, file),
           project,
           provider: 'copilot',
-          sourceType: 'jsonl',
+          sourceType: 'transcript',
         })
       }
     }
@@ -2288,7 +3647,8 @@ export function createCopilotProvider(
   sessionStateDir?: string,
   workspaceStorageDir?: string,
   globalStorageDir?: string,
-  jetbrainsDir?: string
+  jetbrainsDir?: string,
+  sessionStoreDb?: string
 ): Provider {
   // jsonlDir is resolved lazily inside discoverSessions so that env-var
   // overrides set after module load (e.g. in tests) are respected.
@@ -2319,9 +3679,35 @@ export function createCopilotProvider(
     displayName: 'Copilot',
     durableSources: true,
 
+    // Every directory discovery scans, resolved the same way. Besides the
+    // doctor, a resident process's root watchers are built from these — a
+    // provider without them is silently invisible to the validated-reuse
+    // "clean" verdict, which would let a memoized complete parse outlive a
+    // store append + lock that a fresh parse would have deferred on. The
+    // store DB contributes its PARENT directory, not the file: SQLite appends
+    // land in -wal/-shm siblings a file watch would miss.
+    async probeRoots(): Promise<ProbeRoot[]> {
+      const roots = new Map<string, ProbeRoot>()
+      const add = (path: string | null, label: string): void => {
+        if (path && !roots.has(path)) roots.set(path, { path, label })
+      }
+      add(dirname(getSessionStoreDbPath(sessionStoreDb)), 'session store')
+      add(getCopilotSessionStateDir(sessionStateDir), 'CLI session state')
+      for (const dir of getWsDirs()) add(dir, 'VS Code workspaceStorage')
+      for (const dir of getGlobalDirs()) add(dir, 'VS Code globalStorage')
+      add(getJetBrainsCopilotRoot(jetbrainsDir), 'JetBrains')
+      const otelDb = getAgentTracesDbPath()
+      if (otelDb) add(dirname(otelDb), 'OTel agent traces')
+      return [...roots.values()]
+    },
+
+    // Segment-boundary match (#1530): `includes` let a bare `gpt-5` key
+    // capture `gpt-5.5` and `gpt-5.6-luna`. Unknown ids fall through to the
+    // raw id, and the report layer's fallbackRawModelDisplayName then resolves
+    // them with the same global getShortModelName every other provider uses.
     modelDisplayName(model: string): string {
       for (const [key, display] of modelDisplayEntries) {
-        if (model.includes(key)) return display
+        if (modelKeyMatches(model, key)) return display
       }
       return model
     },
@@ -2342,6 +3728,10 @@ export function createCopilotProvider(
           try {
             const otelSources = await discoverOtelSessions(dbPath)
             discoveredOtel = otelSources.length > 0
+            if (discoveredOtel) {
+              const workspaceBySessionId = await mapChatSessionWorkspaces(getWsDirs())
+              for (const otelSource of otelSources) otelSource.workspaceBySessionId = workspaceBySessionId
+            }
             sources.push(...otelSources)
           } catch {
             // OTel discovery failed — fall through to JSONL
@@ -2349,10 +3739,41 @@ export function createCopilotProvider(
         }
       }
 
+      // 1b. Discover the CLI / GitHub desktop-app session store. Written per
+      // API request (crash-proof) where the events.jsonl shutdown rollup
+      // exists only after a clean exit, so its rows are authoritative for
+      // input/cache tokens; the serve-time reconciliation
+      // (reconcileCopilotCalls in parseProviderSources) replaces the covered
+      // (session, model) rollups with the served rows plus a residual. True
+      // absence (older CLI schema, no sqlite driver) leaves the rollup path
+      // untouched; an unreadable store still surfaces the source so its
+      // parse defers and cached rows keep serving (see
+      // discoverSessionStoreSource).
+      let storeSource: SessionStoreSessionSource | null = null
+      try {
+        storeSource = await discoverSessionStoreSource(getSessionStoreDbPath(sessionStoreDb))
+      } catch {
+        // Unreachable in practice (the probe catches its own errors): a
+        // throw here means the sqlite module itself is unusable, and
+        // rollup-only accounting is then the correct mode — the same
+        // fallback as a missing driver.
+        storeSource = null
+      }
+      if (storeSource) sources.push(storeSource)
+
       // 2. Discover JSONL sessions (fallback — output tokens only)
       try {
         const jsonlDir = getCopilotSessionStateDir(sessionStateDir)
         const jsonlSources = await discoverJsonlSessions(jsonlDir)
+        if (storeSource) {
+          // Same sessionId derivation as createJsonlParser: the CLI keys
+          // session-state dirs and session-store rows by the same id, so the
+          // store parser can attribute each session's rows to the same
+          // project its per-turn output calls carry.
+          storeSource.projectsBySessionId = new Map(
+            jsonlSources.map(src => [basename(dirname(src.path)), src.project])
+          )
+        }
         sources.push(...jsonlSources)
       } catch {
         // JSONL discovery failed
@@ -2412,13 +3833,16 @@ export function createCopilotProvider(
       if (isOtelSource(source)) {
         return createOtelParser(source, seenKeys)
       }
+      if (isSessionStoreSource(source)) {
+        return createSessionStoreParser(source, seenKeys)
+      }
       if (isChatSessionSource(source)) {
         return createChatSessionParser(source, seenKeys)
       }
       if (isJetBrainsSource(source)) {
         return createJetBrainsParser(source, seenKeys)
       }
-      return createJsonlParser(source, seenKeys)
+      return createJsonlParser(source, seenKeys, isTranscriptSource(source))
     },
   }
 }

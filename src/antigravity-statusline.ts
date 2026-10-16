@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto'
 import { dirname, join } from 'path'
 import { homedir } from 'os'
 
+import { getCodeburnCacheDir } from './cache-dir.js'
 import {
   recordAntigravityStatusLinePayload,
   snapshotAntigravityStatusLinePayload,
@@ -37,7 +38,10 @@ function isCodeBurnHook(command: unknown): boolean {
 }
 
 function shellQuote(value: string): string {
-  if (process.platform === 'win32') return `"${value.replace(/(["\\])/g, '\\$1')}"`
+  // cmd.exe has no backslash escape, so backslash-escaping a Windows path
+  // corrupts it: double quotes on their own are the whole quoting rule, and a
+  // path can never contain the one character they would need to protect.
+  if (process.platform === 'win32') return `"${value}"`
   return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
@@ -54,12 +58,8 @@ function settingsPath(): string {
     ?? join(homedir(), '.gemini', 'antigravity-cli', 'settings.json')
 }
 
-function codeburnCacheDir(): string {
-  return process.env['CODEBURN_CACHE_DIR'] ?? join(homedir(), '.cache', 'codeburn')
-}
-
 function previousStatusLinePath(): string {
-  return join(codeburnCacheDir(), 'antigravity-statusline-previous.json')
+  return join(getCodeburnCacheDir(), 'antigravity-statusline-previous.json')
 }
 
 async function readSettings(): Promise<Settings> {

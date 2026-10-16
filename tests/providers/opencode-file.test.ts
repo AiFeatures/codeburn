@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 
+import { calculateCost } from '../../src/models.js'
 import { createOpenCodeProvider } from '../../src/providers/opencode.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -101,6 +102,63 @@ describe('opencode file-based provider - discovery', () => {
 })
 
 describe('opencode file-based provider - parsing', () => {
+  it('bills reasoning tokens at the output rate', async () => {
+    await writeSession({
+      messages: [{
+        id: 'msg_a',
+        data: {
+          role: 'assistant', modelID: 'claude-sonnet-4-20250514', cost: 0,
+          tokens: { input: 1000, output: 200, reasoning: 500, cache: { read: 0, write: 0 } },
+          time: { created: 1 },
+        },
+        parts: [{ type: 'text', text: 'done' }],
+      }],
+    })
+    const calls = await parseAll()
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.reasoningTokens).toBe(500)
+    // Same rule as the SQLite twin: reasoning is billed as output. (#1334)
+    expect(calls[0]!.costUSD).toBeCloseTo(calculateCost('claude-sonnet-4-20250514', 1000, 200 + 500, 0, 0, 0), 10)
+  })
+
+  it('preserves only an exact OpenRouter provider field as the route', async () => {
+    await writeSession({
+      messages: [
+        {
+          id: 'msg_exact',
+          data: {
+            role: 'assistant', providerID: 'openrouter', modelID: 'cohere/north-mini-code:free', cost: 0,
+            tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+            time: { created: 1 },
+          },
+          parts: [{ type: 'text', text: 'exact' }],
+        },
+        {
+          id: 'msg_case',
+          data: {
+            role: 'assistant', providerID: 'OpenRouter', modelID: 'cohere/north-mini-code:free', cost: 0,
+            tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+            time: { created: 2 },
+          },
+          parts: [{ type: 'text', text: 'case variant' }],
+        },
+        {
+          id: 'msg_space',
+          data: {
+            role: 'assistant', providerID: ' openrouter ', modelID: 'cohere/north-mini-code:free', cost: 0,
+            tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+            time: { created: 3 },
+          },
+          parts: [{ type: 'text', text: 'space variant' }],
+        },
+      ],
+    })
+
+    const calls = await parseAll()
+    expect(calls).toHaveLength(3)
+    expect(calls.map((call) => call.route)).toEqual(['openrouter', undefined, undefined])
+  })
+
   it('extracts tokens, tools, bash commands, and the preceding user message', async () => {
     await writeSession({
       messages: [

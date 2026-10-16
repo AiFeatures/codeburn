@@ -1,12 +1,17 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
-import { join } from 'path'
+import { join, sep } from 'path'
 import { tmpdir, homedir } from 'os'
 
 import { kiro, createKiroProvider } from '../../src/providers/kiro.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
+
+// Discovered paths carry the platform separator; match on a POSIX-normalized copy.
+function isV2MessagesPath(path: string): boolean {
+  return /\/sess_[^/]+\/messages\.jsonl$/.test(path.split(sep).join('/'))
+}
 
 function makeChatFile(opts: {
   executionId?: string
@@ -109,6 +114,26 @@ describe('kiro provider - chat file parsing', () => {
     expect(call.userMessage).toBe('explain the code')
     expect(call.bashCommands).toEqual([])
     expect(call.costUSD).toBeGreaterThan(0)
+  })
+
+  it('estimates input tokens from the full prompt, not a 500-char slice (money-path)', async () => {
+    // Regression: parseChatFile estimated input tokens from pendingUserMessage
+    // (the last human turn sliced to 500 chars) while output summed every bot
+    // char, so a long prompt undercounted input tokens - and cost - severalfold.
+    const wsHash = 'f'.repeat(32)
+    const wsDir = join(tmpDir, wsHash)
+    await mkdir(wsDir, { recursive: true })
+    const chatPath = join(wsDir, 'long.chat')
+    const prompt = 'x'.repeat(2400) // 2400 chars / 4 = 600 tokens; a 500-slice would give 125
+    await writeFile(chatPath, makeChatFile({ userPrompt: prompt, botResponses: ['ok'] }))
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of kiro.createSessionParser({ path: chatPath, project: 'p', provider: 'kiro' }, new Set()).parse()) calls.push(call)
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(600)
+    // userMessage stays capped for display; only the token estimate uses the full length.
+    expect(calls[0]!.userMessage.length).toBe(500)
   })
 
   it('stores kiro-auto when model is auto', async () => {
@@ -1133,7 +1158,7 @@ describe('kiro provider - v2 sess_ format', () => {
     // cliDir override sits at <sessionsRoot>/cli, so v2 root = dirname(cliDir) = sessionsRoot.
     const provider = createKiroProvider('/nonexistent', '/nonexistent', join(sessionsRoot, 'cli'))
     const sources = await provider.discoverSessions()
-    const v2 = sources.filter(s => /\/sess_[^/]+\/messages\.jsonl$/.test(s.path))
+    const v2 = sources.filter(s => isV2MessagesPath(s.path))
     expect(v2).toHaveLength(1)
     expect(v2[0]!.project).toBe('test-proj')
 
@@ -1267,7 +1292,7 @@ describe('kiro provider - v2 sess_ format', () => {
     })
     const provider = createKiroProvider('/nonexistent', '/nonexistent', join(sessionsRoot, 'cli'))
     const sources = await provider.discoverSessions()
-    const v2 = sources.filter(s => /\/sess_[^/]+\/messages\.jsonl$/.test(s.path))
+    const v2 = sources.filter(s => isV2MessagesPath(s.path))
     expect(v2).toHaveLength(1)
     expect(v2[0]!.project).toBe('kiro-ide')
   })
@@ -1279,7 +1304,7 @@ describe('kiro provider - v2 sess_ format', () => {
 
     const provider = createKiroProvider('/nonexistent', '/nonexistent', join(sessionsRoot, 'cli'))
     const sources = await provider.discoverSessions()
-    const v2 = sources.filter(s => /\/sess_[^/]+\/messages\.jsonl$/.test(s.path))
+    const v2 = sources.filter(s => isV2MessagesPath(s.path))
     expect(v2).toHaveLength(0)
   })
 
@@ -1293,7 +1318,7 @@ describe('kiro provider - v2 sess_ format', () => {
 
     const provider = createKiroProvider('/nonexistent', '/nonexistent', join(sessionsRoot, 'cli'))
     const sources = await provider.discoverSessions()
-    const v2 = sources.filter(s => /\/sess_[^/]+\/messages\.jsonl$/.test(s.path))
+    const v2 = sources.filter(s => isV2MessagesPath(s.path))
     expect(v2).toHaveLength(0)
   })
 })

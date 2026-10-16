@@ -1,3 +1,5 @@
+import type { BillingMode } from './models.js'
+
 export type TokenUsage = {
   inputTokens: number
   outputTokens: number
@@ -34,7 +36,7 @@ export type ApiUsage = {
     web_search_requests?: number
     web_fetch_requests?: number
   }
-  speed?: 'standard' | 'fast'
+  speed?: 'standard' | 'fast' | 'flex'
   // Claude Code advisor tool (/advisor): per-turn sub-usage records. A record
   // with type 'advisor_message' carries the advisor model's own tokens and is
   // NOT included in the top-level totals above; type 'message' records mirror
@@ -57,7 +59,7 @@ export type ApiUsageIteration = {
     web_search_requests?: number
     web_fetch_requests?: number
   }
-  speed?: 'standard' | 'fast'
+  speed?: 'standard' | 'fast' | 'flex'
 }
 
 export type AssistantMessageContent = {
@@ -117,7 +119,7 @@ export type ParsedApiCall = {
   subagentTypes: string[]
   hasAgentSpawn: boolean
   hasPlanMode: boolean
-  speed: 'standard' | 'fast'
+  speed: 'standard' | 'fast' | 'flex'
   timestamp: string
   bashCommands: string[]
   deduplicationKey: string
@@ -127,6 +129,9 @@ export type ParsedApiCall = {
   /// this call's assistant message. Transient (built at parse time, aggregated
   /// into the turn's `spawnToolUseIds`); never cached per-call.
   spawnToolUseIds?: string[]
+  /// Claude Code: the `cwd` recorded on this call's assistant line. Transient
+  /// (parse time only); the cache stores it per call only when it changes.
+  cwd?: string
   /// When set, `costUSD` is the actual local call (forced to 0) and
   /// `savingsUSD` is the counterfactual cost the same tokens would have
   /// incurred against `savingsBaselineModel`. Set by the savings
@@ -153,6 +158,32 @@ export type ParsedApiCall = {
   /// Count of this call's tool results flagged `is_error` (Claude tool_result
   /// blocks). Bash stderr alone is NOT counted (warnings go there). Omitted at 0.
   toolErrors?: number
+  activeDurationMs?: number
+  activeGeneratedTokens?: number
+  toolWaitMs?: number
+  /// Supplementary accounting: this call's tokens/cost are real but the call is
+  /// not a distinct behavioral request (copilot shutdown rollups and store rows
+  /// that pair with an already-counted per-turn call; Hermes observation-time
+  /// deltas). Aggregates keep its tokens/cost but skip it in apiCalls /
+  /// model-call / turn counts. Hermes deltas persist the flag on CachedCall;
+  /// Copilot remains serve-time / never cached.
+  supplementaryAccounting?: boolean
+  /// Requests this one call stands for (see ParsedProviderCall.requestCount).
+  /// Absent means 1. Read through `behavioralCallWeight`, never directly.
+  requestCount?: number
+  /// Copilot session-store `total_nano_aiu`. 1e9 nano-AIU = 1 credit = $0.01.
+  /// Threaded from CachedCall / ParsedProviderCall so plan math can sum credits.
+  /// Absent on older stores and on JSONL / shutdown-rollup siblings.
+  nanoAiu?: number
+  /// Billing route id the provider recorded (see ParsedProviderCall.route).
+  /// Reports key model rows on `modelRowKey(model, route)`, so a call routed
+  /// through Bedrock lands in its own row.
+  route?: string
+  /// Billing mode the provider recorded (see ParsedProviderCall.billing).
+  /// `--billing` reads it through `callBillingMode`, which falls back to the
+  /// effective route's default; absent here means the provider stated no
+  /// fact, never that the call is unbilled.
+  billing?: BillingMode
 }
 
 export type ToolCall = {
@@ -181,13 +212,45 @@ export type ClassifiedTurn = ParsedTurn & {
   subCategory?: string
   retries: number
   hasEdits: boolean
+  /// The calls of a turn that moved to another project mid-turn. The piece that
+  /// holds the turn's first call carries the turn's weight; this one only cost
+  /// (it reads as no edits and no retries).
+  projectContinuation?: boolean
 }
 
 export type SessionSourceMetadata = {
   id: string
   label: string
   path: string
-  kind: 'claude-config' | 'claude-desktop'
+  kind: 'claude-config' | 'claude-desktop' | 'claude-desktop-ledger'
+}
+
+/// Provider-recorded parent-child session lineage (CB-1, slice 1). The
+/// relationship is captured ONLY when a provider writes it on disk in a
+/// durable form: a child file that names its parent (Claude's
+/// transcript-internal `sessionId` on a sidechain; Kimi Code's
+/// `state.json` `agents[<id>].parentAgentId` for any non-`main` agent), or
+/// a parent file whose spawn/child manifest names the children (Claude's
+/// `agentSpawnLinks`, Kimi Code's `state.json` `agents` map listing any
+/// non-`main` entry). The brief forbids inference from time adjacency or
+/// directory layout: a parent whose only evidence is the child file living
+/// under its directory does not yet qualify, and stays `lineage`-less. The
+/// field is purely additive metadata; nothing here changes the cost/token/
+/// call totals, the by-PR fold, or any other aggregation.
+export type SessionLineage = {
+  /// On a child session, the parent session's id (Claude:
+  /// transcript-internal `sessionId`; Kimi Code: `parentAgentId === 'main'`,
+  /// so this is the parent's own session id). Absent on a root session.
+  parentSessionId?: string
+  /// `'root'` when this session is itself a parent (provider-recorded
+  /// children exist); `'child'` when it is a subagent of another session.
+  /// Mutually exclusive for the providers that currently record lineage.
+  role: 'root' | 'child'
+  /// The single supported evidence class: the provider wrote the link
+  /// durably (not inferred). `provider-recorded` is the only value this
+  /// field ever holds; the discriminator exists so a future evidence class
+  /// (e.g. inferred) cannot silently downgrade strictness.
+  evidence: 'provider-recorded'
 }
 
 export type SessionSummary = {
@@ -202,10 +265,23 @@ export type SessionSummary = {
   /// correlations performed after all saved sessions have been parsed.
   prAttributionSource?: 'transcript' | 'explicit-reference' | 'working-directory' | 'launcher-prompt'
   source?: SessionSourceMetadata
+  /// Claude Code only: true when this record is a subagent (sidechain)
+  /// transcript rather than a user-started parent session. Sidechain spend is
+  /// real and remains in every cost/token/call aggregate; consumers that reason
+  /// about human session populations may exclude it explicitly.
+  isSidechain?: boolean
   // Claude Code only: agent type of a subagent transcript session
   // (`workflow-subagent`, `Explore`, `general-purpose`, …); undefined for
   // ordinary sessions. Drives the Claude-scoped agent-type breakdown.
   agentType?: string
+  /// Claude Code only: a subagent's `.meta.json` sidecar. Its Agent
+  /// `description` ("Review PR 1729 Claude quota dir") is read only by PR
+  /// attribution, on demand.
+  agentMetaPath?: string
+  /// OMP nested-agent file stem. Kept separate from Claude's agentType metadata.
+  agentName?: string
+  /// OMP nested-agent session-header timestamp.
+  agentStartedAt?: string
   /// Claude Code only: for a sidechain (subagent) transcript, the id of the
   /// session that spawned it (the transcript's internal `sessionId`, which is the
   /// parent, cross-checked against the owning directory). Lets by-PR attribution
@@ -258,8 +334,8 @@ export type SessionSummary = {
   /// reference made before the window into its later, in-range, ref-less turns.
   /// Absent when no PR was referenced before the range (or no range filter).
   prRefsAtRangeStart?: string[]
-  /// Human session title captured from the transcript (last ai-title entry).
-  /// Absent when the transcript never produced one.
+  /// Human title from the transcript or the optional Codex session index.
+  /// Codex names are refreshed at report time, independently of usage caches.
   title?: string
   /// True when the session observed a git branch on ANY turn of its FULL
   /// (pre-date-filter) transcript. Set before turns are sliced to a range so the
@@ -268,7 +344,11 @@ export type SessionSummary = {
   /// from a provider that never captures branches (→ contributes nothing).
   /// Claude only; absent otherwise.
   everHadBranch?: boolean
-  modelBreakdown: Record<string, { calls: number; costUSD: number; tokens: TokenUsage; savingsUSD: number; estimatedCostUSD?: number }>
+  /// Claude Code: set on each per-project slice of a session whose calls ran
+  /// in more than one project (per-call `cwd`). Session rows merge the slices
+  /// back into one row labeled with the primary (highest-cost) project.
+  projectSplit?: { primaryProject: string; primaryProjectPath: string; primary: boolean }
+  modelBreakdown: Record<string, { calls: number; costUSD: number; tokens: TokenUsage; savingsUSD: number; estimatedCostUSD?: number; activeDurationMs?: number; activeGeneratedTokens?: number; toolWaitMs?: number }>
   toolBreakdown: Record<string, { calls: number }>
   mcpBreakdown: Record<string, { calls: number }>
   bashBreakdown: Record<string, { calls: number }>
@@ -281,6 +361,13 @@ export type SessionSummary = {
   // Built-in tools (Bash, Edit, etc.) are filtered out. Provider-agnostic field;
   // currently populated only by the Claude parser.
   mcpInventory?: string[]
+  /// Provider-recorded parent/child lineage (CB-1, slice 1). Set only when
+  /// the parser captured durable provider evidence (see SessionLineage);
+  /// absent for sessions with no such evidence. The per-provider
+  /// `parentSessionId` / `agentSpawnLinks` / `agentId` fields above remain
+  /// the source of truth for by-PR subagent folding and are kept populated
+  /// independently of this field.
+  lineage?: SessionLineage
 }
 
 export type ProjectSummary = {

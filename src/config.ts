@@ -4,12 +4,15 @@ import { homedir } from 'os'
 import { randomBytes } from 'crypto'
 import { PLAN_PROVIDERS } from './plans.js'
 
-export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'custom' | 'none'
-export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'all'
+export type PlanId = 'claude-pro' | 'claude-max' | 'claude-max-5x' | 'cursor-pro' | 'supergrok' | 'supergrok-heavy' | 'copilot-pro' | 'copilot-pro-plus' | 'copilot-max' | 'google-ai-pro' | 'google-ai-ultra-5x' | 'google-ai-ultra-20x' | 'custom' | 'none'
+export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'copilot' | 'antigravity' | 'all'
 
 export type Plan = {
   id: PlanId
   monthlyUsd: number
+  // Copilot plans budget in AI credits. monthlyUsd stays as credits × $0.01 so
+  // isActivePlan and add-only JSON keep working. Absent on USD plans.
+  monthlyCredits?: number
   provider: PlanProvider
   resetDay?: number
   setAt: string
@@ -23,9 +26,6 @@ export type CodeburnConfig = {
   currency?: {
     code: string
     symbol?: string
-  }
-  devin?: {
-    acuUsdRate?: number
   }
   plan?: Plan
   plans?: PlanConfigMap
@@ -44,6 +44,15 @@ export type CodeburnConfig = {
   // can show "saved $X by running locally". Distinct from modelAliases which
   // rewrites actual spend.
   localModelSavings?: Record<string, string>
+  // Model ids whose $0 cost is correct because they are billed as a
+  // subscription / flat-rate product, not missing LiteLLM rows. Distinct from
+  // modelAliases (which invent per-token spend) and localModelSavings
+  // (counterfactual local baseline). See `codeburn model-flat-rate`.
+  flatRateModels?: string[]
+  // Opt-outs from the built-in flat-rate classifier. `model-flat-rate --remove`
+  // on a built-in SKU records the id here so a false positive can warn again
+  // without waiting for a release.
+  flatRateModelsRemoved?: string[]
   // Spend budgets are stored in the configured display currency, not USD.
   budget?: {
     daily?: number
@@ -61,6 +70,35 @@ export type CodeburnConfig = {
   // Matched against the canonical project path: prefix on a path-segment
   // boundary, case-insensitive, trailing-slash and backslash tolerant.
   proxyPaths?: string[]
+  // Folder -> repository origin key (`codeburn project link`): the folder and
+  // everything under it join that repository's project row.
+  projectLinks?: Record<string, string>
+  // Vercel AI Gateway rows are DAILY AGGREGATES per model with no request id,
+  // timestamp or attribution (see src/providers/vercel-gateway.ts), so they
+  // cannot be matched against the local tools that were pointed at the gateway
+  // (Claude Code via ANTHROPIC_BASE_URL, Codex, OpenCode, Cline/Kilo,
+  // Cursor) — counting both double counts the same spend. Gateway rows are
+  // therefore always shown as their own labelled row but kept OUT of every
+  // headline total unless this is true. Read-side only: the daily cache always
+  // seals the gateway slice, so flipping this re-includes sealed days without
+  // re-fetching anything.
+  includeGatewayInTotals?: boolean
+  // false stops the automatic download of the Cursor account's own usage
+  // export (src/cursor-sync.ts). `codeburn import cursor --sync` still works.
+  cursorSync?: boolean
+}
+
+// Read synchronously by the aggregator on every period build, so it is set
+// once per process from config.json (the `preAction` hook), the same way
+// models.ts holds the pricing config.
+let includeGatewayInTotals = false
+
+export function setIncludeGatewayInTotals(value: boolean): void {
+  includeGatewayInTotals = value
+}
+
+export function gatewayIncludedInTotals(): boolean {
+  return includeGatewayInTotals
 }
 
 function getConfigDir(): string {

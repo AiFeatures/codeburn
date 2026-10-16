@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { mkdtemp, mkdir, writeFile, appendFile, readFile, rm, stat, unlink } from 'fs/promises'
+import { mkdtemp, mkdir, writeFile, appendFile, readFile, rename, rm, stat, unlink } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
@@ -20,7 +20,7 @@ vi.mock('../src/fs-utils.js', async (importOriginal) => {
 })
 
 import { parseAllSessions, clearSessionCache } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { ProjectSummary } from '../src/types.js'
 
 let tmpDir: string
@@ -129,8 +129,8 @@ describe('incremental append parsing', () => {
     await writeFile(sessionPath, baseLines().join('\n') + '\n')
     await parseWith(warmCache)
 
-    const cachedOffset: number = JSON.parse(await readFile(sessionCachePath(), 'utf-8'))
-      .providers.claude.files[sessionPath].lastCompleteLineOffset
+    const cachedOffset = (await readCacheOnDisk())
+      .providers['claude']!.files[sessionPath]!.lastCompleteLineOffset!
     expect(cachedOffset).toBeGreaterThan(0)
 
     // 2) append a new complete turn plus a torn (invalid JSON, no newline) tail.
@@ -286,14 +286,19 @@ describe('incremental append parsing', () => {
     await parseWith(warmCache)
     const inoBefore = (await stat(sessionPath)).ino
 
-    // Replace the file (new inode) with different, LARGER content.
-    await unlink(sessionPath)
+    // Replace the file (new inode) with different, LARGER content. The
+    // replacement is created BESIDE the original and renamed over it: an
+    // unlink-then-create lets ext4 hand the freed inode straight back, which
+    // broke the new-inode premise on Linux CI. Two files alive at once are
+    // guaranteed distinct inodes, and rename keeps the replacement's.
     const replaced = [
       ...baseLines(),
       userLine('2026-05-01T12:00:00.000Z', 'brand new task'),
       asstLine('msg-z', '2026-05-01T12:00:02.000Z', { input_tokens: 500, output_tokens: 120 }, [readBlock('/z.ts')]),
     ].join('\n') + '\n'
-    await writeFile(sessionPath, replaced)
+    const replacementPath = sessionPath + '.replacement'
+    await writeFile(replacementPath, replaced)
+    await rename(replacementPath, sessionPath)
     expect((await stat(sessionPath)).ino).not.toBe(inoBefore)
 
     readLineCalls.length = 0
@@ -312,10 +317,9 @@ describe('incremental append parsing', () => {
     await parseWith(warmCache)
 
     // Corrupt the persisted offset to point far beyond the file, then grow it.
-    const cachePath = sessionCachePath()
-    const cache = JSON.parse(await readFile(cachePath, 'utf-8'))
-    cache.providers.claude.files[sessionPath].lastCompleteLineOffset = 10_000_000
-    await writeFile(cachePath, JSON.stringify(cache))
+    const cache = await readCacheOnDisk()
+    cache.providers['claude']!.files[sessionPath]!.lastCompleteLineOffset = 10_000_000
+    await writeCacheOnDisk(cache)
 
     await appendFile(sessionPath,
       userLine('2026-05-01T13:00:00.000Z', 'grow the file') + '\n' +

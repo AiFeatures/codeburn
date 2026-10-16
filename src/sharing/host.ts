@@ -96,6 +96,9 @@ export function summarizeDeviceUsage(results: DeviceUsage[], window?: SummaryWin
       return {
         cost: a.cost + d.cost,
         calls: a.calls + d.calls,
+        // Numeric wire sum only. Combined-scope UI must not present this as a
+        // unique or lower-bound session count until a cross-device identity
+        // contract exists.
         sessions: a.sessions + d.sessions,
         inputTokens: a.inputTokens + d.inputTokens,
         outputTokens: a.outputTokens + d.outputTokens,
@@ -205,7 +208,7 @@ export async function pullDevices(
 // row. Tokens are shown as full, comma-grouped numbers.
 export function renderDevices(results: DeviceUsage[]): string {
   const n = (x: number): string => Math.round(x).toLocaleString()
-  const money = (x: number): string => formatCost(x).replace(/(\d)(?=(\d{3})+(\.|$))/g, '$1,')
+  const money = (x: number): string => formatCost(x).replace(/(?<!\.\d*)(\d)(?=(\d{3})+(\.|$))/g, '$1,')
   const summary = summarizeDeviceUsage(results)
   const rows = summary.perDevice.map((d) => ({
     name: d.name + (d.local ? ' (this Mac)' : ''),

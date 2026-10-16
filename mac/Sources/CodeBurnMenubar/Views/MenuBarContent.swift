@@ -20,6 +20,18 @@ struct MenuBarContent: View {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(spacing: 0) {
                         HeroSection()
+                        if store.selectedPayloadMayBeIncomplete {
+                            Text(L("This total may be incomplete."))
+                                .font(.system(size: 11))
+                                .foregroundStyle(Color.secondary.opacity(0.75))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 14)
+                                .padding(.bottom, 6)
+                        }
+                        if store.selectedProvider == .cursor || store.selectedProvider == .cursorAgent,
+                           let sync = store.payload.cursorSync?.line() {
+                            CursorSyncLine(text: sync.text, warn: sync.warn)
+                        }
                         Divider().opacity(0.5)
                         PeriodSegmentedControl()
                         ScopeSegmentedControl()
@@ -36,7 +48,7 @@ struct MenuBarContent: View {
                             ActivitySection()
                             Divider().opacity(0.5)
                             ModelsSection()
-                            WorkflowSection()
+                            PullRequestsSection()
                             Divider().opacity(0.5)
                             ToolingSection()
                             Divider().opacity(0.5)
@@ -92,20 +104,23 @@ struct MenuBarContent: View {
 
     private var isFilteredEmpty: Bool {
         guard store.selectedProvider != .all else { return false }
+        // Plan-capable providers keep their sections visible so the Plan tab
+        // (live subscription quota) stays reachable even on days with no
+        // local usage — the quota endpoint doesn't depend on local sessions.
+        if store.selectedProvider == .claude || store.selectedProvider == .codex || store.selectedProvider == .kimiCode || store.selectedProvider == .gemini { return false }
         if store.payload.current.cost > 0 || store.payload.current.calls > 0 { return false }
-        if providerHasCostInAllPayload { return false }
+        if providerHasUsageInAllPayload { return false }
         return true
     }
 
-    private var providerHasCostInAllPayload: Bool {
+    private var providerHasUsageInAllPayload: Bool {
         guard let allPayload = store.periodAllPayload else { return false }
-        let providers = Dictionary(
-            allPayload.current.providers.map { ($0.key.lowercased(), $0.value) },
-            uniquingKeysWith: +
+        let activeKeys = ProviderVisibility.activeKeys(
+            providerDetails: allPayload.current.providerDetails,
+            legacyProviders: allPayload.current.providers
         )
-        return store.selectedProvider.providerKeys.contains { key in
-            (providers[key] ?? 0) > 0
-        }
+        return activeKeys.contains(store.selectedProvider.cliArg)
+            || store.selectedProvider.providerKeys.contains(where: activeKeys.contains)
     }
 
     /// Show the tab row whenever the CLI detected at least one AI coding tool installed
@@ -116,7 +131,7 @@ struct MenuBarContent: View {
         // visible. Without this, the strip disappears for one frame on a period
         // switch when the new key's payload is still empty.
         if store.hasAnyProvidersInCache { return true }
-        let payload = store.todayPayload ?? store.payload
+        let payload = store.todayPayload ?? (store.hasCachedData ? store.payload : .empty)
         return !payload.current.providers.isEmpty
     }
 
@@ -133,7 +148,7 @@ private struct ScopeSegmentedControl: View {
                     Button {
                         store.switchTo(scope: scope)
                     } label: {
-                        Text(scope.rawValue)
+                        Text(scope.displayLabel)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(isActive ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
                             .frame(maxWidth: .infinity)
@@ -170,7 +185,7 @@ private struct ClaudeConfigPicker: View {
     private var selectedLabel: String {
         guard let selected = store.selectedClaudeConfigSourceId,
               let option = store.claudeConfigOptions.first(where: { $0.id == selected }) else {
-            return "All"
+            return L("All")
         }
         return option.label
     }
@@ -184,7 +199,7 @@ private struct ClaudeConfigPicker: View {
                     if store.selectedClaudeConfigSourceId == nil {
                         Image(systemName: "checkmark")
                     }
-                    Text("All")
+                    Text(L("All"))
                 }
             }
 
@@ -226,7 +241,24 @@ private struct ClaudeConfigPicker: View {
         }
         .menuStyle(.borderlessButton)
         .fixedSize(horizontal: true, vertical: false)
-        .help("Claude config")
+        .help(L("Claude config"))
+    }
+}
+
+private struct CursorSyncLine: View {
+    let text: String
+    let warn: Bool
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 11))
+            .foregroundStyle(warn
+                ? Color(quotaWarning: QuotaWarningPalette.foreground(.warning, colorScheme == .dark ? .dark : .light))
+                : Color.secondary.opacity(0.75))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
     }
 }
 
@@ -239,7 +271,7 @@ private struct EmptyProviderState: View {
             Image(systemName: "tray")
                 .font(.system(size: 26))
                 .foregroundStyle(.tertiary)
-            Text("No \(provider.rawValue) data for \(periodLabel)")
+            Text(L("No %1$@ data for %2$@", provider.displayLabel, periodLabel))
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -266,7 +298,7 @@ private struct FetchErrorOverlay: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 28))
                     .foregroundStyle(Theme.brandAccent)
-                Text("Couldn't load \(periodLabel)")
+                Text(L("Couldn't load %@", periodLabel))
                     .font(.system(size: 12.5, weight: .semibold))
                     .foregroundStyle(.primary)
                 Text(displayError)
@@ -275,7 +307,7 @@ private struct FetchErrorOverlay: View {
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: 280)
                     .lineLimit(3)
-                Button("Retry", action: retry)
+                Button(L("Retry"), action: retry)
                     .buttonStyle(.borderedProminent)
                     .tint(Theme.brandAccent)
                     .controlSize(.small)
@@ -298,6 +330,7 @@ private struct FetchErrorOverlay: View {
 /// yellow→orange→red, looping.
 private struct BurnLoadingOverlay: View {
     let periodLabel: String
+    @Environment(AppStore.self) private var store
     @State private var fillProgress: CGFloat = 0
     @State private var glowing: Bool = false
 
@@ -311,18 +344,32 @@ private struct BurnLoadingOverlay: View {
 
             VStack(spacing: 14) {
                 BurnFlame(size: flameSize, fillProgress: fillProgress, glowing: glowing)
-                Text("Loading \(periodLabel)…")
+                Text(L("Loading %@…", periodLabel))
                     .font(.system(size: 11.5, weight: .medium))
                     .foregroundStyle(.secondary)
             }
         }
-        .onAppear {
-            withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
-                fillProgress = 1.0
+        .onAppear { setPulsing(store.menuPopoverVisible) }
+        .onChange(of: store.menuPopoverVisible) { _, visible in
+            setPulsing(visible)
+        }
+    }
+
+    private func setPulsing(_ on: Bool) {
+        guard on else {
+            var stop = Transaction()
+            stop.disablesAnimations = true
+            withTransaction(stop) {
+                fillProgress = 0
+                glowing = false
             }
-            withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
-                glowing = true
-            }
+            return
+        }
+        withAnimation(.easeInOut(duration: 1.4).repeatForever(autoreverses: true)) {
+            fillProgress = 1.0
+        }
+        withAnimation(.easeInOut(duration: 0.9).repeatForever(autoreverses: true)) {
+            glowing = true
         }
     }
 }
@@ -379,25 +426,20 @@ private struct Header: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
-                    (
-                        Text("Code").foregroundStyle(.primary)
-                        + Text("Burn").foregroundStyle(Theme.brandEmber)
-                    )
-                    .font(.system(size: 13, weight: .semibold))
-                    .tracking(-0.15)
-                    Text("AI Coding Cost Tracker")
+                    FlameWordmark()
+                    Text(L("Your AI Bill, Itemized"))
                         .font(.system(size: 10.5))
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                if updateChecker.updateAvailable || updateChecker.cliUpdateAvailable || updateChecker.updateError != nil {
+                if updateChecker.anyUpdateAvailable || updateChecker.updateError != nil {
                     UpdateBadge()
                 }
                 AccentPicker()
             }
             // Compact warning row when any connected provider crosses 70%.
-            // Lists all warning providers with their worst-window percent so
-            // the user knows whether to slow down on Claude, Codex, or both.
+            // Lists every warning provider with its worst window: the label,
+            // percent and reset, so a 5-hour figure is never read as weekly.
             QuotaWarningRow(status: store.aggregateQuotaStatus)
         }
         .padding(.horizontal, 14)
@@ -408,47 +450,45 @@ private struct Header: View {
 
 private struct QuotaWarningRow: View {
     let status: AppStore.AggregateQuotaStatus
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         if !status.warnings.isEmpty {
-            HStack(spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Image(systemName: severityIcon)
                     .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(severityColor)
-                Text(message)
+                    .foregroundStyle(foreground)
+                // One line per provider: "Claude · 5-hour 71% · resets in 3h 12m".
+                Text(QuotaWarningPresentation.message(for: status.warnings))
                     .font(.system(size: 10.5, weight: .medium))
-                    .foregroundStyle(severityColor)
+                    .foregroundStyle(foreground)
+                    .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
             .background(
                 RoundedRectangle(cornerRadius: 5)
-                    .fill(severityColor.opacity(0.12))
+                    .fill(pillFill)
             )
         }
     }
 
-    private var message: String {
-        let parts = status.warnings.map { "\($0.name) \(Int($0.percent.rounded()))%" }
-        if parts.count == 1 {
-            // Reads "Claude over limit (105%)" when any provider exceeds the
-            // quota cap, instead of the awkward "Claude 105% of quota used".
-            if case .danger = status.severity {
-                return "\(status.warnings[0].name) over limit (\(Int(status.warnings[0].percent.rounded()))%)"
-            }
-            return "\(parts[0]) of quota used"
-        }
-        return parts.joined(separator: " · ")
+    private var tone: QuotaWarningPalette.Tone? { QuotaWarningPalette.Tone(status.severity) }
+
+    private var scheme: QuotaWarningPalette.Scheme { colorScheme == .dark ? .dark : .light }
+
+    /// Text and glyph. Not the tint itself: amber on a 12% amber wash is
+    /// unreadable in light mode, so each scheme has an AA-clearing foreground.
+    private var foreground: Color {
+        guard let tone else { return .secondary }
+        return Color(quotaWarning: QuotaWarningPalette.foreground(tone, scheme))
     }
 
-    private var severityColor: Color {
-        switch status.severity {
-        case .normal:   return .secondary
-        case .warning:  return .yellow
-        case .critical: return .orange
-        case .danger:   return .red
-        }
+    private var pillFill: Color {
+        guard let tone else { return Color.secondary.opacity(QuotaWarningPalette.pillOpacity) }
+        return Color(quotaWarning: QuotaWarningPalette.tint(tone, scheme))
+            .opacity(QuotaWarningPalette.pillOpacity)
     }
 
     private var severityIcon: String {
@@ -458,6 +498,12 @@ private struct QuotaWarningRow: View {
         case .critical: return "exclamationmark.triangle"
         case .danger:   return "octagon"
         }
+    }
+}
+
+private extension Color {
+    init(quotaWarning rgb: QuotaWarningPalette.RGB) {
+        self.init(.sRGB, red: rgb.red, green: rgb.green, blue: rgb.blue)
     }
 }
 
@@ -483,7 +529,7 @@ private struct AccentPicker: View {
                                 )
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel(preset.rawValue)
+                        .accessibilityLabel(preset.displayLabel)
                     }
                 }
                 .padding(.horizontal, 6)
@@ -509,7 +555,7 @@ private struct AccentPicker: View {
                     )
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Change accent color")
+            .accessibilityLabel(L("Change accent color"))
             .padding(.leading, 4)
         }
     }
@@ -520,7 +566,9 @@ private struct UpdateBadge: View {
 
     var body: some View {
         Button {
-            if updateChecker.updateAvailable || updateChecker.cliUpdateAvailable {
+            if updateChecker.updateFailureStage == .check {
+                Task { await updateChecker.check() }
+            } else if updateChecker.anyUpdateAvailable {
                 updateChecker.performFullUpdate()
             } else {
                 Task { await updateChecker.check() }
@@ -538,7 +586,7 @@ private struct UpdateBadge: View {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 10))
                 }
-                Text(updateChecker.isUpdating ? "Updating..." : (updateChecker.updateError == nil ? "Update" : "Failed"))
+                Text(updateChecker.updateBadgeLabel)
                     .font(.system(size: 10, weight: .medium))
             }
             .padding(.horizontal, 8)
@@ -548,7 +596,9 @@ private struct UpdateBadge: View {
         .tint(Theme.brandAccent)
         .controlSize(.mini)
         .disabled(updateChecker.isUpdating)
-        .help(updateChecker.updateError ?? "Update the CLI and menubar to the latest release")
+        .help(updateChecker.updateHelpText)
+        .accessibilityLabel(updateChecker.updateBadgeLabel)
+        .accessibilityHint(updateChecker.updateHelpText)
     }
 }
 
@@ -575,41 +625,34 @@ struct CLIUpdateBanner: View {
     @Environment(UpdateChecker.self) private var updateChecker
 
     var body: some View {
-        if updateChecker.cliUpdateAvailable {
+        if let error = updateChecker.updateError, updateChecker.updateFailureStage != .check {
             HStack(spacing: 6) {
-                Image(systemName: "arrow.up.circle.fill")
+                Image(systemName: "exclamationmark.triangle.fill")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.blue)
 
-                Text("CLI \(updateChecker.latestCliVersion ?? "") available")
+                Text(error)
                     .font(.system(size: 10.5, weight: .medium))
                     .foregroundStyle(.primary)
+                    .lineLimit(3)
+                    .textSelection(.enabled)
 
-                Button {
-                    updateChecker.performFullUpdate()
-                } label: {
-                    Text(updateChecker.isUpdating ? "Updating..." : "Update now")
-                        .font(.system(size: 10, weight: .semibold))
+                if let command = updateChecker.manualUpdateCommand {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(command, forType: .string)
+                    } label: {
+                        HStack(spacing: 3) {
+                            Text(command)
+                                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            Image(systemName: "doc.on.doc")
+                                .font(.system(size: 8))
+                        }
                         .foregroundStyle(.blue)
-                }
-                .buttonStyle(.plain)
-                .disabled(updateChecker.isUpdating)
-                .help("Update the CLI (and the menubar if one is available) automatically")
-
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(updateChecker.cliUpdateCommand, forType: .string)
-                } label: {
-                    HStack(spacing: 3) {
-                        Text(updateChecker.cliUpdateCommand)
-                            .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        Image(systemName: "doc.on.doc")
-                            .font(.system(size: 8))
                     }
-                    .foregroundStyle(.blue)
+                    .buttonStyle(.plain)
+                    .help(L("Copy update command to clipboard"))
                 }
-                .buttonStyle(.plain)
-                .help("Copy update command to clipboard")
 
                 Spacer(minLength: 0)
             }
@@ -644,9 +687,9 @@ struct StarBanner: View {
                     NSWorkspace.shared.open(starBannerGitHubURL)
                 } label: {
                     HStack(spacing: 4) {
-                        Text("Enjoying CodeBurn?")
+                        Text(L("Enjoying CodeBurn?"))
                             .foregroundStyle(.primary)
-                        Text("Star us on GitHub")
+                        Text(L("Star us on GitHub"))
                             .foregroundStyle(Theme.brandAccent)
                             .underline(true, pattern: .solid)
                     }
@@ -667,7 +710,7 @@ struct StarBanner: View {
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help("Hide this banner")
+                .help(L("Hide this banner"))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
@@ -692,9 +735,9 @@ struct FooterBar: View {
                         applyCurrency(code: currency.rawValue)
                     } label: {
                         if currency.rawValue == store.currency {
-                            Label("\(currency.displayName) (\(currency.rawValue))", systemImage: "checkmark")
+                            Label(currency.pickerLabel, systemImage: "checkmark")
                         } else {
-                            Text("\(currency.displayName) (\(currency.rawValue))")
+                            Text(currency.pickerLabel)
                         }
                     }
                 }
@@ -720,10 +763,10 @@ struct FooterBar: View {
             .disabled(store.isLoading)
 
             Menu {
-                Button("CSV (folder)") { runExport(format: .csv) }
-                Button("JSON") { runExport(format: .json) }
+                Button(L("CSV (folder)")) { runExport(format: .csv) }
+                Button(L("JSON")) { runExport(format: .json) }
             } label: {
-                Label("Export", systemImage: "square.and.arrow.down")
+                Label(L("Export"), systemImage: "square.and.arrow.down")
                     .font(.system(size: 11, weight: .medium))
                     .labelStyle(.titleAndIcon)
             }
@@ -740,7 +783,7 @@ struct FooterBar: View {
                 .foregroundStyle(.tertiary)
 
             Button { openReport() } label: {
-                Label("Full Report", systemImage: "terminal")
+                Label(L("Full Report"), systemImage: "terminal")
                     .font(.system(size: 11, weight: .semibold))
                     .labelStyle(.titleAndIcon)
             }

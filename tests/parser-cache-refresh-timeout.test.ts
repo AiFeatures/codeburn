@@ -7,8 +7,8 @@ vi.mock('../src/cache-refresh-lock.js', () => ({
   acquireCacheRefreshLock: async () => ({ outcome: 'timed-out' as const }),
 }))
 
-import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { clearSessionCache, isSessionHydrationComplete, parseAllSessions } from '../src/parser.js'
+import { cacheDirSnapshot } from './fixtures/session-cache-io.js'
 
 let root: string
 let sessionPath: string
@@ -52,11 +52,53 @@ describe('parseAllSessions warm refresh timeout', () => {
   it('serves the prior complete snapshot and leaves the holder cache untouched', async () => {
     await writeSession(50)
     expect(output(await parseAllSessions(undefined, 'claude'))).toBe(50)
-    const before = await readFile(sessionCachePath(), 'utf-8')
+    const before = await cacheDirSnapshot()
 
     await writeSession(5000)
     clearSessionCache()
     expect(output(await parseAllSessions(undefined, 'claude'))).toBe(50)
-    expect(await readFile(sessionCachePath(), 'utf-8')).toBe(before)
+    expect(await cacheDirSnapshot()).toBe(before)
+  })
+
+  // The snapshot a timed-out refresh serves is only as good as what has changed
+  // under it. Anything the daily backfill finalizes off a snapshot that skipped
+  // real files freezes those days out of history for good, so the completeness
+  // signal has to distinguish the two cases.
+  it('does not report a complete hydration when the served snapshot is stale', async () => {
+    await writeSession(50)
+    await parseAllSessions(undefined, 'claude')
+    expect(isSessionHydrationComplete()).toBe(true)
+
+    await writeSession(5000)
+    clearSessionCache()
+    await parseAllSessions(undefined, 'claude')
+    expect(isSessionHydrationComplete()).toBe(false)
+  })
+
+  it('does not report a complete hydration when a session file is missing from the snapshot', async () => {
+    await writeSession(50)
+    await parseAllSessions(undefined, 'claude')
+
+    await writeFile(join(sessionPath, '..', 'other.jsonl'), JSON.stringify({
+      type: 'assistant',
+      sessionId: 'sess-2',
+      timestamp: '2026-05-16T10:00:00Z',
+      cwd: '/tmp/proj',
+      message: {
+        id: 'msg-other', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5',
+        content: [], usage: { input_tokens: 100, output_tokens: 7 },
+      },
+    }) + '\n')
+    clearSessionCache()
+    await parseAllSessions(undefined, 'claude')
+    expect(isSessionHydrationComplete()).toBe(false)
+  })
+
+  it('still reports a complete hydration when nothing changed under the snapshot', async () => {
+    await writeSession(50)
+    await parseAllSessions(undefined, 'claude')
+    clearSessionCache()
+    await parseAllSessions(undefined, 'claude')
+    expect(isSessionHydrationComplete()).toBe(true)
   })
 })

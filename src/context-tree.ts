@@ -406,9 +406,15 @@ async function findLastBoundary(filePath: string): Promise<{
 }
 
 // Claude models with a 1M window: opus-4-8 (auto-compactions on disk show
-// ~1.0M preTokens) and the "[1m]" long-context variants. Others default to
-// 200K unless the session itself proves bigger.
-const MILLION_WINDOW_RE = /opus-4-8|\[1m\]/
+// ~1.0M preTokens), the Claude 5 Fable / Mythos ids (claude-fable-5-1 and
+// claude-mythos-5-1 run a 1M window from the first turn), and the "[1m]"
+// long-context variants. Others default to 200K unless the session itself
+// proves bigger.
+const MILLION_WINDOW_RE = /opus-4-8|fable-5|mythos-5|\[1m\]/
+
+export function reportedContextWindow(model: string, maxSeenTokens: number): number {
+  return MILLION_WINDOW_RE.test(model) || maxSeenTokens > 220_000 ? 1_000_000 : 200_000
+}
 
 export async function buildContextTree(session: SessionRef): Promise<ContextTreeResult> {
   const boundary = await findLastBoundary(session.filePath)
@@ -445,8 +451,7 @@ export async function buildContextTree(session: SessionRef): Promise<ContextTree
       (builder.lastUsage.cache_creation_input_tokens ?? 0) +
       (builder.lastUsage.output_tokens ?? 0)
     builder.maxSeenTokens = Math.max(builder.maxSeenTokens, context)
-    const million = MILLION_WINDOW_RE.test(builder.model) || builder.maxSeenTokens > 220_000
-    reported = { context, window: million ? 1_000_000 : 200_000 }
+    reported = { context, window: reportedContextWindow(builder.model, builder.maxSeenTokens) }
   }
 
   return {

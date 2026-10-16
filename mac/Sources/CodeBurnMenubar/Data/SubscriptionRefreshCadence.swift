@@ -1,6 +1,6 @@
 import Foundation
 
-/// User-configurable cadence for /api/oauth/usage polling. Mirrors CodexBar's
+/// User-configurable cadence for /api/oauth/usage polling. Uses
 /// "manual / 1m / 2m / 5m / 15m" preset set so users on tight rate-limit
 /// budgets can dial it down and power users can dial it up. Stored as the raw
 /// number of seconds in UserDefaults; `manual = 0` means "never auto-refresh".
@@ -15,11 +15,11 @@ enum SubscriptionRefreshCadence: Int, CaseIterable, Identifiable {
 
     var label: String {
         switch self {
-        case .manual: return "Manual"
-        case .oneMinute: return "1 minute"
-        case .twoMinutes: return "2 minutes"
-        case .fiveMinutes: return "5 minutes"
-        case .fifteenMinutes: return "15 minutes"
+        case .manual: return L("Manual")
+        case .oneMinute: return L("1 minute")
+        case .twoMinutes: return L("2 minutes")
+        case .fiveMinutes: return L("5 minutes")
+        case .fifteenMinutes: return L("15 minutes")
         }
     }
 

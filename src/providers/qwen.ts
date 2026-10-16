@@ -5,7 +5,7 @@ import { homedir } from 'os'
 import { readSessionFile } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const toolNameMap: Record<string, string> = {
   read_file: 'Read',
@@ -58,6 +58,17 @@ function projectNameFromDirName(dirName: string): string {
   return parts[parts.length - 1] || dirName
 }
 
+// Validate the entry timestamp and fall back to the file mtime when it is
+// missing/unparseable, so the call lands on a real day instead of an empty
+// string that parser.ts date filters exclude from period reports.
+function isoTimestamp(value: string | undefined, fallback: string): string {
+  if (value) {
+    const date = new Date(value)
+    if (!Number.isNaN(date.getTime())) return date.toISOString()
+  }
+  return fallback
+}
+
 function extractTools(parts: QwenPart[]): { tools: string[]; bashCommands: string[] } {
   const tools: string[] = []
   const bashCommands: string[] = []
@@ -80,6 +91,9 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const raw = await readSessionFile(source.path)
       if (raw === null) return
+
+      const fileStat = await stat(source.path).catch(() => null)
+      const fileMtime = fileStat?.mtime.toISOString() ?? ''
 
       const lines = raw.split('\n').filter(l => l.trim())
       let pendingUserMessage = ''
@@ -134,7 +148,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           costUSD,
           tools: [...new Set(tools)],
           bashCommands: [...new Set(bashCommands)],
-          timestamp: entry.timestamp || '',
+          timestamp: isoTimestamp(entry.timestamp, fileMtime),
           speed: 'standard',
           deduplicationKey: dedupKey,
           userMessage: pendingUserMessage,
@@ -160,6 +174,10 @@ export function createQwenProvider(overrideDir?: string): Provider {
 
     toolDisplayName(rawTool: string): string {
       return toolNameMap[rawTool] ?? rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: projectsDir, label: 'projects' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

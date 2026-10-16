@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { isSqliteAvailable } from '../../src/sqlite.js'
+import { calculateCost } from '../../src/models.js'
 import { createOpenCodeProvider } from '../../src/providers/opencode.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
@@ -77,6 +78,7 @@ function insertSession(
 type MessageFixture = {
   role: string
   modelID?: string
+  providerID?: string
   cost?: number
   tokens?: {
     input: number
@@ -182,7 +184,7 @@ skipUnlessSqlite('opencode provider - session discovery', () => {
     expect(sessions[0]!.path).toBe(`${dbPath}:sess-1`)
   })
 
-  it('excludes archived sessions', async () => {
+  it('discovers archived sessions (#1362: the archive is organizational, the rows stay)', async () => {
     const dbPath = createTestDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, 'sess-archived', { archived: 1700000001000 })
@@ -190,7 +192,8 @@ skipUnlessSqlite('opencode provider - session discovery', () => {
 
     const provider = createOpenCodeProvider(tmpDir)
     const sessions = await provider.discoverSessions()
-    expect(sessions).toHaveLength(0)
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.path).toBe(`${dbPath}:sess-archived`)
   })
 
   it('excludes child sessions', async () => {
@@ -335,6 +338,52 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     expect(call.sessionId).toBe('sess-1')
     expect(call.timestamp).toBe(new Date(1700000001000).toISOString())
     expect(call.deduplicationKey).toBe('opencode:sess-1:msg-2')
+  })
+
+  it('carries the exact OpenRouter provider field as the billing route', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-openrouter')
+      insertMessage(db, 'msg-openrouter', 'sess-openrouter', 1700000001000, {
+        role: 'assistant',
+        providerID: 'openrouter',
+        modelID: 'cohere/north-mini-code:free',
+        cost: 0,
+        tokens: { input: 22_928, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-openrouter', 'msg-openrouter', 'sess-openrouter', { type: 'text', text: 'route test' })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-openrouter')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      provider: 'opencode',
+      model: 'cohere/north-mini-code:free',
+      route: 'openrouter',
+      costUSD: 0,
+    })
+  })
+
+  it('carries the exact Amazon Bedrock field without relying on a model-id shape', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-amazon-bedrock')
+      insertMessage(db, 'msg-amazon-bedrock', 'sess-amazon-bedrock', 1700000001000, {
+        role: 'assistant',
+        providerID: 'amazon-bedrock',
+        modelID: 'amazon.nova-2-lite-v1:0',
+        cost: 0.01,
+        tokens: { input: 100, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-amazon-bedrock')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      provider: 'opencode',
+      model: 'amazon.nova-2-lite-v1:0',
+      route: 'bedrock',
+    })
   })
 
   it('normalizes opencode MCP tool names for shared MCP reporting', async () => {
@@ -756,7 +805,7 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     expect(calls[2]!.bashCommands).toEqual(['npm'])
   })
 
-  it('does not include archived child sessions in the root subtree', async () => {
+  it('includes archived child sessions in the root subtree (#1362)', async () => {
     const dbPath = createTestDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, 'root')
@@ -779,8 +828,9 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
 
     const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'root')
 
-    expect(calls).toHaveLength(1)
+    expect(calls).toHaveLength(2)
     expect(calls[0]!.deduplicationKey).toBe('opencode:root:msg-root-assistant')
+    expect(calls[1]!.deduplicationKey).toBe('opencode:archived-child:msg-child-assistant')
   })
 
   it('joins multiple text parts in user messages', async () => {
@@ -823,10 +873,15 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
       db.exec(`ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER`)
       db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER`)
       db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER`)
-      db.exec(`ALTER TABLE session ADD COLUMN model_id TEXT`)
+      db.exec(`ALTER TABLE session ADD COLUMN model TEXT`)
 
       insertSession(db, 'sess-1')
-      db.prepare(`UPDATE session SET cost = 0.15, tokens_input = 5000, tokens_output = 2000, tokens_reasoning = 0, tokens_cache_read = 3000, tokens_cache_write = 1000, model_id = 'claude-sonnet-4-20250514' WHERE id = 'sess-1'`).run()
+      db.prepare(`UPDATE session SET cost = ?, tokens_input = ?, tokens_output = ?, tokens_reasoning = ?, tokens_cache_read = ?, tokens_cache_write = ?, model = ? WHERE id = ?`)
+        .run(0.15, 5000, 2000, 0, 3000, 1000, JSON.stringify({
+          providerID: 'anthropic',
+          id: 'claude-sonnet-4-20250514',
+          variant: 'high',
+        }), 'sess-1')
 
       insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
         role: 'assistant', modelID: 'claude-sonnet-4-20250514',
@@ -842,6 +897,57 @@ skipUnlessSqlite('opencode provider - session parsing', () => {
     expect(calls[0]!.costUSD).toBeGreaterThan(0)
     expect(calls[0]!.model).toBe('claude-sonnet-4-20250514')
     expect(calls[0]!.deduplicationKey).toBe('opencode:sess-1:session-level')
+  })
+
+  it('bills session-level reasoning tokens at the output rate', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      db.exec(`ALTER TABLE session ADD COLUMN cost REAL`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_input INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_output INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_reasoning INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_read INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN tokens_cache_write INTEGER`)
+      db.exec(`ALTER TABLE session ADD COLUMN model TEXT`)
+
+      insertSession(db, 'sess-1')
+      db.prepare(`UPDATE session SET cost = ?, tokens_input = ?, tokens_output = ?, tokens_reasoning = ?, tokens_cache_read = ?, tokens_cache_write = ?, model = ? WHERE id = ?`)
+        .run(0, 5000, 2000, 4000, 3000, 1000, JSON.stringify({
+          providerID: 'anthropic',
+          id: 'claude-sonnet-4-20250514',
+        }), 'sess-1')
+
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'claude-sonnet-4-20250514',
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.reasoningTokens).toBe(4000)
+    // OpenCode charges reasoning tokens at the output rate, and
+    // billableOutputTokens says the same for this provider, so the session-level
+    // fallback has to price output + reasoning, not output alone. (#1334)
+    const model = 'anthropic/claude-sonnet-4-20250514'
+    expect(calls[0]!.costUSD).toBeCloseTo(calculateCost(model, 5000, 2000 + 4000, 1000, 3000, 0), 10)
+    expect(calls[0]!.costUSD).toBeGreaterThan(calculateCost(model, 5000, 2000, 1000, 3000, 0))
+  })
+
+  it('bills per-message reasoning tokens at the output rate', async () => {
+    const dbPath = createTestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, 'sess-1')
+      insertMessage(db, 'msg-1', 'sess-1', 1700000001000, {
+        role: 'assistant', modelID: 'claude-sonnet-4-20250514', cost: 0,
+        tokens: { input: 1000, output: 200, reasoning: 500, cache: { read: 0, write: 0 } },
+      })
+      insertPart(db, 'part-1', 'msg-1', 'sess-1', { type: 'text', text: 'done' })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'sess-1')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.reasoningTokens).toBe(500)
+    expect(calls[0]!.costUSD).toBeCloseTo(calculateCost('claude-sonnet-4-20250514', 1000, 200 + 500, 0, 0, 0), 10)
   })
 
   it('accepts role "model" as equivalent to "assistant"', async () => {
@@ -985,4 +1091,474 @@ skipUnlessSqlite('opencode provider - env override discovery', () => {
     expect(sessions[0]!.path).toBe(`${dbPath}:sess-open`)
   })
 
+})
+
+// ---------------------------------------------------------------------------
+// OpenCode 2.x (session_v2 + session_message) — issue #1293.
+// ejwill's 2.0.3 schema: session_v2 carries the session row (with the same
+// cost/tokens columns legacy had), session_message is tagged by `type` with
+// the payload JSON in `data`, ordered by `seq`. Legacy tables freeze at
+// upgrade; the generations are never joined.
+// ---------------------------------------------------------------------------
+
+type V2MessageFixture = {
+  text?: string
+  agent?: string
+  model?: { id: string; providerID: string; variant?: string }
+  content?: Array<{ type: string; text?: string; name?: string; state?: { status: string; input?: Record<string, unknown> } }>
+  cost?: number
+  tokens?: { input: number; output: number; reasoning: number; cache: { read: number; write: number } }
+  time?: { created: number }
+}
+
+function createV2TestDb(dir: string, opts: { withLegacy?: boolean } = {}): string {
+  const ocDir = join(dir, 'opencode')
+  mkdirSync(ocDir, { recursive: true })
+  const dbPath = join(ocDir, 'opencode.db')
+
+  const { DatabaseSync: Database } = require('node:sqlite')
+  const db = new Database(dbPath)
+  db.exec(`
+    CREATE TABLE session_v2 (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT,
+      slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT, version TEXT NOT NULL,
+      cost REAL NOT NULL DEFAULT 0, tokens_input INTEGER NOT NULL DEFAULT 0,
+      tokens_output INTEGER NOT NULL DEFAULT 0, tokens_reasoning INTEGER NOT NULL DEFAULT 0,
+      tokens_cache_read INTEGER NOT NULL DEFAULT 0, tokens_cache_write INTEGER NOT NULL DEFAULT 0,
+      model TEXT, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+      time_archived INTEGER
+    )
+  `)
+  db.exec(`
+    CREATE TABLE session_message (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL,
+      seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+      data TEXT NOT NULL
+    )
+  `)
+  if (opts.withLegacy) {
+    // An in-place upgrade keeps the frozen legacy tables around, empty.
+    db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, parent_id TEXT, slug TEXT NOT NULL, directory TEXT NOT NULL, title TEXT, version TEXT NOT NULL, time_created INTEGER, time_updated INTEGER, time_archived INTEGER)`)
+    db.exec(`CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER, data TEXT NOT NULL)`)
+    db.exec(`CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, data TEXT NOT NULL)`)
+  }
+  db.close()
+  return dbPath
+}
+
+function insertV2Session(
+  db: TestDb,
+  id: string,
+  opts: { directory?: string; title?: string; parentId?: string | null; archived?: number | null; model?: string } = {},
+): void {
+  db.prepare(`
+    INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version, time_created, time_updated, time_archived, model)
+    VALUES (?, 'proj-1', ?, 'slug-1', ?, ?, '2.0.3', 1700000000000, 1700000000000, ?, ?)
+  `).run(id, opts.parentId ?? null, opts.directory ?? '/home/user/myproject', opts.title ?? 'My Project', opts.archived ?? null, opts.model ?? null)
+}
+
+function insertV2Message(db: TestDb, id: string, sessionId: string, type: string, seq: number, timeCreated: number, payload: V2MessageFixture): void {
+  db.prepare(`INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, sessionId, type, seq, timeCreated, timeCreated, JSON.stringify(payload))
+}
+
+skipUnlessSqlite('opencode provider - v2 generation (session_v2 + session_message)', () => {
+  it('discovers and parses v2 sessions with tokens, cost, model, tools and user attribution', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertV2Session(db, 'ses_v2_1')
+      insertV2Message(db, 'msg_1', 'ses_v2_1', 'user', 1, 1700000000000, { text: 'fix the login bug' })
+      insertV2Message(db, 'msg_2', 'ses_v2_1', 'assistant', 2, 1700000000123, {
+        agent: 'build',
+        model: { id: 'glm-5.3-flash', providerID: 'opencode', variant: 'max' },
+        content: [
+          { type: 'text', text: 'looking into it' },
+          { type: 'tool', name: 'bash', state: { status: 'completed', input: { command: 'grep -rn login src/' } } },
+        ],
+        cost: 0.0077,
+        tokens: { input: 21410, output: 2175, reasoning: 0, cache: { read: 112128, write: 0 } },
+        time: { created: 1700000000123 },
+      })
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.path).toBe(`${dbPath}:ses_v2_1`)
+    expect(sessions[0]!.project).toBe('home-user-myproject')
+
+    const calls = await collectCalls(provider, dbPath, 'ses_v2_1')
+    expect(calls).toHaveLength(1)
+    const call = calls[0]!
+    expect(call.model).toBe('glm-5.3-flash')
+    expect(call.inputTokens).toBe(21410)
+    expect(call.outputTokens).toBe(2175)
+    expect(call.cacheReadInputTokens).toBe(112128)
+    expect(call.tools).toContain('Bash')
+    expect(call.bashCommands).toEqual(['grep'])
+    expect(call.userMessage).toBe('fix the login bug')
+    expect(call.costUSD).toBeGreaterThan(0)
+  })
+
+  it('reads a real OpenCode 2.0.16 session (tool calls, reasoning, cache reads)', async () => {
+    // Rows written by `opencode run` 2.0.16 against the free opencode/big-pickle
+    // model; paths redacted, tool output trimmed.
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertV2Session(db, 'ses_f2cbda7f0ffevXtdfk20qxO7K9', { directory: '/home/user/proj', title: 'toolcall' })
+      insertV2Message(db, 'msg_0d3425814001k3LGlAKci24D6g', 'ses_f2cbda7f0ffevXtdfk20qxO7K9', 'user', 5, 1790250735642, {
+        time: { created: 1790250735642 }, text: '"Read the file notes.txt and tell me its contents in one line."',
+      })
+      insertV2Message(db, 'msg_0d342581b001xOcuI5GMMHjSQR', 'ses_f2cbda7f0ffevXtdfk20qxO7K9', 'assistant', 6, 1790250735647, {
+        agent: 'build',
+        model: { id: 'big-pickle', providerID: 'opencode', variant: 'default' },
+        content: [
+          { type: 'reasoning', text: 'The user wants me to read notes.txt and tell them its contents in one line. Let me find and read the file.' },
+          { type: 'text', text: '\n\n' },
+          { type: 'tool', name: 'glob', state: { status: 'completed', input: { pattern: '**/notes.txt' } } },
+        ],
+        cost: 0,
+        tokens: { input: 6323, output: 72, reasoning: 0, cache: { read: 256, write: 0 } },
+      })
+      insertV2Message(db, 'msg_0d342716c001bPgSpFdp38REPt', 'ses_f2cbda7f0ffevXtdfk20qxO7K9', 'assistant', 17, 1790250742127, {
+        agent: 'build',
+        model: { id: 'big-pickle', providerID: 'opencode', variant: 'default' },
+        content: [{ type: 'tool', name: 'read', state: { status: 'completed', input: { path: '/home/user/proj/notes.txt' } } }],
+        cost: 0,
+        tokens: { input: 318, output: 100, reasoning: 0, cache: { read: 6400, write: 0 } },
+      })
+      insertV2Message(db, 'msg_0d3427704001UBCn6YD3m0MlCQ', 'ses_f2cbda7f0ffevXtdfk20qxO7K9', 'assistant', 24, 1790250743559, {
+        agent: 'build',
+        model: { id: 'big-pickle', providerID: 'opencode', variant: 'default' },
+        content: [{ type: 'text', text: 'notes.txt contains: "hello world".' }],
+        cost: 0,
+        tokens: { input: 243, output: 10, reasoning: 0, cache: { read: 6656, write: 0 } },
+      })
+      insertV2Message(db, 'msg_0d3427a34001SSfPFcwFekJ10S', 'ses_f2cbda7f0ffevXtdfk20qxO7K9', 'idle', 29, 1790250744372, {
+        time: { created: 1790250744372 },
+      })
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+    expect(sessions).toEqual([{ path: `${dbPath}:ses_f2cbda7f0ffevXtdfk20qxO7K9`, project: 'home-user-proj', provider: 'opencode' }])
+
+    const calls = await collectCalls(provider, dbPath, 'ses_f2cbda7f0ffevXtdfk20qxO7K9')
+    expect(calls.map((c) => c.tools)).toEqual([['Glob'], ['Read'], []])
+    expect(calls.every((c) => c.model === 'big-pickle' && c.costUSD === 0)).toBe(true)
+    expect(calls[0]!.timestamp).toBe('2026-09-24T11:52:15.647Z')
+    // Matches OpenCode's own session_v2 rollup for this session.
+    const sum = (f: (c: ParsedProviderCall) => number) => calls.reduce((t, c) => t + f(c), 0)
+    expect(sum((c) => c.inputTokens)).toBe(6884)
+    expect(sum((c) => c.outputTokens)).toBe(182)
+    expect(sum((c) => c.cacheReadInputTokens)).toBe(13312)
+  })
+
+  it('prices a v2 turn the same as the identical 1.x turn', async () => {
+    const tokens = { input: 12_000, output: 800, reasoning: 0, cache: { read: 4_000, write: 0 } }
+    const v2Path = createV2TestDb(tmpDir)
+    withTestDb(v2Path, (db) => {
+      insertV2Session(db, 'ses_v2')
+      insertV2Message(db, 'msg_v2', 'ses_v2', 'assistant', 1, 1700000000000, {
+        model: { id: 'claude-haiku-4-5', providerID: 'opencode' },
+        content: [{ type: 'text', text: 'hi' }],
+        cost: 0,
+        tokens,
+      })
+    })
+    const [v2Call] = await collectCalls(createOpenCodeProvider(tmpDir), v2Path, 'ses_v2')
+
+    const legacyDir = join(tmpDir, 'legacy')
+    const legacyPath = createTestDb(legacyDir)
+    withTestDb(legacyPath, (db) => {
+      insertSession(db, 'ses_v1')
+      insertMessage(db, 'msg_v1', 'ses_v1', 1700000000000, {
+        role: 'assistant', modelID: 'claude-haiku-4-5', providerID: 'opencode', cost: 0, tokens,
+      })
+    })
+    const [legacyCall] = await collectCalls(createOpenCodeProvider(legacyDir), legacyPath, 'ses_v1')
+
+    expect(legacyCall!.costUSD).toBeGreaterThan(0)
+    expect(v2Call!.costUSD).toBe(legacyCall!.costUSD)
+    expect(v2Call!.model).toBe(legacyCall!.model)
+  })
+
+  it('preserves the OpenRouter provider field in v2 messages', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertV2Session(db, 'ses_v2_openrouter')
+      insertV2Message(db, 'msg_v2_openrouter', 'ses_v2_openrouter', 'assistant', 1, 1700000000123, {
+        model: { id: 'cohere/north-mini-code:free', providerID: 'openrouter' },
+        content: [{ type: 'text', text: 'route test' }],
+        cost: 0,
+        tokens: { input: 22_928, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'ses_v2_openrouter')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      model: 'cohere/north-mini-code:free',
+      route: 'openrouter',
+      costUSD: 0,
+    })
+  })
+
+  it('counts compaction usage and skips rows with nothing to report', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertV2Session(db, 'ses_v2_1')
+      insertV2Message(db, 'msg_1', 'ses_v2_1', 'model-switched', 1, 1700000000000, { model: { id: 'x', providerID: 'opencode' } })
+      // CompactionUsage travels on the compaction row itself; 1.x counted
+      // these as assistant messages, so dropping them undercounts compactions.
+      insertV2Message(db, 'msg_2', 'ses_v2_1', 'compaction', 2, 1700000000100, {
+        status: 'completed', reason: 'auto', summary: 's', recent: 'r',
+        model: { id: 'glm-5.3-flash', providerID: 'opencode' },
+        cost: 0.0042,
+        tokens: { input: 18100, output: 900, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      // A still-running compaction carries no usage and must yield nothing.
+      insertV2Message(db, 'msg_3', 'ses_v2_1', 'compaction', 3, 1700000000150, {
+        status: 'running', reason: 'auto', summary: 's', recent: 'r',
+      })
+      insertV2Message(db, 'msg_4', 'ses_v2_1', 'idle', 4, 1700000000200, { outcome: 'succeeded' })
+      insertV2Message(db, 'msg_5', 'ses_v2_1', 'assistant', 5, 1700000000300, {
+        model: { id: 'gpt-4o', providerID: 'openai' },
+        content: [{ type: 'text', text: 'hi' }],
+        tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const calls = await collectCalls(provider, dbPath, 'ses_v2_1')
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.model).toBe('glm-5.3-flash')
+    expect(calls[0]!.inputTokens).toBe(18100)
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+    expect(calls[1]!.model).toBe('gpt-4o')
+  })
+
+  it('walks v2 child sessions through parent_id', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertV2Session(db, 'ses_parent')
+      insertV2Session(db, 'ses_child', { parentId: 'ses_parent' })
+      insertV2Message(db, 'msg_c1', 'ses_child', 'assistant', 1, 1700000000500, {
+        model: { id: 'm', providerID: 'opencode' },
+        content: [{ type: 'text', text: 'child work' }],
+        tokens: { input: 7, output: 3, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+    // Only the root is discovered; the child is reached through the tree walk.
+    expect(sessions.map((s) => s.path)).toEqual([`${dbPath}:ses_parent`])
+
+    const calls = await collectCalls(provider, dbPath, 'ses_parent')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.sessionId).toBe('ses_parent')
+    expect(calls[0]!.inputTokens).toBe(7)
+  })
+
+  it('walks archived v2 child sessions too (#1362: the archive is organizational)', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertV2Session(db, 'ses_parent')
+      insertV2Session(db, 'ses_archived_child', { parentId: 'ses_parent', archived: 1700000009000 })
+      insertV2Message(db, 'msg_ac1', 'ses_archived_child', 'assistant', 1, 1700000000500, {
+        model: { id: 'm', providerID: 'opencode' },
+        content: [{ type: 'text', text: 'archived child work' }],
+        tokens: { input: 11, output: 4, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'ses_parent')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.inputTokens).toBe(11)
+  })
+
+  it('unions legacy and v2 turns on an upgraded DB, counting each turn once (#1293)', async () => {
+    const dbPath = createV2TestDb(tmpDir, { withLegacy: true })
+    withTestDb(dbPath, (db) => {
+      // Live v2 session.
+      insertV2Session(db, 'ses_v2_live')
+      insertV2Message(db, 'msg_1', 'ses_v2_live', 'assistant', 1, 1700000000000, {
+        model: { id: 'glm-5.3-flash', providerID: 'opencode' },
+        content: [{ type: 'text', text: 'live v2 turn' }],
+        tokens: { input: 100, output: 50, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+
+      // Three frozen pre-upgrade sessions that never migrated into session_v2.
+      for (const [i, id] of ['ses_frozen_1', 'ses_frozen_2', 'ses_frozen_3'].entries()) {
+        insertSession(db, id, { title: `frozen ${i + 1}` })
+        insertMessage(db, `lmsg_${id}`, id, 1690000000000 + i, {
+          role: 'assistant', modelID: 'opencode/old',
+          tokens: { input: (i + 1) * 10, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+      }
+
+      // A migrated session continued on 2.x. OpenCode's migration copies each
+      // assistant turn under its legacy id, drops the compaction summary turn,
+      // and the post-upgrade turn exists only in session_message.
+      insertSession(db, 'ses_both', { title: 'migrated' })
+      insertMessage(db, 'lmsg_both', 'ses_both', 1690000000500, {
+        role: 'assistant', modelID: 'glm-5.3-flash', providerID: 'opencode',
+        tokens: { input: 999, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertMessage(db, 'lmsg_summary', 'ses_both', 1690000000600, {
+        role: 'assistant', modelID: 'glm-5.3-flash', providerID: 'opencode',
+        tokens: { input: 40, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertV2Session(db, 'ses_both')
+      insertV2Message(db, 'lmsg_both', 'ses_both', 'assistant', 0, 1690000000500, {
+        model: { id: 'glm-5.3-flash', providerID: 'opencode' },
+        content: [{ type: 'text', text: 'migrated copy' }],
+        tokens: { input: 999, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertV2Message(db, 'msg_both_new', 'ses_both', 'assistant', 5, 1700000000500, {
+        model: { id: 'glm-5.3-flash', providerID: 'opencode' },
+        content: [{ type: 'text', text: 'after the upgrade' }],
+        tokens: { input: 500, output: 10, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+
+      // Migration stopped before this session: its session_v2 row exists but
+      // no session_message rows were written.
+      insertSession(db, 'ses_stuck', { title: 'stuck' })
+      insertMessage(db, 'lmsg_stuck', 'ses_stuck', 1690000000700, {
+        role: 'assistant', modelID: 'glm-5.3-flash', providerID: 'opencode',
+        tokens: { input: 70, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      })
+      insertV2Session(db, 'ses_stuck')
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+    expect(sessions.map((s) => s.path).sort()).toEqual(
+      [
+        `${dbPath}:ses_both`,
+        `${dbPath}:ses_frozen_1`,
+        `${dbPath}:ses_frozen_2`,
+        `${dbPath}:ses_frozen_3`,
+        `${dbPath}:ses_stuck`,
+        `${dbPath}:ses_v2_live`,
+      ].sort(),
+    )
+
+    const seen = new Set<string>()
+    let totalInput = 0
+    let totalCalls = 0
+    for (const s of sessions) {
+      const id = s.path.split(':').pop()!
+      for (const call of await collectCalls(provider, dbPath, id, seen)) {
+        totalInput += call.inputTokens
+        totalCalls++
+      }
+    }
+    // 100 + (10 + 20 + 30) + (999 + 40 + 500) + 70
+    expect(totalCalls).toBe(8)
+    expect(totalInput).toBe(1769)
+
+    const bothCalls = await collectCalls(provider, dbPath, 'ses_both')
+    expect(bothCalls.map((c) => c.inputTokens)).toEqual([999, 40, 500])
+    expect(bothCalls.map((c) => c.model)).toEqual(['glm-5.3-flash', 'glm-5.3-flash', 'glm-5.3-flash'])
+  })
+
+  it('keeps fallback model prefixes normalized without accepting malformed routes', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      db.prepare(`
+        INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version,
+          cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated, time_archived)
+        VALUES ('ses_spaced_provider', 'proj-1', NULL, 'slug-1', '/home/user/myproject', 't', '2.0.3',
+          0, 100, 10, 0, 0, 0, ?, 1700000000000, 1700000000000, NULL)
+      `).run(JSON.stringify({ id: 'gpt-4o', providerID: ' openai ' }))
+      insertV2Message(db, 'msg_spaced_provider', 'ses_spaced_provider', 'assistant', 1, 1700000000100, {
+        model: { id: 'gpt-4o', providerID: ' openai ' },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'ses_spaced_provider')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('gpt-4o')
+    expect(calls[0]!.route).toBeUndefined()
+    expect(calls[0]!.costUSD).toBeGreaterThan(0)
+  })
+
+  it('preserves the OpenRouter route in session-level rollup fallbacks', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      db.prepare(`
+        INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version,
+          cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated, time_archived)
+        VALUES ('ses_openrouter_roll', 'proj-1', NULL, 'slug-1', '/home/user/myproject', 't', '2.0.3',
+          0, 22928, 10, 0, 0, 0, ?, 1700000000000, 1700000000000, NULL)
+      `).run(JSON.stringify({ id: 'cohere/north-mini-code:free', providerID: 'openrouter' }))
+      insertV2Message(db, 'msg_openrouter_roll', 'ses_openrouter_roll', 'assistant', 1, 1700000000100, {
+        model: { id: 'cohere/north-mini-code:free', providerID: 'openrouter' },
+      })
+    })
+
+    const calls = await collectCalls(createOpenCodeProvider(tmpDir), dbPath, 'ses_openrouter_roll')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      model: 'cohere/north-mini-code:free',
+      route: 'openrouter',
+      inputTokens: 22_928,
+      costUSD: 0,
+    })
+  })
+
+  it('prices a Vertex session-level rollup on the bare id and keeps an unpriceable recorded cost as the fallback (#1547)', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      const insert = db.prepare(`
+        INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version,
+          cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated, time_archived)
+        VALUES (?, 'proj-1', NULL, 'slug-1', '/home/user/myproject', 't', '2.0.16',
+          ?, 1000, 100, 0, 0, 0, ?, 1700000000000, 1700000000000, NULL)
+      `)
+      insert.run('ses_vx_sonnet', 0.5, JSON.stringify({ id: 'claude-sonnet-5@default', providerID: 'google-vertex-anthropic' }))
+      insert.run('ses_vx_private', 0.5, JSON.stringify({ id: 'vertex-private-model-x@default', providerID: 'google-vertex' }))
+      insertV2Message(db, 'msg_vx_1', 'ses_vx_sonnet', 'assistant', 1, 1700000000100, { model: { id: 'claude-sonnet-5@default', providerID: 'google-vertex-anthropic' } })
+      insertV2Message(db, 'msg_vx_2', 'ses_vx_private', 'assistant', 1, 1700000000100, { model: { id: 'vertex-private-model-x@default', providerID: 'google-vertex' } })
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const [sonnet] = await collectCalls(provider, dbPath, 'ses_vx_sonnet')
+    expect(sonnet).toMatchObject({ model: 'claude-sonnet-5@default', route: 'vertex' })
+    expect(sonnet!.costUSD).toBeCloseTo(1000 * 2e-6 + 100 * 10e-6, 12)
+    expect(sonnet!.fallbackCostUSD).toBeUndefined()
+
+    const [priv] = await collectCalls(provider, dbPath, 'ses_vx_private')
+    expect(priv).toMatchObject({ model: 'vertex-private-model-x@default', route: 'vertex', costUSD: 0.5, fallbackCostUSD: 0.5 })
+  })
+
+  it('falls back to session_v2 rollups when v2 messages carry no tokens', async () => {
+    const dbPath = createV2TestDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      db.prepare(`
+        INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, title, version,
+          cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write,
+          model, time_created, time_updated, time_archived)
+        VALUES ('ses_roll', 'proj-1', NULL, 'slug-1', '/home/user/myproject', 't', '2.0.3',
+          0.0077, 21410, 2175, 0, 112128, 0, ?, 1700000000000, 1700000000000, NULL)
+      `).run(JSON.stringify({ id: 'glm-5.3-flash', providerID: 'opencode' }))
+      insertV2Message(db, 'msg_1', 'ses_roll', 'user', 1, 1700000000000, { text: 'hello' })
+      insertV2Message(db, 'msg_2', 'ses_roll', 'assistant', 2, 1700000000100, {
+        model: { id: 'glm-5.3-flash', providerID: 'opencode' },
+      })
+    })
+
+    const provider = createOpenCodeProvider(tmpDir)
+    const calls = await collectCalls(provider, dbPath, 'ses_roll')
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.model).toBe('glm-5.3-flash')
+    expect(calls[0]!.inputTokens).toBe(21410)
+    expect(calls[0]!.cacheReadInputTokens).toBe(112128)
+    expect(calls[0]!.costUSD).toBeCloseTo(0.0077, 4)
+  })
 })

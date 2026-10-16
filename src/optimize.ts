@@ -1,16 +1,23 @@
 import chalk from 'chalk'
-import { readdir, stat } from 'fs/promises'
+import stripAnsi from 'strip-ansi'
+import { createHash } from 'crypto'
+import { open, readdir, stat, type FileHandle } from 'fs/promises'
 import { existsSync, statSync } from 'fs'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
+import { isReadShapedBashCommand } from './bash-utils.js'
+import { EDIT_TOOLS } from './classifier.js'
 import { readSessionLines, readSessionFileSync } from './fs-utils.js'
-import { discoverAllSessions } from './providers/index.js'
+import { discoverAllSessions, providerDisplayName } from './providers/index.js'
 import { parseJsonlLine, shouldSkipLine } from './parser.js'
 import type { DateRange, ProjectSummary, SessionSummary } from './types.js'
 import { formatCost } from './currency.js'
 import { formatTokens } from './format.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
+import { appliedFixGlyph, formatAppliedFix, type AppliedFix } from './act/types.js'
+import { isUserStartedSession, userStartedProjects } from './session-population.js'
+import { countSessions, inferSessionProvider, sessionBillableOutputTokens } from './session-output.js'
 import { aggregateFileChurn, buildCoachingNotes, scanUserCorrections, medianTimeToFirstEditMs, worstOneShotCategory, type ReworkedFile } from './workflow-insights.js'
 
 // ============================================================================
@@ -30,6 +37,9 @@ const RED = '#F55B5B'
 
 export const AVG_TOKENS_PER_READ = 600
 export const TOKENS_PER_MCP_TOOL = 400
+// A deferred MCP tool sits in the prompt as its name line only (measured
+// median 32 chars), not its schema.
+export const TOKENS_PER_DEFERRED_MCP_TOOL = 9
 export const TOOLS_PER_MCP_SERVER = 5
 export const TOKENS_PER_AGENT_DEF = 80
 export const TOKENS_PER_SKILL_DEF = 80
@@ -102,6 +112,10 @@ const CONTEXT_BLOAT_HIGH_MIN_CANDIDATES = 10
 const CONTEXT_BLOAT_GROWTH_RATIO = 2
 const CONTEXT_BLOAT_GROWTH_MAX_GAP_MS = 7 * 24 * 60 * 60 * 1000
 const CONTEXT_BLOAT_RATIO_DISPLAY_CAP = 1000
+const LOW_CACHE_HIT_TARGET_PERCENT = 80
+const LOW_CACHE_HIT_MIN_INPUT_TOKENS = CONTEXT_BLOAT_MIN_INPUT_TOKENS
+const LOW_CACHE_HIT_MIN_CALLS = 5
+const LOW_CACHE_HIT_PREVIEW = 5
 const WORTH_IT_MIN_COST_USD = 2
 const WORTH_IT_NO_EDIT_MIN_COST_USD = 3
 // A zero-edit session's full cost is an upper bound on recoverable waste, not
@@ -167,6 +181,17 @@ const DEFER_THRESHOLD_DEFAULT_PERCENT = 10
 const DEFER_THRESHOLD_MAX_PERCENT = 100
 const DEFER_THRESHOLD_MIN_TOKENS_PER_SESSION = 5_000
 const DEFER_THRESHOLD_MEDIUM_IMPACT_TOKENS = 200_000
+// "recurring-context": the same block opening session after session. 1.5 KB
+// is roughly 400 tokens at BASH_TOKENS_PER_CHAR — below that a repeated
+// opener costs too little to be worth a habit change, and five sessions is
+// where "I keep pasting this" stops looking like coincidence.
+const RECURRING_CONTEXT_MIN_CHARS = 1_500
+const RECURRING_CONTEXT_MIN_SESSIONS = 5
+const RECURRING_CONTEXT_NORMALIZE_SLACK = 4
+const RECURRING_CONTEXT_PREVIEW = 3
+const RECURRING_CONTEXT_PREVIEW_CHARS = 80
+const RECURRING_CONTEXT_MEDIUM_IMPACT_TOKENS = 50_000
+const RECURRING_CONTEXT_HIGH_IMPACT_TOKENS = 200_000
 
 // ============================================================================
 // Scoring constants
@@ -231,6 +256,89 @@ export type PasteDestination =
   | 'session-opener'   // one-time paste at the start of a NEW session
   | 'prompt'           // one-time ask in the current Claude conversation
   | 'shell-config'     // append to ~/.zshrc / ~/.bashrc
+  | 'manual'           // instructions the user carries out directly
+
+/// Provider-scoped remediation nouns. Cross-provider detectors and both
+/// render surfaces (CLI + TUI) share this so `--provider codex` cannot still
+/// tell the user to ask Claude or edit CLAUDE.md. Claude / unset / `all`
+/// keep the shipped CLAUDE.md copy. Only `codex` has a file CodeBurn already
+/// names (`AGENTS.md` in the Codex parser); every other provider stays on
+/// the generic "project instructions" rather than inventing a filename.
+export type OptimizeRemediationCopy = {
+  agent: string
+  instructionFile: string
+}
+
+const REMEDIATION_INSTRUCTION_FILES: Record<string, string> = {
+  claude: 'CLAUDE.md',
+  codex: 'AGENTS.md',
+}
+
+export function isDefaultClaudeProvider(provider?: string): boolean {
+  return !provider || provider === 'all' || provider === 'claude'
+}
+
+export function optimizeRemediationCopy(provider?: string): OptimizeRemediationCopy {
+  const key = !provider || provider === 'all' ? 'claude' : provider.toLowerCase()
+  return {
+    agent: providerDisplayName(key),
+    instructionFile: REMEDIATION_INSTRUCTION_FILES[key] ?? 'project instructions',
+  }
+}
+
+export function sessionOpenerLabel(copy: OptimizeRemediationCopy): string {
+  return `Paste at the start of your NEXT expensive thread (one-time, do not add to ${copy.instructionFile}):`
+}
+
+export function askAgentLabel(copy: OptimizeRemediationCopy, rest: string): string {
+  return `Ask ${copy.agent} to ${rest}:`
+}
+
+export function optimizePasteHeader(destination: PasteDestination | undefined, copy: OptimizeRemediationCopy): string {
+  switch (destination) {
+    case 'claude-md':      return `Suggested ${copy.instructionFile} addition (permanent rule)`
+    case 'session-opener': return `One-time session opener (do NOT add to ${copy.instructionFile})`
+    case 'prompt':         return `Ask ${copy.agent} in the current session`
+    case 'shell-config':   return 'Add to your shell config'
+    case 'manual':         return 'Manual action'
+    default:               return 'Suggested action'
+  }
+}
+
+/// Exact pre-#1049 TUI strings for unset/`all`/`claude`. Non-Claude providers
+/// reuse the CLI header table so the two surfaces cannot drift on new copy.
+export function optimizeTuiPasteHeader(destination: PasteDestination | undefined, provider?: string): string {
+  if (isDefaultClaudeProvider(provider)) {
+    switch (destination) {
+      case 'claude-md':      return '── Suggested CLAUDE.md addition (permanent rule) '.padEnd(64, '─')
+      case 'session-opener': return '── One-time session opener (do not add to CLAUDE.md) '.padEnd(64, '─')
+      case 'prompt':         return '── Ask Claude in the current session '.padEnd(64, '─')
+      case 'shell-config':   return '── Add to your shell config '.padEnd(64, '─')
+      case 'manual':         return '── Manual action '.padEnd(64, '─')
+      default:               return '── Suggested action '.padEnd(64, '─')
+    }
+  }
+  return `── ${optimizePasteHeader(destination, optimizeRemediationCopy(provider))} `.padEnd(64, '─')
+}
+
+export function optimizeEmptyScanLines(provider?: string): [string, string, string] {
+  if (isDefaultClaudeProvider(provider)) {
+    return [
+      'CodeBurn optimize scans your Claude Code sessions and config for',
+      'token waste: junk directory reads, duplicate file reads, unused',
+      'agents/skills/MCP servers, bloated CLAUDE.md, and more.',
+    ]
+  }
+  const copy = optimizeRemediationCopy(provider)
+  // scanSessions is Claude-only. Naming the provider's instruction file here
+  // would claim a scan that did not run (Health A / 100 under --provider
+  // codex with every listed detector claudeOnly-disabled).
+  return [
+    `Session-scan detectors do not cover ${copy.agent} yet.`,
+    'junk directory reads, duplicate file reads, unused agents/skills/MCP,',
+    'and bloated instruction files currently scan Claude Code only.',
+  ]
+}
 
 export type WasteAction =
   | { type: 'paste'; label: string; text: string; destination?: PasteDestination }
@@ -257,11 +365,162 @@ export type FindingId =
   | 'low-worth-sessions'
   | 'context-heavy-sessions'
   | 'cost-outliers'
+  | 'low-cache-hit-sessions'
   | 'claude-md-too-long'
   | 'bash-output-cap'
   | 'unused-agents'
   | 'unused-skills'
   | 'unused-commands'
+  | 'recurring-context'
+
+/// How a finding is meant to be acted on:
+/// - `fix`   CodeBurn can write the change itself (`codeburn optimize --apply`)
+/// - `nudge` behavioural, the user changes a habit
+/// - `keep`  informational; the cost may well be justified
+export type FindingClass = 'fix' | 'nudge' | 'keep'
+
+/// Where a finding's `tokensSaved` number comes from:
+/// - `measured`  summed from provider-counted usage on the parsed calls
+/// - `estimated` a schema/heuristic model (per-tool sizes, recovery fractions)
+/// A detector that mixes the two counts as `estimated`.
+export type FindingBasis = 'measured' | 'estimated'
+
+/// Static class per finding id. `fix` entries are exactly the ids `buildPlan`
+/// (src/act/plans.ts) routes to a plan builder; tests assert the two lists
+/// stay equal. Instances that lack the payload their builder needs fall back
+/// to `nudge` via `findingClass`.
+export const FINDING_CLASS: Record<FindingId, FindingClass> = {
+  'read-edit-ratio': 'fix',          // CLAUDE.md rule block
+  'build-folder-reads': 'fix',       // CLAUDE.md rule block
+  'redundant-rereads': 'nudge',
+  'warmup-heavy': 'nudge',
+  'unused-mcp': 'fix',
+  'mcp-low-coverage': 'fix',
+  'mcp-project-scope': 'fix',
+  'mcp-deferral-off': 'fix',
+  'mcp-alwaysload-hygiene': 'fix',
+  'mcp-defer-threshold': 'fix',
+  'retry-heavy-capabilities': 'nudge',
+  'low-worth-sessions': 'nudge',
+  'context-heavy-sessions': 'keep',  // context-heavy work is often load-bearing
+  'cost-outliers': 'nudge',
+  'low-cache-hit-sessions': 'nudge',
+  'claude-md-too-long': 'nudge',     // trimming is a judgement call, not a rule block
+  'bash-output-cap': 'fix',
+  'unused-agents': 'fix',
+  'unused-skills': 'fix',
+  'unused-commands': 'fix',
+  'recurring-context': 'nudge',
+}
+
+/// Ids whose plan is built from the `apply` payload: without it the plan
+/// builder returns null, so the finding is only a nudge.
+const CLASS_NEEDS_APPLY: ReadonlySet<FindingId> = new Set<FindingId>([
+  'unused-mcp',
+  'mcp-low-coverage',
+  'mcp-project-scope',
+  'mcp-deferral-off',
+  'mcp-alwaysload-hygiene',
+  'mcp-defer-threshold',
+  'unused-agents',
+  'unused-skills',
+  'unused-commands',
+])
+
+/// Static basis per finding id. Only the two session-level detectors sum
+/// provider-counted tokens end to end; everything else multiplies a modelled
+/// per-unit size or a recovery fraction.
+export const FINDING_BASIS: Record<FindingId, FindingBasis> = {
+  'read-edit-ratio': 'estimated',          // reads x AVG_TOKENS_PER_READ
+  'build-folder-reads': 'estimated',       // reads x AVG_TOKENS_PER_READ
+  'redundant-rereads': 'estimated',        // reads x AVG_TOKENS_PER_READ
+  'warmup-heavy': 'estimated',             // observed median minus a modelled baseline
+  'unused-mcp': 'estimated',               // tools x TOKENS_PER_MCP_TOOL x sessions
+  'mcp-low-coverage': 'estimated',         // schema-size model, only capped by observed cache tokens
+  'mcp-project-scope': 'estimated',        // same schema-size model
+  'mcp-deferral-off': 'estimated',         // schema-size model x affected sessions
+  'mcp-alwaysload-hygiene': 'estimated',   // tools x TOKENS_PER_MCP_TOOL x loaded sessions
+  'mcp-defer-threshold': 'estimated',      // definition-size model x sessions
+  'retry-heavy-capabilities': 'estimated', // real turn tokens x recovery fraction
+  'low-worth-sessions': 'estimated',       // real session tokens x recovery fraction
+  'context-heavy-sessions': 'measured',    // counted input/cache tokens above the target ratio
+  'cost-outliers': 'measured',             // counted session tokens above the peer average
+  'low-cache-hit-sessions': 'estimated',   // counted tokens below the target hit ratio x read discount
+  'claude-md-too-long': 'estimated',       // lines x CLAUDEMD_TOKENS_PER_LINE
+  'bash-output-cap': 'estimated',          // chars x BASH_TOKENS_PER_CHAR
+  'unused-agents': 'estimated',            // count x TOKENS_PER_AGENT_DEF
+  'unused-skills': 'estimated',            // count x TOKENS_PER_SKILL_DEF
+  'unused-commands': 'estimated',          // count x TOKENS_PER_COMMAND_DEF
+  // Provider usage is per API call: the first turn's input tokens mix the
+  // system prompt, tool schemas and CLAUDE.md in with the pasted block, so
+  // nothing counted isolates the block. Its size is modelled from its bytes.
+  'recurring-context': 'estimated',        // block chars x BASH_TOKENS_PER_CHAR x repeats
+}
+
+/// Scope label for a setting that lives in ~/.zshrc / ~/.bashrc. The MCP
+/// deferral plans (defer-enable, defer-threshold) refuse to rewrite an
+/// override found there and report it instead; bash-output-cap does append
+/// its own marker block to the shell rc.
+export const SHELL_PROFILE_SCOPE = 'shell profile'
+
+export function findingClass(f: WasteFinding): FindingClass {
+  const base = FINDING_CLASS[f.id]
+  if (base !== 'fix') return base
+  if (CLASS_NEEDS_APPLY.has(f.id) && !f.apply) return 'nudge'
+  const apply = f.apply
+  if ((apply?.kind === 'defer-enable' || apply?.kind === 'defer-threshold') && apply.settingScope === SHELL_PROFILE_SCOPE) {
+    return 'nudge'
+  }
+  // Of the deferral causes only these two have a plan; the rest are manual
+  // advice (Vertex policy, an outdated Claude Code, an unverified proxy).
+  if (apply?.kind === 'defer-enable' && apply.cause !== 'env-false' && apply.cause !== 'proxy-verified') return 'nudge'
+  return 'fix'
+}
+
+export function findingBasis(f: WasteFinding): FindingBasis {
+  return f.basis ?? FINDING_BASIS[f.id]
+}
+
+const CLASS_ORDER: Record<FindingClass, number> = { fix: 0, nudge: 1, keep: 2 }
+
+export const CLASS_HEADERS: Record<FindingClass, string> = {
+  fix: 'Fix now (apply-able)',
+  nudge: 'Habits',
+  keep: 'FYI',
+}
+
+export type ClassTotals = { tokensSaved: number; savingsUSD: number; count: number }
+
+export function classTotals(findings: WasteFinding[], costRate: number): Record<FindingClass, ClassTotals> {
+  const totals: Record<FindingClass, ClassTotals> = {
+    fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    nudge: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+    keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+  }
+  for (const f of findings) {
+    const cls = findingClass(f)
+    // A `fix` whose plan owns only part of its estimate (a mixed local +
+    // claude.ai connector MCP finding) contributes only the apply-able
+    // subset, so this subtotal and the "apply-able" headline never promise
+    // what `--apply` cannot recover. The finding keeps the whole
+    // opportunity in its own `tokensSaved`, so the fix subtotal can be
+    // smaller than the findings listed under it.
+    const tokens = cls === 'fix' ? f.applyTokensSaved ?? f.tokensSaved : f.tokensSaved
+    const t = totals[cls]
+    t.tokensSaved += tokens
+    t.savingsUSD += tokens * costRate
+    t.count++
+  }
+  return totals
+}
+
+/// Group header with its own subtotal, shared by the CLI and the TUI so the
+/// two never drift apart.
+export function classHeaderLine(cls: FindingClass, totals: ClassTotals, costRate: number): string {
+  const cost = costRate > 0 ? ` (~${formatCost(totals.savingsUSD)})` : ''
+  const suffix = cls === 'fix' ? ' — codeburn optimize --apply' : ''
+  return `${CLASS_HEADERS[cls]} · ~${formatTokens(totals.tokensSaved)} tokens${cost} · ${totals.count} finding${totals.count === 1 ? '' : 's'}${suffix}`
+}
 
 // Cause taxonomy for defer-enable plans (mcp-deferral-off findings).
 // 'proxy-verified' is never produced by the detector today: it is reserved
@@ -299,9 +558,24 @@ export type WasteFinding = {
   explanation: string
   impact: Impact
   tokensSaved: number
+  /// Savings attributable to the automatic mutation when it covers only a
+  /// subset of the finding. Omitted when `tokensSaved` already describes the
+  /// whole apply action (or when the finding is manual-only).
+  applyTokensSaved?: number
+  /// Per-server shares from the same capped cost pass as `tokensSaved`.
+  /// Internal apply/report consumers use this to price only targets that a
+  /// concrete mutation plan can actually edit; JSON output remains stable.
+  applyTokensSavedByServer?: Record<string, number>
+  /// Additional by-hand action retained when `fix` is an executable local
+  /// command (for example, connector guidance beside a local MCP removal).
+  /// Internal apply UI metadata; the stable optimize JSON mapper omits it.
+  manualFollowUp?: { label: string; text: string }
   fix: WasteAction
   trend?: Trend
   apply?: FindingApply
+  /// Set only when a detector's basis varies per run (see detectSessionOutliers);
+  /// otherwise `FINDING_BASIS[id]` applies. Read through `findingBasis`.
+  basis?: FindingBasis
 }
 
 export type OptimizeResult = {
@@ -329,6 +603,12 @@ export type OptimizeJsonReport = {
     potentialSavingsCostUSD: number
     potentialSavingsPercent: number | null
     costRateUSD: number
+    /// Portion of `potentialSavingsCostUSD` coming from `measured`-basis
+    /// findings. The total keeps its old meaning: measured plus estimated.
+    measuredSavingsUSD: number
+    /// Per-class subtotals; the three counts and token sums add up to
+    /// `findingCount` and `potentialSavingsTokens`.
+    byClass: Record<FindingClass, ClassTotals>
   }
   findings: Array<{
     id: FindingId
@@ -338,6 +618,8 @@ export type OptimizeJsonReport = {
     trend: Trend | null
     tokensSaved: number
     estimatedSavingsUSD: number
+    class: FindingClass
+    basis: FindingBasis
     fix: WasteAction
   }>
   /// Files most reworked by edit-family calls, relative to project root (top 15).
@@ -345,6 +627,8 @@ export type OptimizeJsonReport = {
   /// 1-3 templated one-liners keyed on the strongest workflow signals.
   coachingNotes: string[]
   modelRecommendations?: Array<ModelDefaultRecommendation>
+  /// One entry per still-applied fix, re-measured on every run (see act/report.ts).
+  appliedFixes: Array<Omit<AppliedFix, 'ageDays' | 'note'>>
 }
 
 export type ToolCall = {
@@ -352,13 +636,28 @@ export type ToolCall = {
   input: Record<string, unknown>
   sessionId: string
   project: string
+  /// When the call happened. `recent` is derived from it against the scan's
+  /// cutoff, so a scanned file can be reused across scans whose cutoffs differ.
+  tsMs?: number
   recent?: boolean
+  isSidechain?: boolean
 }
 
 export type ApiCallMeta = {
   cacheCreationTokens: number
   version: string
+  tsMs?: number
   recent?: boolean
+}
+
+/// One session's opening paste. `hash` groups sessions that open with the
+/// same block; `chars` is the block's length, a floor for a block long
+/// enough that the parser capped its text.
+export type SessionOpener = {
+  hash: string
+  chars: number
+  project: string
+  preview: string
 }
 
 type ScanData = {
@@ -366,6 +665,7 @@ type ScanData = {
   projectCwds: Set<string>
   apiCalls: ApiCallMeta[]
   userMessages: string[]
+  openers: SessionOpener[]
 }
 
 // ============================================================================
@@ -382,6 +682,10 @@ function compactOptimizeInput(name: string, input: unknown): Record<string, unkn
   if (isReadTool(name)) {
     const filePath = cappedString(raw['file_path'], OPTIMIZE_TEXT_CAP)
     return filePath ? { file_path: filePath } : {}
+  }
+  if (BASH_TOOL_NAMES.has(name)) {
+    const command = cappedString(raw['command'], OPTIMIZE_TEXT_CAP)
+    return command ? { command } : {}
   }
   if (name === 'Agent' || name === 'Task') {
     const subagentType = cappedString(raw['subagent_type'])
@@ -420,12 +724,13 @@ async function collectJsonlFiles(dirPath: string): Promise<string[]> {
   return result
 }
 
-async function isFileStaleForRange(filePath: string, range: DateRange | undefined): Promise<boolean> {
-  if (!range) return false
+/// Size and last write, the pair a scan memo keys on. Null when the file cannot
+/// be stat'd, which is how the scan already treats a file it cannot read.
+async function fileIdentity(filePath: string): Promise<{ size: number; mtimeMs: number } | null> {
   try {
     const s = await stat(filePath)
-    return s.mtimeMs < range.start.getTime()
-  } catch { return false }
+    return { size: s.size, mtimeMs: s.mtimeMs }
+  } catch { return null }
 }
 
 async function runWithConcurrency<T>(
@@ -448,6 +753,43 @@ type ScanFileResult = {
   cwds: string[]
   apiCalls: ApiCallMeta[]
   userMessages: string[]
+  openers: SessionOpener[]
+}
+
+/// Whitespace-insensitive so the same block reflowed by a different paste
+/// still groups, and ANSI-free so terminal output pasted twice matches.
+function normalizeOpener(text: string): string {
+  return stripAnsi(text).replace(/\s+/g, ' ').trim()
+}
+
+/// True when a program wrote this prompt rather than a person pasting it: an
+/// SDK caller, or a parent agent writing a subagent's task. Either repeats by
+/// design and has no home in CLAUDE.md. Both flags survive the parser's
+/// large-line path, which is where generated prompts routinely land.
+function isMachineWrittenPrompt(entry: Record<string, unknown>): boolean {
+  return entry['promptSource'] === 'sdk' || entry['isSidechain'] === true
+}
+
+/// A session's opening block, or null when it is too small to matter or is
+/// not a paste at all: system reminders carry CLAUDE.md and hook output,
+/// slash command wrappers refer to a file that already exists. `chars` is a
+/// floor: the parser caps the text of a very large user entry, so a huge
+/// block is sized at that cap rather than its true length.
+function toSessionOpener(text: string, project: string): SessionOpener | null {
+  if (text.length < RECURRING_CONTEXT_MIN_CHARS) return null
+  const head = text.trimStart()
+  if (head.startsWith('<system-reminder>') || head.startsWith('<command-name>') || head.startsWith('<command-message>')) return null
+  // Normalizing before the cap is what lets a re-flowed paste hash the same;
+  // the pre-slice keeps the work per session bounded however long the block
+  // is, with slack for whitespace that expands under re-flow.
+  const normalized = normalizeOpener(text.slice(0, OPTIMIZE_TEXT_CAP * RECURRING_CONTEXT_NORMALIZE_SLACK))
+    .slice(0, OPTIMIZE_TEXT_CAP)
+  return {
+    hash: createHash('sha1').update(normalized).digest('hex'),
+    chars: text.length,
+    project,
+    preview: normalized.slice(0, RECURRING_CONTEXT_PREVIEW_CHARS),
+  }
 }
 
 function inRange(timestamp: string | undefined, range: DateRange | undefined): boolean {
@@ -457,9 +799,9 @@ function inRange(timestamp: string | undefined, range: DateRange | undefined): b
   return ts >= range.start && ts <= range.end
 }
 
-function isRecent(timestamp: string | undefined, cutoff: number): boolean {
-  if (!timestamp) return false
-  return new Date(timestamp).getTime() >= cutoff
+// An absent or unparseable timestamp is not recent: NaN >= cutoff is false.
+function isRecentAt(tsMs: number | undefined, cutoff: number): boolean {
+  return tsMs !== undefined && tsMs >= cutoff
 }
 
 export async function scanJsonlFile(
@@ -468,63 +810,155 @@ export async function scanJsonlFile(
   dateRange: DateRange | undefined,
   recentCutoffMs = Date.now() - RECENT_WINDOW_MS,
 ): Promise<ScanFileResult> {
-  const calls: ToolCall[] = []
-  const cwds: string[] = []
-  const apiCalls: ApiCallMeta[] = []
-  const userMessages: string[] = []
-  const sessionId = basename(filePath, '.jsonl')
-  let lastVersion = ''
+  const { record } = await scanFileRecord(filePath, project)
+  return useProjection(projectRecord(record, dateRange), recentCutoffMs)
+}
 
-  const skipThreshold = dateRange
-    ? new Date(dateRange.start.getTime() - 86_400_000).toISOString()
-    : null
-  const skipFn = dateRange
-    ? (head: string) => shouldSkipLine(head, skipThreshold!)
-    : undefined
-  const lines = readSessionLines(filePath, skipFn, { largeLineAsBuffer: true })
+/// One file scanned once, independent of any query range: every item the
+/// detectors can ask for, each carrying the instant it happened, plus the small
+/// amount of state the line loop carried so a range filter can reproduce it.
+///
+/// The scan used to take the range with it - skipping lines below it, and
+/// collecting only what fell inside - which meant one stored result per period
+/// and three periods evicting each other. Scanning once and filtering per query
+/// lets one entry serve every period.
+type ScanFileRecord = {
+  calls: ToolCall[]
+  cwds: Array<{ value: string; tsMs: number }>
+  apiCalls: Array<{ call: ApiCallMeta; versionIndex: number }>
+  /// The version each line carried, in order, one entry per CHANGE of version:
+  /// a run of lines repeating one version collapses to a single event whose
+  /// anchor is the easiest of them to qualify (an unskippable line, else the
+  /// latest timestamp), because whichever member of the run survives a range's
+  /// skip threshold yields the same version string. Replayed per range, so a
+  /// file that changed version partway through resolves exactly as a scan
+  /// carrying that range would have.
+  versionEvents: Array<{ version: string; anchor: string | null }>
+  users: Array<{ tsMs: number; messages: string[]; opener: SessionOpener | null }>
+  /// A line marking the file as a sidechain qualifies unless the range filter
+  /// would have skipped it: `always` is one that can never be skipped, `maxTs`
+  /// the latest timestamp among those that can.
+  sidechainAlways: boolean
+  sidechainMaxTs: string | null
+}
+
+/// What the line loop carries across lines, and therefore what a resumed read
+/// has to be handed to continue where the last one stopped.
+type ScanCarry = { version: string }
+type ScanPass = { record: ScanFileRecord; carry: ScanCarry; offset: number }
+
+const emptyCarry = (): ScanCarry => ({ version: '' })
+const emptyRecord = (): ScanFileRecord => ({
+  calls: [], cwds: [], apiCalls: [], users: [], versionEvents: [],
+  sidechainAlways: false, sidechainMaxTs: null,
+})
+
+/// Can the range filter skip this line outright? Mirrors shouldSkipLine: only a
+/// user or assistant line carrying a usable timestamp is ever skipped, and then
+/// only for a threshold above it.
+function skipTimestampOf(entry: Record<string, unknown>): string | null {
+  const type = entry.type
+  if (type !== 'user' && type !== 'assistant') return null
+  const ts = entry.timestamp
+  return typeof ts === 'string' && ts.length >= 10 ? ts : null
+}
+
+async function scanFileRecord(
+  filePath: string,
+  project: string,
+  // Continue an earlier read of this same file: start at the byte after the
+  // last complete line it consumed, append into the record it produced, and
+  // carry the state the loop had reached. The caller proves the bytes below
+  // that offset have not changed before passing this.
+  resume?: { fromOffset: number; carry: ScanCarry; into: ScanFileRecord },
+): Promise<ScanPass> {
+  const record = resume?.into ?? emptyRecord()
+  const carry = resume ? { ...resume.carry } : emptyCarry()
+  const sessionId = basename(filePath, '.jsonl')
+
+  // Tracks the byte after the last complete line, so a partial line left by a
+  // writer mid-append is never consumed and is re-read whole next time.
+  const tracker = { lastCompleteLineOffset: resume?.fromOffset ?? 0 }
+  const lines = readSessionLines(filePath, undefined, {
+    largeLineAsBuffer: true,
+    byteOffsetTracker: tracker,
+    ...(resume ? { startByteOffset: resume.fromOffset } : {}),
+  })
   for await (const line of lines) {
     if (typeof line === 'string' && !line.trim()) continue
     if (Buffer.isBuffer(line) && line.length === 0) continue
     const parsed = parseJsonlLine(line)
     if (!parsed) continue
     const entry = parsed as Record<string, unknown>
+    const skipTs = skipTimestampOf(entry)
 
-    if (entry.version && typeof entry.version === 'string') lastVersion = entry.version
+    if (entry.isSidechain === true) {
+      if (skipTs === null) record.sidechainAlways = true
+      else if (record.sidechainMaxTs === null || skipTs > record.sidechainMaxTs) record.sidechainMaxTs = skipTs
+    }
+
+    if (entry.version && typeof entry.version === 'string') {
+      const last = record.versionEvents[record.versionEvents.length - 1]
+      if (last && last.version === entry.version) {
+        // Same version again: keep whichever of the run a range is likeliest to
+        // still see - an unskippable line beats any timestamp, otherwise the
+        // latest one.
+        if (skipTs === null) last.anchor = null
+        else if (last.anchor !== null && skipTs > last.anchor) last.anchor = skipTs
+      } else {
+        record.versionEvents.push({ version: entry.version, anchor: skipTs })
+      }
+      carry.version = entry.version
+    }
 
     const ts = typeof entry.timestamp === 'string' ? entry.timestamp : undefined
-    const withinRange = inRange(ts, dateRange)
-    const recent = isRecent(ts, recentCutoffMs)
+    const tsMs = ts === undefined ? Number.NaN : Date.parse(ts)
 
-    if (entry.cwd && typeof entry.cwd === 'string' && withinRange) cwds.push(entry.cwd)
+    if (entry.cwd && typeof entry.cwd === 'string') record.cwds.push({ value: entry.cwd, tsMs })
 
     if (entry.type === 'user') {
-      if (!withinRange) continue
       const msg = entry.message as Record<string, unknown> | undefined
       const msgContent = msg?.content
+      const messages: string[] = []
+      let opener: SessionOpener | null = null
+      let sawText = false
       if (typeof msgContent === 'string') {
-        userMessages.push(msgContent.slice(0, OPTIMIZE_TEXT_CAP))
+        messages.push(msgContent.slice(0, OPTIMIZE_TEXT_CAP))
+        sawText = true
+        opener = isMachineWrittenPrompt(entry) ? null : toSessionOpener(msgContent, project)
       } else if (Array.isArray(msgContent)) {
         let remaining = OPTIMIZE_TEXT_CAP
         for (const block of msgContent) {
           if (remaining <= 0) break
           if (block && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string') {
             const text = block.text.slice(0, remaining)
-            userMessages.push(text)
+            messages.push(text)
             remaining -= text.length
+            if (!sawText) {
+              sawText = true
+              opener = isMachineWrittenPrompt(entry) ? null : toSessionOpener(block.text, project)
+            }
           }
         }
       }
+      // An entry with no text at all is not recorded: the opening block is the
+      // first user message that carries text, and this one never claims it.
+      if (messages.length > 0) record.users.push({ tsMs, messages, opener })
       continue
     }
 
     if (entry.type !== 'assistant') continue
-    if (!withinRange) continue
 
     const msg = entry.message as Record<string, unknown> | undefined
     const usage = msg?.usage as Record<string, unknown> | undefined
     if (usage) {
       const cacheCreate = (usage.cache_creation_input_tokens as number) ?? 0
-      if (cacheCreate > 0) apiCalls.push({ cacheCreationTokens: cacheCreate, version: lastVersion, recent })
+      if (cacheCreate > 0) {
+        record.apiCalls.push({
+          call: { cacheCreationTokens: cacheCreate, version: carry.version, tsMs },
+          versionIndex: record.versionEvents.length,
+        })
+      }
     }
 
     const blocks = msg?.content
@@ -533,44 +967,360 @@ export async function scanJsonlFile(
     for (const block of blocks) {
       if (block.type !== 'tool_use') continue
       const name = typeof block.name === 'string' ? block.name : ''
-      calls.push({
+      record.calls.push({
         name,
         input: compactOptimizeInput(name, block.input),
         sessionId,
         project,
-        recent,
+        tsMs,
       })
     }
   }
 
-  return { calls, cwds, apiCalls, userMessages }
+  return { record, carry, offset: tracker.lastCompleteLineOffset }
 }
 
-async function scanSessions(dateRange?: DateRange): Promise<ScanData> {
+/// One range's view of a scanned file: the items it selected, held by
+/// reference, plus the two values that depend on the range and are therefore
+/// stamped onto those items each time the view is used. Keeping the selection
+/// means a repeat of the same period walks what it returns rather than the
+/// whole file; re-stamping means two periods can share the items safely,
+/// because a request always stamps its own view before anything reads it.
+type ScanProjection = { result: ScanFileResult; sidechain: boolean; versions: string[] }
+
+function useProjection(projection: ScanProjection, recentCutoffMs: number): ScanFileResult {
+  // One pass for all three range-or-clock derived stamps. Walking the selected
+  // items twice - once to place the range's verdicts, once for recency - was
+  // the larger half of what a warm scan cost.
+  for (const call of projection.result.calls) {
+    call.isSidechain = projection.sidechain
+    call.recent = isRecentAt(call.tsMs, recentCutoffMs)
+  }
+  const apiCalls = projection.result.apiCalls
+  for (let i = 0; i < apiCalls.length; i++) {
+    const call = apiCalls[i]!
+    call.version = projection.versions[i]!
+    call.recent = isRecentAt(call.tsMs, recentCutoffMs)
+  }
+  return projection.result
+}
+
+/// Narrow one scanned file to a query range, reproducing exactly what a scan
+/// that had carried the range would have collected: the same items, the same
+/// order, the same carried version and sidechain verdict.
+function projectRecord(record: ScanFileRecord, dateRange: DateRange | undefined): ScanProjection {
+  // No range means everything, exactly as the range test did; with a range, an
+  // absent or unparseable instant is NaN and compares false, as it did.
+  const startMs = dateRange ? dateRange.start.getTime() : 0
+  const endMs = dateRange ? dateRange.end.getTime() : 0
+  const within = dateRange
+    ? (tsMs: number): boolean => tsMs >= startMs && tsMs <= endMs
+    : (): boolean => true
+  // The threshold the line-level skip used, as the same ISO string it compared.
+  const threshold = dateRange ? new Date(dateRange.start.getTime() - 86_400_000).toISOString() : null
+  const qualifies = (skipTs: string | null): boolean =>
+    threshold === null || skipTs === null || skipTs >= threshold
+  const isSidechain = record.sidechainAlways || (record.sidechainMaxTs !== null && qualifies(record.sidechainMaxTs))
+
+  // Stamped in place rather than copied, on the same terms as the recency flag
+  // below: the record is owned by one serialized request at a time, and every
+  // reader of these objects is downstream of this projection. Copying each call
+  // instead cost more per request than re-reading the file had.
+  const calls: ToolCall[] = []
+  for (const call of record.calls) {
+    if (!within(call.tsMs!)) continue
+    calls.push(call)
+  }
+  const cwds: string[] = []
+  for (const cwd of record.cwds) if (within(cwd.tsMs)) cwds.push(cwd.value)
+  const apiCalls: ApiCallMeta[] = []
+  // The version a call carried is the last version line before it that the
+  // range's own skip threshold would have left in place. Resolved for every
+  // position once, in one forward pass, rather than walked back per call: a
+  // range that skips every version line in a file would otherwise re-walk the
+  // whole list for each of that file's calls.
+  const versionBefore: string[] = new Array(record.versionEvents.length + 1)
+  versionBefore[0] = ''
+  for (let i = 0; i < record.versionEvents.length; i++) {
+    const event = record.versionEvents[i]!
+    versionBefore[i + 1] = qualifies(event.anchor) ? event.version : versionBefore[i]!
+  }
+  const versions: string[] = []
+  for (const entry of record.apiCalls) {
+    if (!within(entry.call.tsMs!)) continue
+    versions.push(versionBefore[entry.versionIndex]!)
+    apiCalls.push(entry.call)
+  }
+  const userMessages: string[] = []
+  const openers: SessionOpener[] = []
+  let sawUserText = false
+  for (const user of record.users) {
+    if (!within(user.tsMs)) continue
+    for (const message of user.messages) userMessages.push(message)
+    if (!sawUserText) {
+      sawUserText = true
+      if (user.opener) openers.push(user.opener)
+    }
+  }
+  return { result: { calls, cwds, apiCalls, userMessages, openers }, sidechain: isSidechain, versions }
+}
+
+// The session scan reads Claude Code transcripts only, so a `--provider` that
+// excludes Claude leaves nothing for it to do. Callers must also skip the
+// detectors it feeds (see `claudeOnly` in scanAndDetect) — the empty scan
+// returned here is an absence of measurement, not a measurement of absence.
+export function providerCoversClaude(provider?: string): boolean {
+  return !provider || provider === 'all' || provider === 'claude'
+}
+
+// Session files a resident process (codeburn serve) has already scanned for the
+// optimize detectors, keyed by the file's identity and the range it was scanned
+// for. The scan re-read every Claude transcript overlapping the period on every
+// request - about six of the seven seconds a desktop period switch cost - while
+// all but the handful of files written since the last request produce exactly
+// the same result. An unchanged file is served as it is; a file that only grew
+// is read from the byte after the last complete line the previous read consumed
+// and the new lines are merged in, which is what keeps a live transcript from
+// costing its whole length on every request. Anything else - a file that shrank,
+// or whose opening bytes changed - is read in full. The recency flag is stamped
+// afterwards, so a kept result is not pinned to the cutoff it was first scanned
+// under. Bounded by bytes with age and least-recently-used eviction, like the
+// shard memo.
+// Held heap, not text: measured against a live heap on a 7GB corpus, the
+// objects a scanned file retains cost about 1.8x the text they carry, so a
+// budget counted in text alone lets the memo grow past the resident-set guard -
+// which then drops every memo and hands the next request a cold scan.
+const SCAN_RETAINED_FACTOR = 1.8
+const CALL_SAMPLE_STRIDE = 16
+// How recently a file must have been written to be worth the digest that lets a
+// later read resume from an offset.
+const SCAN_RESUMABLE_AGE_MS = 24 * 60 * 60 * 1000
+// The desktop rotates through six named periods; holding a selection for each
+// of them per file is references only, and past that the oldest is dropped.
+const MAX_PROJECTIONS_PER_FILE = 6
+const SCAN_MEMO_MAX_BYTES = 160 * 1024 * 1024
+const SCAN_MEMO_MAX_AGE_MS = 10 * 60 * 1000
+// `head` is the digest of the file's first bytes as of the stored offset: the
+// cheapest proof that the bytes already consumed are still the same bytes, and
+// the one an in-place rewrite that happens to grow the file cannot fake.
+const SCAN_HEAD_BYTES = 4096
+type ScanMemoEntry = {
+  record: ScanFileRecord
+  // Least-recently-used order; `bytes` below counts these too.
+  projections: Map<string, ScanProjection>
+  carry: ScanCarry
+  offset: number
+  size: number
+  mtimeMs: number
+  head: string
+  /// The record plus every selection currently held for it.
+  bytes: number
+  usedAt: number
+}
+const scanFileMemo = new Map<string, ScanMemoEntry>()
+let scanFileMemoBytes = 0
+
+export function clearScanFileMemo(): void {
+  scanFileMemo.clear()
+  scanFileMemoBytes = 0
+}
+
+export function scanFileMemoStats(): { entries: number; bytes: number } {
+  return { entries: scanFileMemo.size, bytes: scanFileMemoBytes }
+}
+
+/// Drop entries unused past the age bound, then least-recently-used entries
+/// until the byte budget holds. `now` is injected so the rule is testable.
+export function evictScanFileMemo(now: number, maxBytes: number = SCAN_MEMO_MAX_BYTES): void {
+  // The map is held in least-recently-used order - a hit reinserts its entry at
+  // the back - so the oldest and the least recently used are the same walk from
+  // the front, and it stops at the first entry that is both fresh and within
+  // budget. Sorting the whole map per insertion instead made a scan whose
+  // working set does not fit cost more than having no memo at all.
+  for (const [key, entry] of scanFileMemo) {
+    if (scanFileMemoBytes <= maxBytes && now - entry.usedAt <= SCAN_MEMO_MAX_AGE_MS) break
+    scanFileMemo.delete(key)
+    scanFileMemoBytes -= entry.bytes
+  }
+}
+
+/// What one scanned file costs to keep, in held heap. Tool inputs are already
+/// compacted by the scanner and user messages are capped, so the text they hold
+/// plus a flat per-record overhead, scaled by the measured retention factor,
+/// tracks the real footprint closely enough to bound it.
+function scanResultBytes(record: ScanFileRecord): number {
+  let bytes = record.apiCalls.length * 96 + record.cwds.length * 80
+  // Sampled, not exhaustive: measuring every tool input meant serializing the
+  // whole corpus on every scan, which cost more than the memo saved.
+  let sampled = 0
+  let sampledBytes = 0
+  for (let i = 0; i < record.calls.length; i += CALL_SAMPLE_STRIDE) {
+    sampledBytes += JSON.stringify(record.calls[i]!.input).length
+    sampled++
+  }
+  const averageInput = sampled > 0 ? sampledBytes / sampled : 0
+  bytes += record.calls.length * (128 + averageInput)
+  for (const user of record.users) {
+    bytes += 96
+    for (const message of user.messages) bytes += message.length
+    if (user.opener) bytes += user.opener.preview.length + 96
+  }
+  return Math.round(bytes * SCAN_RETAINED_FACTOR)
+}
+
+/// Digest of a file's opening bytes, or null when they cannot be read.
+async function headDigest(filePath: string): Promise<string | null> {
+  let handle: FileHandle
+  try {
+    handle = await open(filePath, 'r')
+  } catch { return null }
+  try {
+    const buffer = Buffer.allocUnsafe(SCAN_HEAD_BYTES)
+    const { bytesRead } = await handle.read(buffer, 0, SCAN_HEAD_BYTES, 0)
+    return createHash('sha256').update(buffer.subarray(0, bytesRead)).digest('hex')
+  } catch {
+    return null
+  } finally {
+    await handle.close()
+  }
+}
+
+/// What one range's selection costs to keep: slots holding references, not the
+/// items themselves, which is the whole reason a period can have its own.
+function projectionBytes(projection: ScanProjection): number {
+  const { calls, cwds, apiCalls, userMessages, openers } = projection.result
+  const slots = calls.length + cwds.length + apiCalls.length + userMessages.length
+    + openers.length + projection.versions.length
+  return slots * 24
+}
+
+/// The view of a stored file for one range, built once and kept. Selections are
+/// held least-recently-used, so a period the desktop has moved on from is the
+/// one dropped; the record itself stays, and rebuilding a selection is a walk,
+/// not a read.
+function rangeProjection(entry: ScanMemoEntry, dateRange: DateRange | undefined, recentCutoffMs: number): ScanFileResult {
+  const rangeKey = dateRange ? `${dateRange.start.getTime()}-${dateRange.end.getTime()}` : 'all'
+  const existing = entry.projections.get(rangeKey)
+  if (existing) {
+    entry.projections.delete(rangeKey)
+    entry.projections.set(rangeKey, existing)
+    return useProjection(existing, recentCutoffMs)
+  }
+  const projection = projectRecord(entry.record, dateRange)
+  while (entry.projections.size >= MAX_PROJECTIONS_PER_FILE) {
+    const oldest = entry.projections.entries().next().value
+    if (oldest === undefined) break
+    entry.projections.delete(oldest[0])
+    const freed = projectionBytes(oldest[1])
+    entry.bytes -= freed
+    scanFileMemoBytes -= freed
+  }
+  entry.projections.set(rangeKey, projection)
+  const held = projectionBytes(projection)
+  entry.bytes += held
+  scanFileMemoBytes += held
+  return useProjection(projection, recentCutoffMs)
+}
+
+export async function scanJsonlFileMemoized(
+  filePath: string,
+  project: string,
+  dateRange: DateRange | undefined,
+  identity: { size: number; mtimeMs: number } | null,
+  recentCutoffMs: number = Date.now() - RECENT_WINDOW_MS,
+): Promise<ScanFileResult> {
+  if (identity === null) return useProjection(projectRecord((await scanFileRecord(filePath, project)).record, dateRange), recentCutoffMs)
+  // No range in the key: the record is what the file holds, not what one period
+  // asked of it, so one entry answers every period the desktop rotates through.
+  const key = `${filePath}\0${project}`
+  const now = Date.now()
+  const hit = scanFileMemo.get(key)
+  if (hit && hit.size === identity.size && hit.mtimeMs === identity.mtimeMs) {
+    hit.usedAt = now
+    scanFileMemo.delete(key)
+    scanFileMemo.set(key, hit)
+    return rangeProjection(hit, dateRange, recentCutoffMs)
+  }
+
+  // Only growth past a still-intact head can be read as an append. A file that
+  // shrank, or whose offset now sits past its end, is a different file as far
+  // as this scan is concerned and is read from the top.
+  let resume: { fromOffset: number; carry: ScanCarry; into: ScanFileRecord } | undefined
+  if (hit && hit.head !== '' && identity.size > hit.size && hit.offset <= identity.size) {
+    const head = await headDigest(filePath)
+    if (head !== null && head === hit.head) {
+      resume = { fromOffset: hit.offset, carry: hit.carry, into: hit.record }
+    }
+  }
+  if (hit) {
+    scanFileMemo.delete(key)
+    scanFileMemoBytes -= hit.bytes
+  }
+
+  const pass = await scanFileRecord(filePath, project, resume)
+  // Only a file that could still be written to is worth a head digest. Digesting
+  // every file in the window meant opening the whole corpus a second time on
+  // every scan, which cost more than the resume it enables; a file untouched for
+  // a day that then grows simply gets a full read.
+  const mayGrow = now - identity.mtimeMs < SCAN_RESUMABLE_AGE_MS
+  const head = resume ? hit!.head : mayGrow ? await headDigest(filePath) : null
+  if (head === null && mayGrow) return useProjection(projectRecord(pass.record, dateRange), recentCutoffMs)
+  const bytes = scanResultBytes(pass.record)
+  const entry: ScanMemoEntry = {
+    record: pass.record,
+    projections: new Map(),
+    carry: pass.carry,
+    offset: pass.offset,
+    size: identity.size,
+    mtimeMs: identity.mtimeMs,
+    head: head ?? '',
+    bytes,
+    usedAt: now,
+  }
+  scanFileMemo.set(key, entry)
+  scanFileMemoBytes += bytes
+  evictScanFileMemo(now)
+  return rangeProjection(entry, dateRange, recentCutoffMs)
+}
+
+async function scanSessions(dateRange?: DateRange, provider?: string): Promise<ScanData> {
+  if (!providerCoversClaude(provider)) {
+    return { toolCalls: [], projectCwds: new Set(), apiCalls: [], userMessages: [], openers: [] }
+  }
   const sources = await discoverAllSessions('claude')
   const allCalls: ToolCall[] = []
   const allCwds = new Set<string>()
   const allApiCalls: ApiCallMeta[] = []
   const allUserMessages: string[] = []
+  const allOpeners: SessionOpener[] = []
 
-  const tasks: Array<{ file: string; project: string }> = []
+  const tasks: Array<{ file: string; project: string; identity: { size: number; mtimeMs: number } | null }> = []
   for (const source of sources) {
     const files = await collectJsonlFiles(source.path)
     for (const file of files) {
-      if (await isFileStaleForRange(file, dateRange)) continue
-      tasks.push({ file, project: source.project })
+      const identity = await fileIdentity(file)
+      // A file that cannot be stat'd is still scanned, as it always was; it
+      // just has no identity to memoize under.
+      if (identity && dateRange && identity.mtimeMs < dateRange.start.getTime()) continue
+      tasks.push({ file, project: source.project, identity })
     }
   }
 
-  await runWithConcurrency(tasks, FILE_READ_CONCURRENCY, async ({ file, project }) => {
-    const { calls, cwds, apiCalls, userMessages } = await scanJsonlFile(file, project, dateRange)
+  // One cutoff for the whole scan rather than one per file, so every detector
+  // reads the same window and a memoized file is stamped with the same verdict
+  // a freshly read one would get.
+  const recentCutoffMs = Date.now() - RECENT_WINDOW_MS
+  await runWithConcurrency(tasks, FILE_READ_CONCURRENCY, async ({ file, project, identity }) => {
+    const { calls, cwds, apiCalls, userMessages, openers } =
+      await scanJsonlFileMemoized(file, project, dateRange, identity, recentCutoffMs)
     allCalls.push(...calls)
     for (const cwd of cwds) allCwds.add(cwd)
     allApiCalls.push(...apiCalls)
     allUserMessages.push(...userMessages)
+    allOpeners.push(...openers)
   })
 
-  return { toolCalls: allCalls, projectCwds: allCwds, apiCalls: allApiCalls, userMessages: allUserMessages }
+  return { toolCalls: allCalls, projectCwds: allCwds, apiCalls: allApiCalls, userMessages: allUserMessages, openers: allOpeners }
 }
 
 // ============================================================================
@@ -645,6 +1395,27 @@ export function loadMcpConfigs(projectCwds: Iterable<string>, homeDir = homedir(
   return servers
 }
 
+/// Server names owned by readable local MCP config, normalized the way
+/// transcript namespaces are (":" -> "_"). `loadMcpConfigs` covers
+/// settings.json and .mcp.json; `~/.claude.json` adds the top-level and
+/// per-project `mcpServers` containers the remove plan also edits.
+///
+/// A `claude_ai_*` namespace listed here is a local server that happens to
+/// carry the connector prefix, not a claude.ai connector. Config we cannot
+/// read simply contributes no names, which leaves those namespaces on the
+/// conservative connector path.
+export function localMcpServerNames(projectCwds: Iterable<string>, homeDir = homedir()): Set<string> {
+  const names = new Set(loadMcpConfigs(projectCwds, homeDir).keys())
+  const userJson = readJsonFile(join(homeDir, '.claude.json'))
+  const projects = (userJson?.['projects'] ?? {}) as Record<string, { mcpServers?: unknown } | null>
+  const containers = [userJson?.['mcpServers'], ...Object.values(projects).map(entry => entry?.mcpServers)]
+  for (const container of containers) {
+    if (!container || typeof container !== 'object') continue
+    for (const name of Object.keys(container)) names.add(name.replace(/:/g, '_'))
+  }
+  return names
+}
+
 // ============================================================================
 // Detectors
 // ============================================================================
@@ -700,6 +1471,11 @@ export function detectJunkReads(calls: ToolCall[], dateRange?: DateRange): Waste
 }
 
 export function detectDuplicateReads(calls: ToolCall[], dateRange?: DateRange): WasteFinding | null {
+  // A sidechain re-reading what its parent read is not a repeat: a subagent
+  // starts on a fresh context and has to read it. Junk reads and the
+  // read:edit ratio keep the full call population - that waste is waste
+  // whoever does it, and the CLAUDE.md rule they suggest binds subagents too.
+  calls = calls.filter(call => call.isSidechain !== true)
   const sessionFiles = new Map<string, Map<string, { count: number; recent: number }>>()
 
   for (const call of calls) {
@@ -783,6 +1559,12 @@ type McpSchemaCostEstimate = {
   cacheReadTokens: number
   effectiveInputTokens: number
 }
+
+type McpSchemaCostAttribution = McpSchemaCostEstimate & {
+  byServer: Record<string, McpSchemaCostEstimate>
+}
+
+type McpUnusedToolsByServer = Record<string, number | readonly string[]>
 
 /**
  * Aggregate MCP inventory and invocations across the projects in scope.
@@ -959,49 +1741,88 @@ export function estimateMcpSchemaCost(
     counts = unusedToolCounts
   }
 
-  const totalUnusedSchemaTokens = servers.reduce(
-    (s, srv) => s + (counts[srv] ?? 0) * TOKENS_PER_MCP_TOOL,
-    0,
-  )
-  if (totalUnusedSchemaTokens === 0) {
-    return { cacheWriteTokens: 0, cacheReadTokens: 0, effectiveInputTokens: 0 }
+  const attributed = estimateMcpSchemaCostAttributed(counts, projects, servers)
+  return {
+    cacheWriteTokens: attributed.cacheWriteTokens,
+    cacheReadTokens: attributed.cacheReadTokens,
+    effectiveInputTokens: attributed.effectiveInputTokens,
+  }
+}
+
+function estimateMcpSchemaCostAttributed(
+  unusedToolsByServer: McpUnusedToolsByServer,
+  projects: ProjectSummary[],
+  servers: string[],
+): McpSchemaCostAttribution {
+  servers = [...new Set(servers)]
+  const byServer: Record<string, McpSchemaCostEstimate> = {}
+  for (const server of servers) {
+    byServer[server] = { cacheWriteTokens: 0, cacheReadTokens: 0, effectiveInputTokens: 0 }
   }
 
-  const serverSet = new Set(servers)
-  let cacheWriteTokens = 0
-  let cacheReadTokens = 0
+  const addBucket = (
+    loaded: Array<{ server: string; schemaTokens: number }>,
+    bucket: number,
+    key: 'cacheWriteTokens' | 'cacheReadTokens',
+  ): void => {
+    if (bucket <= 0) return
+    const totalSchemaTokens = loaded.reduce((sum, entry) => sum + entry.schemaTokens, 0)
+    if (totalSchemaTokens <= 0) return
+    const charged = Math.min(totalSchemaTokens, bucket)
+    for (const entry of loaded) {
+      byServer[entry.server]![key] += charged * (entry.schemaTokens / totalSchemaTokens)
+    }
+  }
 
   for (const project of projects) {
     for (const session of project.sessions) {
-      // A session counts only if its observed inventory included at least
-      // one of the flagged servers — same invariant `aggregateMcpCoverage`
-      // uses for `loadedSessions`.
-      let loaded = false
-      for (const fqn of session.mcpInventory ?? []) {
-        const seg = fqn.split('__')[1]
-        if (seg && serverSet.has(seg)) { loaded = true; break }
+      const inventory = new Set(session.mcpInventory ?? [])
+      const inventoryCounts = new Map<string, number>()
+      for (const fqn of inventory) {
+        const parts = fqn.split('__')
+        if (parts[0] !== 'mcp' || !parts[1] || parts.length < 3) continue
+        inventoryCounts.set(parts[1], (inventoryCounts.get(parts[1]) ?? 0) + 1)
       }
-      if (!loaded) continue
+
+      const loaded: Array<{ server: string; schemaTokens: number }> = []
+      for (const server of servers) {
+        const unused = unusedToolsByServer[server]
+        const toolCount = typeof unused === 'number'
+          ? Math.min(unused, inventoryCounts.get(server) ?? 0)
+          : [...new Set(unused ?? [])].reduce((count, fqn) => count + (inventory.has(fqn) ? 1 : 0), 0)
+        if (toolCount > 0) loaded.push({ server, schemaTokens: toolCount * TOKENS_PER_DEFERRED_MCP_TOOL })
+      }
+      if (loaded.length === 0) continue
 
       for (const turn of session.turns) {
         for (const call of turn.assistantCalls) {
-          // Both buckets can be non-zero on the same call (cache rebuild
-          // alongside a partial read), so account for them independently.
-          // The cap is applied to the combined unused-schema budget so
-          // multiple flagged servers cannot all claim the same call.
-          if (call.usage.cacheCreationInputTokens > 0) {
-            cacheWriteTokens += Math.min(totalUnusedSchemaTokens, call.usage.cacheCreationInputTokens)
-          }
-          if (call.usage.cacheReadInputTokens > 0) {
-            cacheReadTokens += Math.min(totalUnusedSchemaTokens, call.usage.cacheReadInputTokens)
-          }
+          // A cache bucket is shared by every flagged schema loaded on this
+          // call. Charge it once, then attribute the capped amount in
+          // proportion to each server's unused schema. This conserves the
+          // combined total and makes any local-only subset additive.
+          // The tool lines sit in the prefix: a call that read cache read
+          // them; only a call with no cache read wrote them.
+          if (call.usage.cacheReadInputTokens > 0) addBucket(loaded, call.usage.cacheReadInputTokens, 'cacheReadTokens')
+          else addBucket(loaded, call.usage.cacheCreationInputTokens, 'cacheWriteTokens')
         }
       }
     }
   }
 
-  const effectiveInputTokens = cacheWriteTokens * CACHE_WRITE_MULTIPLIER + cacheReadTokens * CACHE_READ_DISCOUNT
-  return { cacheWriteTokens, cacheReadTokens, effectiveInputTokens }
+  let cacheWriteTokens = 0
+  let cacheReadTokens = 0
+  for (const estimate of Object.values(byServer)) {
+    estimate.effectiveInputTokens = estimate.cacheWriteTokens * CACHE_WRITE_MULTIPLIER
+      + estimate.cacheReadTokens * CACHE_READ_DISCOUNT
+    cacheWriteTokens += estimate.cacheWriteTokens
+    cacheReadTokens += estimate.cacheReadTokens
+  }
+  return {
+    cacheWriteTokens,
+    cacheReadTokens,
+    effectiveInputTokens: cacheWriteTokens * CACHE_WRITE_MULTIPLIER + cacheReadTokens * CACHE_READ_DISCOUNT,
+    byServer,
+  }
 }
 
 /**
@@ -1021,6 +1842,7 @@ export function estimateMcpSchemaCost(
 export function detectMcpToolCoverage(
   projects: ProjectSummary[],
   coverage = aggregateMcpCoverage(projects),
+  localServerNames: ReadonlySet<string> = new Set(),
 ): WasteFinding | null {
   if (coverage.length === 0) return null
 
@@ -1035,48 +1857,119 @@ export function detectMcpToolCoverage(
 
   const lines: string[] = []
   const removeCommands: string[] = []
-  const unusedCountsByServer: Record<string, number> = {}
+  const unusedToolsByServer: Record<string, readonly string[]> = {}
   const flaggedServers: string[] = []
+  const localServers: string[] = []
+  const connectorServers: string[] = []
+  // Local, but named like a connector: the transcript cannot tell the two
+  // apart, so the removal targets the config entry and the guidance warns
+  // about a possible same-name connector instead of asserting one.
+  const ambiguousServers: string[] = []
 
   for (const c of flagged) {
-    unusedCountsByServer[c.server] = c.toolsAvailable - c.toolsInvoked
+    unusedToolsByServer[c.server] = c.unusedTools
     flaggedServers.push(c.server)
     const pct = Math.round(c.coverageRatio * 100)
     lines.push(
       `${c.server}: ${c.toolsInvoked}/${c.toolsAvailable} tools used (${pct}% coverage) across ${c.loadedSessions} session${c.loadedSessions === 1 ? '' : 's'}`,
     )
-    removeCommands.push(`claude mcp remove '${c.server}'`)
+    if (c.server.startsWith('claude_ai_') && !localServerNames.has(c.server)) {
+      connectorServers.push(c.server)
+    } else {
+      if (c.server.startsWith('claude_ai_')) ambiguousServers.push(c.server)
+      localServers.push(c.server)
+      removeCommands.push(`claude mcp remove '${c.server}'`)
+    }
   }
 
   // Single combined cost pass: caps each call's contribution at the
   // total unused-schema budget across all flagged servers, so two
   // flagged servers cannot independently claim the same call's cache
   // bucket and overstate `tokensSaved`.
-  const cost = estimateMcpSchemaCost(unusedCountsByServer, projects, flaggedServers)
+  const cost = estimateMcpSchemaCostAttributed(unusedToolsByServer, projects, flaggedServers)
   const tokensSaved = Math.round(cost.effectiveInputTokens)
+  const applyTokensSavedByServer = Object.fromEntries(localServers.map(server => [
+    server,
+    cost.byServer[server]?.effectiveInputTokens ?? 0,
+  ]))
+  const localTokensSaved = Object.values(applyTokensSavedByServer).reduce((sum, value) => sum + value, 0)
+  const applyTokensSaved = localServers.length > 0 && connectorServers.length > 0
+    ? Math.round(localTokensSaved)
+    : undefined
   const impact: Impact = tokensSaved >= MCP_COVERAGE_HIGH_IMPACT_TOKENS
     ? 'high'
     : flagged.length >= UNUSED_MCP_HIGH_THRESHOLD
       ? 'high'
       : 'medium'
+  // `claude_ai_*` is Claude Code's transcript namespace for server-side
+  // claude.ai connectors, which are not local mcpServers entries, so
+  // `claude mcp remove` and the file-editing apply plan cannot own them --
+  // unless readable local config claims the exact name (`ambiguousServers`).
+  // Coverage is aggregate here; project-level config attribution is deliberately
+  // out of scope, hence the instruction to inspect /mcp per affected project.
+  const one = connectorServers.length === 1
+  const connectorLabels = connectorServers.map(server =>
+    `claude.ai ${server.slice('claude_ai_'.length).replaceAll('_', ' ')}`,
+  )
+  const connectorEvidence = connectorServers.map((server, index) =>
+    `${connectorLabels[index]} (${server})`,
+  )
+  const connectorGuidance = connectorServers.length > 0
+    ? ` ${connectorEvidence.join(', ')} ${one ? 'is a claude.ai connector namespace' : 'are claude.ai connector namespaces'}, separate from any similarly named local MCP server. Transcript inventory is aggregated across the selected projects; use /mcp in each project where ${one ? 'it loads' : 'they load'}, or manage ${one ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+    : ''
+  const oneAmbiguous = ambiguousServers.length === 1
+  const ambiguousNote = ambiguousServers.length > 0
+    ? `If you also use ${oneAmbiguous ? 'a claude.ai connector' : 'claude.ai connectors'} named ${ambiguousServers.join(', ')}, manage ${oneAmbiguous ? 'it' : 'them'} with /mcp or in claude.ai Settings > Connectors.`
+    : ''
+  const ambiguousGuidance = ambiguousServers.length > 0
+    ? ` ${ambiguousServers.join(', ')} ${oneAmbiguous ? 'is a local MCP config entry whose name matches' : 'are local MCP config entries whose names match'} the claude.ai connector namespace, so the removal below edits local config only. ${ambiguousNote}`
+    : ''
+  const connectorText = [
+    connectorServers.length > 0
+      ? `Open /mcp in each affected project and disable ${connectorLabels.join(', ')}, or manage ${one ? 'it' : 'them'} in claude.ai Settings > Connectors.`
+      : '',
+    ambiguousNote,
+  ].filter(Boolean).join(' ')
+  const connectorAction = connectorText
+    ? {
+        label: connectorServers.length === 0
+          ? 'Check for a same-name claude.ai connector:'
+          : one ? 'Manage the underused claude.ai connector where it loads:'
+            : 'Manage the underused claude.ai connectors where they load:',
+        text: connectorText,
+      }
+    : undefined
+  const fix: WasteAction = localServers.length > 0
+    ? {
+        type: 'command',
+        label: localServers.length === 1
+          ? 'Remove the underused local server, or trim its tools in your MCP config:'
+          : 'Remove underused local servers, or trim their tools in your MCP config:',
+        text: removeCommands.join('\n'),
+      }
+    : {
+        type: 'paste',
+        destination: 'manual',
+        label: connectorAction!.label,
+        text: connectorAction!.text,
+      }
 
   return {
     id: 'mcp-low-coverage',
     title: `${flagged.length} MCP server${flagged.length === 1 ? '' : 's'} with low tool coverage`,
     explanation:
-      `Schema for unused tools is loaded into the system prompt every session and ` +
+      `Each unused tool adds a deferred name line to every session's prompt, ` +
       `carried in the cached prefix on every turn. ` +
-      `${lines.join('; ')}.`,
+      `${lines.join('; ')}.${connectorGuidance}${ambiguousGuidance}`,
     impact,
     tokensSaved,
-    fix: {
-      type: 'command',
-      label: flagged.length === 1
-        ? 'Remove the underused server, or trim its tools in your MCP config:'
-        : 'Remove underused servers, or trim their tools in your MCP config:',
-      text: removeCommands.join('\n'),
-    },
-    apply: { kind: 'mcp-remove', servers: flaggedServers },
+    ...(applyTokensSaved !== undefined ? { applyTokensSaved } : {}),
+    ...(localServers.length > 0 ? { applyTokensSavedByServer } : {}),
+    ...(localServers.length > 0 && connectorAction ? { manualFollowUp: connectorAction } : {}),
+    fix,
+    ...(localServers.length > 0
+      ? { apply: { kind: 'mcp-remove' as const, servers: localServers } }
+      : {}),
   }
 }
 
@@ -1150,17 +2043,16 @@ function estimateMcpProfileColdSchemaCost(
       for (const [server, toolsAvailable] of serverToolCounts) {
         if (!coldProjectKeysByServer.get(server)?.has(projectKey)) continue
         if (!sessionLoadedMcpServer(session, server)) continue
-        schemaTokens += toolsAvailable * TOKENS_PER_MCP_TOOL
+        schemaTokens += toolsAvailable * TOKENS_PER_DEFERRED_MCP_TOOL
       }
       if (schemaTokens === 0) continue
 
       for (const turn of session.turns) {
         for (const call of turn.assistantCalls) {
-          if (call.usage.cacheCreationInputTokens > 0) {
-            cacheWriteTokens += Math.min(schemaTokens, call.usage.cacheCreationInputTokens)
-          }
           if (call.usage.cacheReadInputTokens > 0) {
             cacheReadTokens += Math.min(schemaTokens, call.usage.cacheReadInputTokens)
+          } else if (call.usage.cacheCreationInputTokens > 0) {
+            cacheWriteTokens += Math.min(schemaTokens, call.usage.cacheCreationInputTokens)
           }
         }
       }
@@ -1277,6 +2169,7 @@ function collectMcpProjectProfiles(
 export function detectMcpProfileAdvisor(
   projects: ProjectSummary[],
   coverage = aggregateMcpCoverage(projects),
+  provider?: string,
 ): WasteFinding | null {
   const candidates = collectMcpProjectProfiles(projects, coverage)
   if (candidates.length === 0) return null
@@ -1309,13 +2202,13 @@ export function detectMcpProfileAdvisor(
     title: `${candidates.length} MCP server${candidates.length === 1 ? '' : 's'} should be project-scoped`,
     explanation:
       `These MCP servers look useful in a small set of projects but are loaded into other projects where they are not invoked. ` +
-      `Project-scoping them keeps the hot-project workflow while avoiding schema overhead elsewhere. ${lines.join('; ')}${extra}.`,
+      `Project-scoping them keeps the hot-project workflow while avoiding their tool lines elsewhere. ${lines.join('; ')}${extra}.`,
     impact,
     tokensSaved,
     fix: {
       type: 'paste',
       destination: 'prompt',
-      label: 'Ask Claude to turn this into a project-scoped MCP profile:',
+      label: askAgentLabel(optimizeRemediationCopy(provider), 'turn this into a project-scoped MCP profile'),
       text: [
         `Review these MCP profile recommendations before changing config (${preview.length} of ${candidates.length} shown):`,
         ...preview.map(candidate => {
@@ -1508,7 +2401,8 @@ function findCapabilityReliabilityCandidates(projects: ProjectSummary[]): Capabi
   return candidates
 }
 
-export function detectCapabilityReliability(projects: ProjectSummary[]): WasteFinding | null {
+export function detectCapabilityReliability(projects: ProjectSummary[], provider?: string): WasteFinding | null {
+  projects = userStartedProjects(projects)
   const candidates = findCapabilityReliabilityCandidates(projects)
   if (candidates.length === 0) return null
 
@@ -1570,7 +2464,7 @@ export function detectCapabilityReliability(projects: ProjectSummary[]): WasteFi
     fix: {
       type: 'paste',
       destination: 'prompt',
-      label: 'Ask Claude to audit the retry-heavy capability before changing config:',
+      label: askAgentLabel(optimizeRemediationCopy(provider), 'audit the retry-heavy capability before changing config'),
       text: `Investigate these retry-correlated capabilities: ${names}. Compare edit turns with retries against one-shot edit turns, identify whether the MCP server or skill actually caused rework, then propose a scoped MCP config or skill-instruction change with session evidence. Do not remove a capability solely because it appears in this report.`,
     },
   }
@@ -1624,7 +2518,7 @@ export function detectUnusedMcp(
 
   if (unused.length === 0) return null
 
-  const totalSessions = projects.reduce((s, p) => s + p.sessions.length, 0)
+  const totalSessions = countSessions(projects)
   const schemaTokensPerSession = unused.length * TOOLS_PER_MCP_SERVER * TOKENS_PER_MCP_TOOL
   const tokensSaved = schemaTokensPerSession * Math.max(totalSessions, 1)
 
@@ -1700,7 +2594,7 @@ export function findDeferralEnvSetting(
     const content = readSessionFileSync(path)
     if (content === null) continue
     const match = content.match(linePattern)
-    if (match) return { value: match[1]!, scope: 'shell profile', path }
+    if (match) return { value: match[1]!, scope: SHELL_PROFILE_SCOPE, path }
   }
   return null
 }
@@ -1977,7 +2871,7 @@ export function detectMcpAlwaysLoadHygiene(
   const versions = apiCalls.map(c => c.version).filter(v => v.length > 0)
   if (versions.length > 0 && versions.every(v => versionPredates(v, ALWAYSLOAD_MIN_VERSION))) return null
 
-  const totalSessions = projects.reduce((s, p) => s + p.sessions.length, 0)
+  const totalSessions = countSessions(projects)
   if (totalSessions === 0) return null
 
   const coverageByServer = new Map(mcpCoverage.map(c => [c.server, c]))
@@ -2189,6 +3083,7 @@ export function detectBloatedClaudeMd(projectCwds: Set<string>): WasteFinding | 
 
 export const READ_TOOL_NAMES = new Set(['Read', 'Grep', 'Glob', 'FileReadTool', 'GrepTool', 'GlobTool'])
 export const EDIT_TOOL_NAMES = new Set(['Edit', 'Write', 'FileEditTool', 'FileWriteTool', 'NotebookEdit'])
+export const BASH_TOOL_NAMES = new Set(['Bash', 'BashTool', 'PowerShellTool'])
 
 export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
   let reads = 0
@@ -2197,6 +3092,12 @@ export function detectLowReadEditRatio(calls: ToolCall[]): WasteFinding | null {
   let recentReads = 0
   for (const call of calls) {
     if (READ_TOOL_NAMES.has(call.name)) {
+      reads++
+      if (call.recent) recentReads++
+    } else if (BASH_TOOL_NAMES.has(call.name) && typeof call.input['command'] === 'string' && isReadShapedBashCommand(call.input['command'])) {
+      // A session that looks things up with rg/cat/git log IS reading (#941):
+      // ignoring shell reads scored disciplined rg-first workflows as
+      // reckless editors (90%+ of real reads were invisible to this ratio).
       reads++
       if (call.recent) recentReads++
     } else if (EDIT_TOOL_NAMES.has(call.name)) {
@@ -2465,11 +3366,81 @@ export function detectBashBloat(): WasteFinding | null {
   }
 }
 
+/// The same long block opening many sessions: a spec, a repo dump, a standing
+/// brief. Every repeat is input tokens for context that could live in
+/// CLAUDE.md or in a file read on demand. The first paste is the honest cost
+/// of saying it once, so only the repeats count as savings.
+export function detectRecurringContext(openers: SessionOpener[]): WasteFinding | null {
+  type Group = { sessions: number; chars: number; preview: string; projects: Set<string> }
+  const groups = new Map<string, Group>()
+  for (const o of openers) {
+    const g = groups.get(o.hash)
+    if (!g) {
+      groups.set(o.hash, { sessions: 1, chars: o.chars, preview: o.preview, projects: new Set([o.project]) })
+      continue
+    }
+    g.sessions++
+    // Only the hashed prefix is known to match, so size the block by the
+    // smallest occurrence rather than claiming the longest.
+    g.chars = Math.min(g.chars, o.chars)
+    g.projects.add(o.project)
+  }
+
+  const repeated = [...groups.values()]
+    .filter(g => g.sessions >= RECURRING_CONTEXT_MIN_SESSIONS)
+    .map(g => ({ ...g, tokens: Math.round((g.sessions - 1) * g.chars * BASH_TOKENS_PER_CHAR) }))
+    .sort((a, b) => b.tokens - a.tokens)
+  if (repeated.length === 0) return null
+
+  const tokensSaved = repeated.reduce((sum, g) => sum + g.tokens, 0)
+  const top = repeated[0]
+  const preview = repeated.slice(0, RECURRING_CONTEXT_PREVIEW)
+  const list = preview
+    .map(g => {
+      const where = g.projects.size === 1
+        ? [...g.projects][0].split('-').filter(Boolean).pop() ?? [...g.projects][0]
+        : `${g.projects.size} projects`
+      return `"${g.preview}..." — ${g.sessions} sessions in ${where}, ~${formatTokens(g.tokens)} tokens`
+    })
+    .join('; ')
+  const extra = repeated.length > preview.length ? `; +${repeated.length - preview.length} more` : ''
+
+  return {
+    id: 'recurring-context',
+    title: `Same ${(top.chars / 1024).toFixed(1)} KB block pasted at the start of ${top.sessions} sessions`,
+    explanation: `These sessions open with a block you have pasted before, so you pay input tokens for the same context every time: ${list}${extra}. Standing rules belong in CLAUDE.md; reference material belongs in a file Claude reads on demand. Only the repeats are counted, not the first paste.`,
+    impact: tokensSaved >= RECURRING_CONTEXT_HIGH_IMPACT_TOKENS ? 'high' : tokensSaved >= RECURRING_CONTEXT_MEDIUM_IMPACT_TOKENS ? 'medium' : 'low',
+    tokensSaved,
+    fix: {
+      type: 'paste',
+      destination: 'prompt',
+      label: 'Ask Claude to give this block a permanent home:',
+      text: `I open many sessions by pasting this block:\n"${top.preview}..."\nMove it into CLAUDE.md if it is a standing rule, or into a file you read on demand if it is reference material, then tell me the one-line pointer to start sessions with instead.`,
+    },
+  }
+}
+
 function sessionTokenTotal(session: ProjectSummary['sessions'][number]): number {
   return session.totalInputTokens
-    + session.totalOutputTokens
+    + sessionBillableOutputTokens(session)
     + session.totalCacheReadTokens
     + session.totalCacheWriteTokens
+}
+
+// Sidechain transcripts are real usage, so they stay in project totals and in
+// token/cost calibration. They are not user-started sessions, however, and
+// should never enter optimize heuristics whose unit is a human work session.
+// Keep that distinction local to optimize instead of deleting sidechains from
+// ProjectSummary, which would under-report the work delegated to subagents.
+function isOptimizeSession(session: ProjectSummary['sessions'][number]): boolean {
+  return isUserStartedSession(session)
+}
+
+function optimizeSessionCount(projects: ProjectSummary[]): number {
+  return projects.reduce(
+    (total, project) => total + project.sessions.filter(isOptimizeSession).length,
+    0,
+  )
 }
 
 function sessionEffectiveContextTokens(session: ProjectSummary['sessions'][number]): number {
@@ -2489,15 +3460,26 @@ function formatContextRatio(ratio: number): string {
 
 // Use (\s|$|--) instead of \b after commit/push so `git commit-tree` and
 // `git commit-graph` are not treated as deliveries. The `--` clause keeps
-// `git commit --amend` matching as a real delivery command.
+// `git commit --amend` matching as a real delivery command. Git's global
+// options (`git -C dir commit`, `git -c user.name=x commit`) may sit between
+// `git` and the subcommand.
 const DELIVERY_COMMAND_PATTERNS = [
-  /(?:^|[;&|]\s*)git\s+(?:commit|push)(?=\s|$|--)(?![^;&|]*--dry-run)/,
-  /(?:^|[;&|]\s*)gh\s+pr\s+(?:create|merge)(?=\s|$|--)(?![^;&|]*--dry-run)/,
+  /(?:^|[;&|(\n]\s*|\b(?:do|then)\s+)git(?:\s+-[Cc]\s+\S+|\s+--[\w-]+(?:=\S+)?)*\s+(?:commit|push)(?=\s|$|--)(?![^;&|\n]*--dry-run)/,
+  /(?:^|[;&|(\n]\s*|\b(?:do|then)\s+)gh\s+pr\s+(?:create|merge)(?=\s|$|--)(?![^;&|\n]*--dry-run)/,
 ]
 
+// bashBreakdown keys are base command names (`git`), so delivery is read from
+// the full command text each call keeps in its tool sequence.
 function sessionDeliveryCommand(session: ProjectSummary['sessions'][number]): string | null {
-  const commands = Object.keys(session.bashBreakdown)
-  return commands.find(command => DELIVERY_COMMAND_PATTERNS.some(pattern => pattern.test(command))) ?? null
+  for (const turn of session.turns) {
+    for (const call of turn.assistantCalls) {
+      for (const tool of call.toolSequence?.flat() ?? []) {
+        const command = tool.command
+        if (command && DELIVERY_COMMAND_PATTERNS.some(pattern => pattern.test(command))) return command
+      }
+    }
+  }
+  return null
 }
 
 function hasCategoryBreakdownData(session: ProjectSummary['sessions'][number]): boolean {
@@ -2531,11 +3513,16 @@ function sessionRetryCount(session: ProjectSummary['sessions'][number]): number 
   return session.turns.reduce((sum, turn) => sum + turn.retries, 0)
 }
 
-function sessionTotalTurns(session: ProjectSummary['sessions'][number]): number {
-  if (hasCategoryBreakdownData(session)) {
-    return Object.values(session.categoryBreakdown).reduce((sum, c) => sum + c.turns, 0)
+// Counted the way the classifier counts retries: one per edit tool call.
+function sessionEditSteps(session: ProjectSummary['sessions'][number]): number {
+  let steps = 0
+  for (const turn of session.turns) {
+    for (const call of turn.assistantCalls) {
+      const tools = call.toolSequence?.length ? call.toolSequence.flat().map(t => t.tool) : call.tools
+      steps += tools.filter(tool => EDIT_TOOLS.has(tool)).length
+    }
   }
-  return session.turns.length
+  return steps
 }
 
 // Token-savings estimate for a low-worth candidate. Two regimes:
@@ -2545,8 +3532,8 @@ function sessionTotalTurns(session: ProjectSummary['sessions'][number]): number 
 //   - Sessions with edits but with retries / no one-shot: only the retry
 //     fraction is counted as recoverable. Edits may still have been useful;
 //     we credit the model with that and only flag the retry overhead.
-// Ratio is bounded to [0, 1] so retry-heavy sessions with weird turn counts
-// can't claim more than the full session token total.
+// A retry is a re-edit, so the fraction is retries over edit steps, not over
+// user prompts (an agent loop can make dozens of edits per prompt).
 function estimateLowWorthRecoverableTokens(
   session: ProjectSummary['sessions'][number],
   editTurns: number,
@@ -2554,9 +3541,9 @@ function estimateLowWorthRecoverableTokens(
 ): number {
   const tokens = sessionTokenTotal(session)
   if (editTurns === 0) return Math.round(tokens * WORTH_IT_NO_EDIT_RECOVERY_FRACTION)
-  const totalTurns = sessionTotalTurns(session)
-  if (totalTurns === 0) return 0
-  const fraction = Math.min(1, Math.max(0, retries / totalTurns))
+  const editSteps = sessionEditSteps(session)
+  if (editSteps === 0) return 0
+  const fraction = Math.min(1, Math.max(0, retries / editSteps))
   return Math.round(tokens * fraction)
 }
 
@@ -2580,6 +3567,7 @@ export function findLowWorthCandidates(projects: ProjectSummary[]): LowWorthCand
 
   for (const project of projects) {
     for (const session of project.sessions) {
+      if (!isOptimizeSession(session)) continue
       if (session.totalCostUSD < WORTH_IT_MIN_COST_USD) continue
       if (sessionDeliveryCommand(session)) continue
 
@@ -2624,7 +3612,7 @@ export function findLowWorthCandidates(projects: ProjectSummary[]): LowWorthCand
   return candidates
 }
 
-export function detectLowWorthSessions(projects: ProjectSummary[]): WasteFinding | null {
+export function detectLowWorthSessions(projects: ProjectSummary[], provider?: string): WasteFinding | null {
   const candidates = findLowWorthCandidates(projects)
   if (candidates.length === 0) return null
 
@@ -2659,7 +3647,7 @@ export function detectLowWorthSessions(projects: ProjectSummary[]): WasteFinding
     fix: {
       type: 'paste',
       destination: 'session-opener',
-      label: 'Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):',
+      label: sessionOpenerLabel(optimizeRemediationCopy(provider)),
       text: LOW_WORTH_OPENER,
     },
   }
@@ -2680,7 +3668,7 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
   const candidates: ContextBloatCandidate[] = []
 
   for (const project of projects) {
-    const sessions = [...project.sessions].sort((a, b) =>
+    const sessions = project.sessions.filter(isOptimizeSession).sort((a, b) =>
       new Date(a.firstTimestamp).getTime() - new Date(b.firstTimestamp).getTime()
     )
     let previousInputTokens: number | null = null
@@ -2688,7 +3676,9 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
 
     for (const session of sessions) {
       const inputTokens = sessionEffectiveContextTokens(session)
-      const outputTokens = session.totalOutputTokens
+      // Generated tokens: exclusive providers add reasoning; inclusive ones
+      // already folded it into totalOutputTokens (#1078 / #1115).
+      const outputTokens = sessionBillableOutputTokens(session)
       const ratio = inputTokens / Math.max(outputTokens, 1)
       const currentMs = new Date(session.firstTimestamp).getTime()
       const gapMs = previousTimestampMs !== null ? currentMs - previousTimestampMs : null
@@ -2732,7 +3722,7 @@ export function findContextBloatCandidates(projects: ProjectSummary[]): ContextB
   return candidates
 }
 
-export function detectContextBloat(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>): WasteFinding | null {
+export function detectContextBloat(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>, provider?: string): WasteFinding | null {
   const candidates = findContextBloatCandidates(projects)
     .filter(c => !excludedSessionIds?.has(c.sessionId))
   if (candidates.length === 0) return null
@@ -2773,13 +3763,13 @@ export function detectContextBloat(projects: ProjectSummary[], excludedSessionId
     fix: {
       type: 'paste',
       destination: 'session-opener',
-      label: 'Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):',
+      label: sessionOpenerLabel(optimizeRemediationCopy(provider)),
       text: CONTEXT_HEAVY_OPENER,
     },
   }
 }
 
-export function detectSessionOutliers(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>): WasteFinding | null {
+export function detectSessionOutliers(projects: ProjectSummary[], excludedSessionIds?: ReadonlySet<string>, provider?: string): WasteFinding | null {
   type Outlier = {
     project: string
     sessionId: string
@@ -2791,9 +3781,17 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
   }
 
   const outliers: Outlier[] = []
+  // Modelled costs (Kiro, Cursor, some Cline sessions) are not comparable
+  // against provider-reported ones, so they leave the peer math. Providers
+  // that only ever estimate would lose the finding entirely, so those fall
+  // back to the full set and the finding reports itself as estimated.
+  let usedEstimatedCosts = false
 
   for (const project of projects) {
-    const sessions = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => isOptimizeSession(s) && s.totalCostUSD > 0)
+    const exact = costed.filter(s => (s.totalEstimatedCostUSD ?? 0) === 0)
+    const sessions = exact.length >= MIN_SESSIONS_FOR_OUTLIER ? exact : costed
+    const fellBack = sessions.length > exact.length
     if (sessions.length < MIN_SESSIONS_FOR_OUTLIER) continue
 
     const totalCost = sessions.reduce((sum, s) => sum + s.totalCostUSD, 0)
@@ -2812,6 +3810,7 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
       // "tighter constraint" advice here.
       if (excludedSessionIds?.has(session.sessionId)) continue
 
+      if (fellBack) usedEstimatedCosts = true
       outliers.push({
         project: project.project,
         sessionId: session.sessionId,
@@ -2841,11 +3840,66 @@ export function detectSessionOutliers(projects: ProjectSummary[], excludedSessio
     explanation: `Sessions costing more than ${SESSION_OUTLIER_MULTIPLIER}x their peer-session average in the same project: ${list}${extra}. These usually come from broad prompts, runaway loops, or context-heavy work that should be split into smaller sessions.`,
     impact: outliers.length >= 3 || totalExcessCost >= 10 ? 'high' : 'medium',
     tokensSaved,
+    ...(usedEstimatedCosts ? { basis: 'estimated' as const } : {}),
     fix: {
       type: 'paste',
       destination: 'session-opener',
-      label: 'Paste at the start of your NEXT expensive thread (one-time, do not add to CLAUDE.md):',
+      label: sessionOpenerLabel(optimizeRemediationCopy(provider)),
       text: 'Before making changes, summarize the smallest viable plan. Keep context narrow, avoid broad searches, and stop after the first working patch so I can review before continuing.',
+    },
+  }
+}
+
+export function detectLowCacheHitSessions(projects: ProjectSummary[]): WasteFinding | null {
+  type Candidate = { project: string; sessionId: string; provider: string; hitPercent: number; totalInput: number; missedReads: number }
+  const candidates: Candidate[] = []
+
+  for (const project of projects) {
+    for (const session of project.sessions) {
+      if (!isOptimizeSession(session)) continue
+      const reads = session.totalCacheReadTokens
+      const writes = session.totalCacheWriteTokens
+      // Parsers record unreported cache usage as 0, so a session with no cache
+      // tokens at all is unmeasured, not a 0% hit rate.
+      if (reads + writes === 0) continue
+      if (session.apiCalls < LOW_CACHE_HIT_MIN_CALLS) continue
+      const totalInput = session.totalInputTokens + reads + writes
+      if (totalInput < LOW_CACHE_HIT_MIN_INPUT_TOKENS) continue
+      // Same formula as the dashboard overview: reads over all input incl. writes.
+      const hitPercent = (reads / totalInput) * 100
+      if (hitPercent >= LOW_CACHE_HIT_TARGET_PERCENT) continue
+      candidates.push({
+        project: project.project,
+        sessionId: session.sessionId,
+        provider: inferSessionProvider(session),
+        hitPercent,
+        totalInput,
+        missedReads: totalInput * LOW_CACHE_HIT_TARGET_PERCENT / 100 - reads,
+      })
+    }
+  }
+
+  if (candidates.length === 0) return null
+
+  candidates.sort((a, b) => b.missedReads - a.missedReads || a.sessionId.localeCompare(b.sessionId))
+  const preview = candidates.slice(0, LOW_CACHE_HIT_PREVIEW)
+  const list = preview
+    .map(c => `${c.project}/${c.sessionId} (${providerDisplayName(c.provider)}): ${c.hitPercent.toFixed(1)}% of ${formatTokens(c.totalInput)} input`)
+    .join('; ')
+  const extra = candidates.length > preview.length ? `; +${candidates.length - preview.length} more` : ''
+  const tokensSaved = Math.round(candidates.reduce((sum, c) => sum + c.missedReads, 0) * (1 - CACHE_READ_DISCOUNT))
+
+  return {
+    id: 'low-cache-hit-sessions',
+    title: `${candidates.length} session${candidates.length === 1 ? '' : 's'} with a low cache hit rate`,
+    explanation: `These sessions read less than ${LOW_CACHE_HIT_TARGET_PERCENT}% of their input from the prompt cache: ${list}${extra}. Healthy agent sessions usually sit above ${LOW_CACHE_HIT_TARGET_PERCENT}%. Low rates come from switching models or tools mid-session, editing instruction files mid-session, or long pauses that let the cache expire, so the full prompt is paid again.`,
+    impact: candidates.length >= 3 || tokensSaved >= CONTEXT_BLOAT_HIGH_INPUT_TOKENS ? 'high' : 'medium',
+    tokensSaved,
+    fix: {
+      type: 'paste',
+      destination: 'manual',
+      label: 'Keep the prompt cache valid:',
+      text: 'Stay on one model per session, and start a new session after editing instruction files or MCP config instead of continuing the old one.',
     },
   }
 }
@@ -2854,7 +3908,7 @@ function findYoungProjectFirstSessionIds(projects: ProjectSummary[]): Set<string
   const firstSessionIds = new Set<string>()
 
   for (const project of projects) {
-    const costed = project.sessions.filter(s => s.totalCostUSD > 0)
+    const costed = project.sessions.filter(s => isOptimizeSession(s) && s.totalCostUSD > 0)
     if (costed.length >= YOUNG_PROJECT_SESSION_LIMIT) continue
 
     let firstSession: ProjectSummary['sessions'][number] | null = null
@@ -2965,76 +4019,119 @@ export function computeInputCostRate(projects: ProjectSummary[]): number {
 type CacheEntry = { data: OptimizeResult; ts: number }
 const resultCache = new Map<string, CacheEntry>()
 
-function cacheKey(projects: ProjectSummary[], dateRange: DateRange | undefined): string {
+export function cacheKey(projects: ProjectSummary[], dateRange: DateRange | undefined, provider?: string): string {
   const dr = dateRange ? `${dateRange.start.getTime()}-${dateRange.end.getTime()}` : 'all'
-  const fingerprint = projects.length + ':' + projects.reduce((s, p) => s + p.totalApiCalls, 0)
-  return `${dr}:${fingerprint}`
+  // Fingerprint enough of the dataset that two materially different inputs
+  // cannot collide onto one cached OptimizeResult. Project count + api-call
+  // sum alone collided any two datasets sharing those two numbers, and served
+  // stale findings when cost/tokens moved (e.g. a re-price) while call count
+  // held - reachable in the long-lived menubar process within the 60s TTL.
+  // Cost is scaled to whole micro-dollars so float jitter cannot thrash the key.
+  let calls = 0, cost = 0, savings = 0, proxied = 0, sidechains = 0
+  const sessions = countSessions(projects)
+  const sidechainIdentities: string[] = []
+  for (const p of projects) {
+    calls += p.totalApiCalls
+    cost += p.totalCostUSD
+    savings += p.totalSavingsUSD
+    proxied += p.totalProxiedCostUSD
+    for (const session of p.sessions) {
+      if (session.isSidechain !== true) continue
+      sidechains++
+      sidechainIdentities.push(`${p.projectPath}\0${session.sessionId}`)
+    }
+  }
+  const sidechainDigest = createHash('sha256')
+    .update(sidechainIdentities.sort().join('\0'))
+    .digest('base64url')
+  // Costs scaled to whole micro-dollars so float jitter cannot thrash the key.
+  const fingerprint = `${projects.length}:${sessions}:${sidechains}:${sidechainDigest}:${calls}:${Math.round(cost * 1e6)}:${Math.round(savings * 1e6)}:${Math.round(proxied * 1e6)}`
+  // The provider decides whether the Claude session scan runs at all, so two
+  // filters that happen to share a project fingerprint must not share a result.
+  return `${provider ?? 'all'}:${dr}:${fingerprint}`
 }
 
 export async function scanAndDetect(
   projects: ProjectSummary[],
   dateRange?: DateRange,
+  provider?: string,
 ): Promise<OptimizeResult> {
   if (projects.length === 0) {
     return { findings: [], costRate: 0, healthScore: 100, healthGrade: 'A', modelRecommendations: [] }
   }
 
-  const key = cacheKey(projects, dateRange)
+  const key = cacheKey(projects, dateRange, provider)
   const cached = resultCache.get(key)
   if (cached && Date.now() - cached.ts < RESULT_CACHE_TTL_MS) return cached.data
 
   const costRate = computeInputCostRate(projects)
-  const { toolCalls, projectCwds, apiCalls, userMessages } = await scanSessions(dateRange)
+  const behavioralProjects = userStartedProjects(projects)
+  const scanCoversClaude = providerCoversClaude(provider)
+  const { toolCalls, projectCwds, apiCalls, userMessages, openers } = await scanSessions(dateRange, provider)
   const mcpCoverage = aggregateMcpCoverage(projects)
 
   const findings: WasteFinding[] = []
   // Priority order for the per-session findings: low-worth → context-bloat →
   // outliers. Each later detector excludes sessions already named by an
   // earlier one so a single session is not listed in three findings.
-  const lowWorthSessionIds = new Set(findLowWorthCandidates(projects).map(c => c.sessionId))
+  const lowWorthSessionIds = new Set(findLowWorthCandidates(behavioralProjects).map(c => c.sessionId))
   const contextBloatVisibleIds = new Set(
-    findContextBloatCandidates(projects)
+    findContextBloatCandidates(behavioralProjects)
       .filter(c => !lowWorthSessionIds.has(c.sessionId))
       .map(c => c.sessionId),
   )
-  const firstSessionIds = findYoungProjectFirstSessionIds(projects)
+  const firstSessionIds = findYoungProjectFirstSessionIds(behavioralProjects)
   const outlierExclusions = new Set([...lowWorthSessionIds, ...contextBloatVisibleIds, ...firstSessionIds])
+  // Detectors fed by the session scan or by `~/.claude` config only mean
+  // anything when the run covers Claude. Under a different `--provider` they
+  // must be skipped rather than handed an empty scan: emptiness reads as
+  // "never invoked", so every skill, agent and command would be reported as
+  // unused when it was simply not measured.
+  const claudeOnly = (detect: () => WasteFinding | null): (() => WasteFinding | null) =>
+    scanCoversClaude ? detect : () => null
   const syncDetectors: Array<() => WasteFinding | null> = [
-    () => detectCacheBloat(apiCalls, projects, dateRange),
-    () => detectLowReadEditRatio(toolCalls),
-    () => detectJunkReads(toolCalls, dateRange),
-    () => detectDuplicateReads(toolCalls, dateRange),
-    () => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage),
-    () => detectMcpToolCoverage(projects, mcpCoverage),
-    () => detectMcpProfileAdvisor(projects, mcpCoverage),
+    claudeOnly(() => detectCacheBloat(apiCalls, projects, dateRange)),
+    claudeOnly(() => detectLowReadEditRatio(toolCalls)),
+    claudeOnly(() => detectJunkReads(toolCalls, dateRange)),
+    claudeOnly(() => detectDuplicateReads(toolCalls, dateRange)),
+    claudeOnly(() => detectUnusedMcp(toolCalls, projects, projectCwds, mcpCoverage)),
+    () => detectMcpToolCoverage(projects, mcpCoverage, localMcpServerNames(projectCwds)),
+    () => detectMcpProfileAdvisor(projects, mcpCoverage, provider),
     // mcp-deferral-gaps family (#614): detection only, no apply plans yet.
-    () => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls),
-    () => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage),
-    () => detectMcpDeferThreshold(projects, projectCwds),
-    () => detectCapabilityReliability(projects),
-    () => detectLowWorthSessions(projects),
-    () => detectContextBloat(projects, lowWorthSessionIds),
-    () => detectSessionOutliers(projects, outlierExclusions),
-    () => detectBloatedClaudeMd(projectCwds),
-    () => detectBashBloat(),
+    claudeOnly(() => detectMcpDeferralOff(toolCalls, projects, projectCwds, apiCalls)),
+    claudeOnly(() => detectMcpAlwaysLoadHygiene(projects, projectCwds, apiCalls, mcpCoverage)),
+    claudeOnly(() => detectMcpDeferThreshold(projects, projectCwds)),
+    () => detectCapabilityReliability(behavioralProjects, provider),
+    () => detectLowWorthSessions(behavioralProjects, provider),
+    () => detectContextBloat(behavioralProjects, lowWorthSessionIds, provider),
+    () => detectSessionOutliers(behavioralProjects, outlierExclusions, provider),
+    () => detectLowCacheHitSessions(behavioralProjects),
+    claudeOnly(() => detectBloatedClaudeMd(projectCwds)),
+    claudeOnly(() => detectBashBloat()),
+    claudeOnly(() => detectRecurringContext(openers)),
   ]
   for (const detect of syncDetectors) {
     const finding = detect()
     if (finding) findings.push(finding)
   }
 
-  const ghostResults = await Promise.all([
-    detectGhostAgents(toolCalls),
-    detectGhostSkills(toolCalls),
-    detectGhostCommands(userMessages),
-  ])
+  const ghostResults = scanCoversClaude
+    ? await Promise.all([
+      detectGhostAgents(toolCalls),
+      detectGhostSkills(toolCalls),
+      detectGhostCommands(userMessages),
+    ])
+    : []
   for (const f of ghostResults) if (f) findings.push(f)
 
+  // Urgency first, then class: every surface lists the apply-able fixes
+  // before the habit nudges, and orders by urgency inside each group.
   findings.sort((a, b) => urgencyScore(b) - urgencyScore(a))
+  findings.sort((a, b) => CLASS_ORDER[findingClass(a)] - CLASS_ORDER[findingClass(b)])
   const { score, grade } = computeHealth(findings)
   
   const modelRecommendations: ModelDefaultRecommendation[] = []
-  for (const project of projects) {
+  for (const project of behavioralProjects) {
     const rec = recommendModelDefault(project, { now: dateRange?.end })
     if (rec) modelRecommendations.push(rec)
   }
@@ -3073,7 +4170,7 @@ function wrap(text: string, width: number, indent: string): string {
 /// destination. Issue #277: users were dropping one-time session openers
 /// into CLAUDE.md as permanent rules because the prompts had no labeled
 /// home in the output.
-function renderActionHeader(action: WasteAction): string {
+function renderActionHeader(action: WasteAction, copy: OptimizeRemediationCopy): string {
   const headerWidth = PANEL_WIDTH - 4
   const fillTo = (label: string): string => {
     const inner = ` ${label} `
@@ -3086,17 +4183,11 @@ function renderActionHeader(action: WasteAction): string {
     case 'command':
       return fillTo('Run this command')
     case 'paste':
-      switch (action.destination) {
-        case 'claude-md':       return fillTo('Suggested CLAUDE.md addition (permanent rule)')
-        case 'session-opener':  return fillTo('One-time session opener (do NOT add to CLAUDE.md)')
-        case 'prompt':          return fillTo('Ask Claude in the current session')
-        case 'shell-config':    return fillTo('Add to your shell config')
-        default:                return fillTo('Suggested action')
-      }
+      return fillTo(optimizePasteHeader(action.destination, copy))
   }
 }
 
-function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
+function renderFinding(n: number, f: WasteFinding, costRate: number, copy: OptimizeRemediationCopy): string[] {
   const lines: string[] = []
   const costSaved = f.tokensSaved * costRate
   const impactLabel = f.impact.charAt(0).toUpperCase() + f.impact.slice(1)
@@ -3114,7 +4205,7 @@ function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
   lines.push('')
   lines.push(wrap(f.explanation, PANEL_WIDTH - 4, '  '))
   lines.push('')
-  lines.push(chalk.hex(GOLD)(`  Potential savings: ${savings}`))
+  lines.push(chalk.hex(GOLD)(`  Potential savings: ${savings}`) + chalk.dim(`  ${findingBasis(f)}`))
   lines.push('')
 
   // Destination header — issue #277. Tells the user where each suggestion
@@ -3122,7 +4213,7 @@ function renderFinding(n: number, f: WasteFinding, costRate: number): string[] {
   // permanent rules and one-time prompts are no longer interchangeable in
   // the output.
   const a = f.fix
-  lines.push(chalk.hex(ORANGE)(`  ${renderActionHeader(a)}`))
+  lines.push(chalk.hex(ORANGE)(`  ${renderActionHeader(a, copy)}`))
   lines.push(chalk.hex(DIM)(`  ${a.label}`))
   if (a.type === 'file-content') {
     for (const line of a.content.split('\n')) lines.push(chalk.hex(CYAN)(`    ${line}`))
@@ -3157,7 +4248,26 @@ function renderWorkflowSection(reworkedFiles: ReworkedFile[], coachingNotes: str
   return lines
 }
 
-function renderOptimize(
+const APPLIED_FIX_COLORS: Record<AppliedFix['verdict'], string> = {
+  worked: GREEN,
+  partial: GOLD,
+  'no-effect': RED,
+  pending: DIM,
+}
+
+// Closes the loop after --apply: every still-applied fix gets its measured
+// verdict back here, on every run.
+function renderAppliedFixes(appliedFixes: AppliedFix[]): string[] {
+  if (appliedFixes.length === 0) return []
+  const lines = [chalk.bold.hex(ORANGE)('  Applied fixes'), '']
+  for (const fix of appliedFixes) {
+    lines.push(chalk.hex(APPLIED_FIX_COLORS[fix.verdict])(`  ${appliedFixGlyph(fix)} ${formatAppliedFix(fix)}`))
+  }
+  lines.push('')
+  return lines
+}
+
+export function renderOptimize(
   findings: WasteFinding[],
   costRate: number,
   periodLabel: string,
@@ -3171,29 +4281,37 @@ function renderOptimize(
   appliedHeader?: string,
   previouslyApplied?: Record<string, string>,
   modelRecommendations?: ModelDefaultRecommendation[],
+  appliedFixes: AppliedFix[] = [],
+  provider?: string,
 ): string {
+  const copy = optimizeRemediationCopy(provider)
   const lines: string[] = []
   lines.push('')
   lines.push(`  ${chalk.bold.hex(ORANGE)('CodeBurn config health')}${chalk.dim('  ' + periodLabel)}`)
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
 
   const issueSuffix = findings.length > 0 ? `, ${findings.length} issue${findings.length > 1 ? 's' : ''}` : ''
+  const measured = findings.filter(f => findingBasis(f) === 'measured').length
   lines.push('  ' + [
-    `${sessionCount} sessions`,
+    `${sessionCount} session${sessionCount === 1 ? '' : 's'}`,
     `${callCount.toLocaleString()} calls`,
     chalk.hex(GOLD)(formatCost(periodCost)),
     `Health: ${chalk.bold.hex(GRADE_COLORS[healthGrade])(healthGrade)}${chalk.dim(` (${healthScore}/100${issueSuffix})`)}`,
   ].join(chalk.hex(DIM)('   ')))
+  if (findings.length > 0) {
+    lines.push(chalk.dim(`  ${measured} measured · ${findings.length - measured} estimated`))
+  }
   if (appliedHeader) lines.push('  ' + chalk.hex(GREEN)(appliedHeader))
   lines.push('')
 
   if (findings.length === 0) {
     lines.push(chalk.hex(GREEN)('  Nothing to fix. Your setup is lean.'))
     lines.push('')
-    lines.push(chalk.dim('  CodeBurn optimize scans your Claude Code sessions and config for'))
-    lines.push(chalk.dim('  token waste: junk directory reads, duplicate file reads, unused'))
-    lines.push(chalk.dim('  agents/skills/MCP servers, bloated CLAUDE.md, and more.'))
+    for (const line of optimizeEmptyScanLines(provider)) {
+      lines.push(chalk.dim(`  ${line}`))
+    }
     lines.push('')
+    lines.push(...renderAppliedFixes(appliedFixes))
     lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
     return lines.join('\n')
   }
@@ -3203,21 +4321,33 @@ function renderOptimize(
   const pctRaw = periodCost > 0 ? (totalCost / periodCost) * 100 : 0
   const pct = pctRaw >= 1 ? pctRaw.toFixed(0) : pctRaw.toFixed(1)
 
+  const totals = classTotals(findings, costRate)
   const costText = costRate > 0 ? ` (~${formatCost(totalCost)}, ~${pct}% of spend)` : ''
-  lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}`))
+  // The headline is the whole board; name the apply-able slice separately so
+  // it never reads as "what CodeBurn can fix for you".
+  const applyable = costRate > 0 && totals.fix.count > 0 ? ` — apply-able: ~${formatCost(totals.fix.savingsUSD)}` : ''
+  lines.push(chalk.hex(GREEN)(`  Potential savings: ~${formatTokens(totalTokens)} tokens${costText}${applyable}`))
   lines.push('')
 
-  for (let i = 0; i < findings.length; i++) {
-    const f = findings[i]!
-    const appliedOn = previouslyApplied?.[f.id]
-    const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
-    lines.push(...renderFinding(i + 1, shown, costRate))
+  // One block per class, in fix -> nudge -> keep order; numbering runs
+  // continuously across the blocks so `--only` picks stay unambiguous.
+  let n = 0
+  for (const cls of ['fix', 'nudge', 'keep'] as const) {
+    const group = findings.filter(f => findingClass(f) === cls)
+    if (group.length === 0) continue
+    lines.push(chalk.bold.hex(ORANGE)(`  ${classHeaderLine(cls, totals[cls], costRate)}`))
+    lines.push('')
+    for (const f of group) {
+      const appliedOn = previouslyApplied?.[f.id]
+      const shown = appliedOn ? { ...f, title: `${f.title} (previously applied ${appliedOn}, re-flagged)` } : f
+      lines.push(...renderFinding(++n, shown, costRate, copy))
+    }
   }
 
   lines.push(chalk.hex(DIM)('  ' + SEP.repeat(PANEL_WIDTH)))
-  lines.push(chalk.dim('  Estimates only.'))
   lines.push('')
 
+  lines.push(...renderAppliedFixes(appliedFixes))
   lines.push(...renderWorkflowSection(reworkedFiles, coachingNotes))
 
   if (modelRecommendations && modelRecommendations.length > 0) {
@@ -3255,7 +4385,7 @@ export async function runOptimize(
   projects: ProjectSummary[],
   periodLabel: string,
   dateRange?: DateRange,
-  opts: { format?: 'text' | 'json'; appliedHeader?: string; previouslyApplied?: Record<string, string> } = {},
+  opts: { format?: 'text' | 'json'; appliedHeader?: string; previouslyApplied?: Record<string, string>; appliedFixes?: AppliedFix[]; provider?: string } = {},
 ): Promise<void> {
   const format = opts.format ?? 'text'
   if (projects.length === 0 && format === 'text') {
@@ -3267,19 +4397,19 @@ export async function runOptimize(
     process.stderr.write(chalk.dim('  Analyzing your sessions...\n'))
   }
 
-  const result = await scanAndDetect(projects, dateRange)
+  const result = await scanAndDetect(projects, dateRange, opts.provider)
   const { findings, costRate, healthScore, healthGrade } = result
-  const sessions = projects.flatMap(p => p.sessions)
+  const sessionCount = optimizeSessionCount(projects)
   const periodCost = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const callCount = projects.reduce((s, p) => s + p.totalApiCalls, 0)
 
   if (format === 'json') {
-    console.log(JSON.stringify(buildOptimizeJsonReport(projects, periodLabel, result, dateRange), null, 2))
+    console.log(JSON.stringify(buildOptimizeJsonReport(projects, periodLabel, result, dateRange, opts.appliedFixes), null, 2))
     return
   }
 
   const { topReworkedFiles, coachingNotes } = buildWorkflowReport(projects)
-  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessions.length, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations)
+  const output = renderOptimize(findings, costRate, periodLabel, periodCost, sessionCount, callCount, healthScore, healthGrade, topReworkedFiles, coachingNotes, opts.appliedHeader, opts.previouslyApplied, result.modelRecommendations, opts.appliedFixes, opts.provider)
   console.log(output)
 }
 
@@ -3288,8 +4418,8 @@ export function buildOptimizeJsonReport(
   periodLabel: string,
   result: OptimizeResult,
   dateRange?: DateRange,
+  appliedFixes: AppliedFix[] = [],
 ): OptimizeJsonReport {
-  const sessions = projects.flatMap(p => p.sessions)
   const periodCostUSD = projects.reduce((s, p) => s + p.totalCostUSD, 0)
   const calls = projects.reduce((s, p) => s + p.totalApiCalls, 0)
   const potentialSavingsTokens = result.findings.reduce((s, f) => s + f.tokensSaved, 0)
@@ -3309,12 +4439,16 @@ export function buildOptimizeJsonReport(
       healthGrade: result.healthGrade,
       findingCount: result.findings.length,
       periodCostUSD,
-      sessions: sessions.length,
+      sessions: optimizeSessionCount(projects),
       calls,
       potentialSavingsTokens,
       potentialSavingsCostUSD,
       potentialSavingsPercent,
       costRateUSD: result.costRate,
+      measuredSavingsUSD: result.findings
+        .filter(f => findingBasis(f) === 'measured')
+        .reduce((s, f) => s + f.tokensSaved * result.costRate, 0),
+      byClass: classTotals(result.findings, result.costRate),
     },
     findings: result.findings.map(f => ({
       id: f.id,
@@ -3324,9 +4458,21 @@ export function buildOptimizeJsonReport(
       trend: f.trend ?? null,
       tokensSaved: f.tokensSaved,
       estimatedSavingsUSD: f.tokensSaved * result.costRate,
+      class: findingClass(f),
+      basis: findingBasis(f),
       fix: f.fix,
     })),
     ...buildWorkflowReport(projects),
     modelRecommendations: result.modelRecommendations,
+    appliedFixes: appliedFixes.map(f => ({
+      id: f.id,
+      kind: f.kind,
+      findingId: f.findingId,
+      appliedAt: f.appliedAt,
+      verdict: f.verdict,
+      estimatedTokens: f.estimatedTokens,
+      realizedTokens: f.realizedTokens,
+      undoCommand: f.undoCommand,
+    })),
   }
 }

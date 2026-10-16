@@ -2,12 +2,13 @@ import React, { useState, useEffect, useRef } from 'react'
 import { render, Box, Text, useInput, useApp, useStdout } from 'ink'
 
 import type { ModelStats, ComparisonRow, CategoryComparison, WorkingStyleRow } from './compare-stats.js'
-import { aggregateModelStats, computeComparison, computeCategoryComparison, computeWorkingStyle, scanSelfCorrections } from './compare-stats.js'
-import { formatCost } from './format.js'
-import { parseAllSessions, setInteractiveScanUI } from './parser.js'
-import { getAllProviders } from './providers/index.js'
+import { aggregateModelStats, computeComparison, computeCategoryComparison, computeWorkingStyle, findModelStat, projectSessionIds, scanSelfCorrections } from './compare-stats.js'
+import { formatCost, formatTokens } from './format.js'
+import { filterProjectsByName, parseAllSessions, setInteractiveScanUI } from './parser.js'
+import { getAllProviders, safeDiscoverSessions } from './providers/index.js'
 import type { ProjectSummary, DateRange } from './types.js'
 import { patchStdoutForWindows } from './ink-win.js'
+import { startUserTimingGuard } from './user-timing-guard.js'
 import { recommendModelDefault, type ModelDefaultRecommendation } from './act/model-defaults.js'
 
 const ORANGE = '#FF8C42'
@@ -234,17 +235,11 @@ function ComparisonResults({ modelA, modelB, rows, categories, workingStyle, onB
     sectionRows.get(row.section)!.push(row)
   }
 
-  const fmtTokens = (n: number) => {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
-    return String(n)
-  }
-
   const contextRows: { label: string; valueA: string; valueB: string }[] = [
     { label: 'Calls', valueA: modelA.calls.toLocaleString(), valueB: modelB.calls.toLocaleString() },
     { label: 'Total cost', valueA: formatCost(modelA.cost), valueB: formatCost(modelB.cost) },
-    { label: 'Input tokens', valueA: fmtTokens(modelA.inputTokens), valueB: fmtTokens(modelB.inputTokens) },
-    { label: 'Output tokens', valueA: fmtTokens(modelA.outputTokens), valueB: fmtTokens(modelB.outputTokens) },
+    { label: 'Input tokens', valueA: formatTokens(modelA.inputTokens), valueB: formatTokens(modelB.inputTokens) },
+    { label: 'Output tokens', valueA: formatTokens(modelA.outputTokens), valueB: formatTokens(modelB.outputTokens) },
     { label: 'Days of data', valueA: String(daysOfData(modelA.firstSeen, modelA.lastSeen)), valueB: String(daysOfData(modelB.firstSeen, modelB.lastSeen)) },
     { label: 'Edit turns', valueA: modelA.editTurns.toLocaleString(), valueB: modelB.editTurns.toLocaleString() },
     { label: 'Self-corrections', valueA: modelA.selfCorrections.toLocaleString(), valueB: modelB.selfCorrections.toLocaleString() },
@@ -333,9 +328,16 @@ function ComparisonResults({ modelA, modelB, rows, categories, workingStyle, onB
 type CompareViewProps = {
   projects: ProjectSummary[]
   onBack: () => void
+  // Pre-resolved canonical model ids from --model-a/--model-b (already
+  // validated to exist in `projects`' aggregated stats by the caller). When
+  // set, comparison results load immediately instead of showing the picker.
+  presetModels?: [string, string]
+  // `projects` is already project-filtered: scope the self-correction scan to
+  // its sessions instead of every session on the machine.
+  scopeToProjects?: boolean
 }
 
-export function CompareView({ projects, onBack }: CompareViewProps) {
+export function CompareView({ projects, onBack, presetModels, scopeToProjects }: CompareViewProps) {
   const { exit } = useApp()
   const [phase, setPhase] = useState<'select' | 'loading' | 'results'>('select')
   const [models, setModels] = useState<ModelStats[]>(() => aggregateModelStats(projects))
@@ -347,13 +349,13 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
     }
     return recs
   })
-  const [pickedNames, setPickedNames] = useState<[string, string] | null>(null)
+  const [pickedNames, setPickedNames] = useState<[string, string] | null>(presetModels ?? null)
   const [selectedA, setSelectedA] = useState<ModelStats | null>(null)
   const [selectedB, setSelectedB] = useState<ModelStats | null>(null)
   const [rows, setRows] = useState<ComparisonRow[]>([])
   const [categories, setCategories] = useState<CategoryComparison[]>([])
   const [style, setStyle] = useState<WorkingStyleRow[]>([])
-  const [loadTrigger, setLoadTrigger] = useState(0)
+  const [loadTrigger, setLoadTrigger] = useState(presetModels ? 1 : 0)
   const projectsRef = useRef(projects)
   projectsRef.current = projects
 
@@ -418,10 +420,10 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
       const providers = await getAllProviders()
       const dirs: string[] = []
       for (const p of providers) {
-        const sessions = await p.discoverSessions()
+        const sessions = await safeDiscoverSessions(p)
         for (const s of sessions) dirs.push(s.path)
       }
-      const corrections = await scanSelfCorrections(dirs)
+      const corrections = await scanSelfCorrections(dirs, scopeToProjects ? projectSessionIds(projectsRef.current) : undefined)
       if (cancelled) return
 
       const currentProjects = projectsRef.current
@@ -504,7 +506,7 @@ export function CompareView({ projects, onBack }: CompareViewProps) {
   )
 }
 
-export async function renderCompare(range: DateRange, provider: string): Promise<void> {
+export async function renderCompare(range: DateRange, provider: string, modelA?: string, modelB?: string, projectFilter?: string[], excludeFilter?: string[]): Promise<void> {
   // Interactive Ink UI: suppress the CLI scan-progress line for the whole
   // lifetime so it can't print over the rendered comparison. Plain CLI
   // commands still show progress.
@@ -516,9 +518,35 @@ export async function renderCompare(range: DateRange, provider: string): Promise
   }
 
   patchStdoutForWindows()
-  const projects = await parseAllSessions(range, provider)
-  const { waitUntilExit } = render(
-    <CompareView projects={projects} onBack={() => process.exit(0)} />
-  )
-  await waitUntilExit()
+  const hasProjectFilter = (projectFilter?.length ?? 0) > 0 || (excludeFilter?.length ?? 0) > 0
+  const projects = filterProjectsByName(await parseAllSessions(range, provider), projectFilter, excludeFilter)
+
+  // --model-a/--model-b: resolve up front (by canonical id or display name,
+  // same lookup the JSON path uses) so the TUI jumps straight to results
+  // instead of ignoring the flags and showing the picker.
+  let presetModels: [string, string] | undefined
+  if (modelA && modelB) {
+    const models = aggregateModelStats(projects)
+    const a = findModelStat(models, modelA)
+    const b = findModelStat(models, modelB)
+    if (!a) {
+      process.stderr.write(`codeburn compare: model not found: "${modelA}".\n`)
+      process.exit(1)
+    }
+    if (!b) {
+      process.stderr.write(`codeburn compare: model not found: "${modelB}".\n`)
+      process.exit(1)
+    }
+    presetModels = [a.model, b.model]
+  }
+
+  const stopUserTimingGuard = startUserTimingGuard()
+  try {
+    const { waitUntilExit } = render(
+      <CompareView projects={projects} onBack={() => process.exit(0)} presetModels={presetModels} scopeToProjects={hasProjectFilter} />
+    )
+    await waitUntilExit()
+  } finally {
+    stopUserTimingGuard()
+  }
 }

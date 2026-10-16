@@ -4,7 +4,7 @@ Cognition Devin CLI local usage tracking.
 
 - **Source:** `src/providers/devin.ts`
 - **Loading:** eager (`src/providers/index.ts`)
-- **Test:** `tests/providers/devin.test.ts`
+- **Test:** `tests/providers/devin.test.ts`, `tests/providers/devin-sessions-db.test.ts`
 
 ## Where it reads from
 
@@ -14,48 +14,49 @@ Devin CLI data lives under:
 ~/.local/share/devin/cli/
 ```
 
-The MVP usage source is transcript JSON:
-
-```text
-~/.local/share/devin/cli/transcripts/*.json
-```
-
-The provider also reads:
+The usage source is the CLI's SQLite store, opened read-only:
 
 ```text
 ~/.local/share/devin/cli/sessions.db
 ```
 
-`sessions.db` is enrichment only. It supplies project path/name, model fallback,
-timestamp fallback, and hidden-session filtering. It is not the source of usage
-or billing.
+Transcript JSON is an export-only snapshot of a subset of that store:
+
+```text
+~/.local/share/devin/cli/transcripts/*.json
+```
+
+When `sessions.db` opens and has a `message_nodes` table, transcripts are not
+read at all, so the two never double count. Transcripts are parsed only when the
+database is missing or unusable (no SQLite, older build without
+`message_nodes`); `sessions.db` then still enriches them when it can.
+
+## sessions.db usage
+
+One source per non-hidden session: `<sessions.db path>:<session id>`. The
+parser reads `message_nodes` for that session in `node_id` keyset batches and
+pulls only the JSON fields it needs, so tool output never reaches JS.
+
+Each assistant node's `chat_message.metadata` supplies `request_id`,
+`generation_model`, `created_at` (the call time; the row's `created_at` is not)
+and `metrics`. `metrics.input_tokens` already excludes cache reads, so nothing
+is carved out. `cache_read_tokens` and `cache_creation_tokens` may be null.
+
+Devin stores each retry of a request as a sibling node with the same
+`request_id` and identical metrics, so the request id is the dedup key. Nodes
+off `sessions.main_chain_id` are distinct requests and count. `compactor` and
+`cache_keepalive` requests are real calls and count too.
+
+Tools come from `chat_message.tool_calls[].name`. The task text is the nearest
+ancestor user node with `metadata.is_user_input = true` (a `cache_keepalive`
+"continue" is not one), then `sessions.title`, then the first `prompt_history`
+row. A locked database (`SQLITE_BUSY`) is rethrown so the refresh retries
+instead of reading the store as empty.
 
 ## Configuration
 
-Devin reports spend in ACUs. CodeBurn reports provider cost through `costUSD`,
-so Devin stays disabled until a positive finite ACU-to-USD rate is configured:
-
-```json
-{
-  "devin": {
-    "acuUsdRate": 2.25
-  }
-}
-```
-
-The config file is:
-
-```text
-~/.config/codeburn/config.json
-```
-
-The macOS Settings window writes this value from the Devin tab. There is no
-environment-variable override and no default rate. Do not hardcode a universal
-ACU price; Devin ACU pricing is account/contract dependent.
-
-When the rate is missing or invalid, `discoverSessions()` returns `[]` and the
-parser yields no calls. Devin remains registered as a provider, but it does not
-appear in CLI/UI results until configured.
+None. Devin is priced from per-step tokens like every other provider, so it
+needs no config to appear in CLI/UI results.
 
 ## Storage format
 
@@ -69,9 +70,7 @@ backend/permission info), `final_metrics`, and `steps[]`.
 
 Steps now support two metric sources. The parser checks `step.metrics` first
 (the standard ATIF location) and falls back to `step.metadata.metrics` (the
-legacy Devin location). Similarly, ACU cost is read from
-`step.metadata.committed_acu_cost` first, falling back to
-`step.extra.committed_acu_cost`.
+legacy Devin location). `committed_acu_cost` is ignored wherever it appears.
 
 Messages can be a plain string or an array of `ContentPart` objects (text or
 image), following the ATIF v1.6+ multimodal content model. The parser
@@ -80,7 +79,6 @@ normalises both forms when extracting user messages.
 Each counted step can provide:
 
 - `step_id`
-- `metadata.committed_acu_cost` (or `extra.committed_acu_cost`)
 - `metrics.prompt_tokens` (or `metadata.metrics.input_tokens`)
 - `metrics.completion_tokens` (or `metadata.metrics.output_tokens`)
 - `metrics.extra.cache_creation_input_tokens` (or `metadata.metrics.cache_creation_tokens`)
@@ -91,40 +89,48 @@ Each counted step can provide:
 - `tool_calls[].function_name`
 - `observation.results[]` (tool output; not parsed for usage)
 
-User-input steps (`metadata.is_user_input === true`) are skipped. Non-user
-steps are included only if they have positive ACU usage or positive token usage.
+User steps (`source === "user"` or `metadata.is_user_input === true`) are skipped. Non-user
+steps are included only if they have positive token usage.
 
 ## Pricing
 
-ACU cost is per step, not cumulative. The provider reads
-`metadata.committed_acu_cost` first, falling back to
-`extra.committed_acu_cost`, then converts with:
+Per step, from tokens and the model id, through `calculateCost()` — the same
+pricing tables every other provider uses. The pricing id is
+`metadata.generation_model` (or `extra.generation_model`), falling back to
+`step.model_name`, `agent.model_name`, then `sessions.model`; a `MODEL_*`
+placeholder is never used for pricing. `gpt-5-3-codex` style ids are rewritten
+to `gpt-5.3-codex` before lookup, so they hit their own row instead of
+collapsing to the base `gpt-5` price.
 
-```text
-costUSD = committed_acu_cost * devin.acuUsdRate
-```
+Transcript `metrics.prompt_tokens` is OpenAI-style, with the cached tokens
+counted inside it, so the cached share is subtracted from input rather than
+billed twice. Devin's own `metadata.metrics.input_tokens` (in `sessions.db` and
+legacy transcripts) excludes cache reads and is used as is.
 
-Token-only steps are still included when they have positive token metrics, but
-their `costUSD` is `0` if `committed_acu_cost` is absent from both locations.
+A model with no pricing row (today: `swe-2-high`, `swe-2-max`, `swe-2-medium`,
+`compactor`) costs `$0` and warns once,
+like any other unpriced model. It is never silently priced off a neighbouring
+row.
 
 `src/parser.ts` preserves Devin's provider-supplied `costUSD` instead of
-re-pricing it through LiteLLM.
+re-pricing it, because the call carries Devin's display model name.
 
-## sessions.db enrichment
+## sessions.db session columns
 
-The provider currently reads these columns from `sessions`:
+The provider reads these columns from `sessions`:
 
 | Column              | Use                                                                                                         |
 | ------------------- | ----------------------------------------------------------------------------------------------------------- |
-| `id`                | join key with transcript `session_id` during parsing; discovery uses the transcript filename before `.json` |
+| `id`                | source key; for transcripts, joined with `session_id` (discovery uses the filename before `.json`)          |
 | `working_directory` | `projectPath` and derived project name                                                                      |
 | `model`             | model fallback                                                                                              |
-| `title`             | project name fallback                                                                                       |
+| `title`             | task text; project name fallback (falls back to the session's first `prompt_history` row when empty)         |
 | `created_at`        | timestamp fallback                                                                                          |
 | `last_activity_at`  | preferred session timestamp fallback                                                                        |
 | `hidden`            | skip hidden sessions                                                                                        |
 
-`message_nodes`, `prompt_history`, and `tool_call_state` are not parsed yet.
+`prompt_history` supplies the task text for a session Devin has not titled yet.
+`tool_call_state` is not parsed.
 
 ## Timestamps
 
@@ -139,7 +145,7 @@ Numeric normalization is only applied to `sessions.db` timestamps:
 
 ## Model Resolution
 
-Model names resolve in this order:
+Model names (display and pricing) resolve in this order:
 
 1. `step.metadata.generation_model`
 2. `step.model_name`
@@ -151,41 +157,43 @@ Model names resolve in this order:
 
 No provider-level cache.
 
-The normal session cache stores parsed provider calls, but Devin is always
-reparsed by `src/parser.ts` because `sessions.db` can change without the
-transcript JSON fingerprint changing.
+A `sessions.db` source is fingerprinted with its `-wal` sibling, so any write
+to the store reparses every session (about a second for 85 sessions). A
+transcript source is always reparsed by `src/parser.ts`, because `sessions.db`
+can change without the transcript JSON fingerprint changing.
 
 ## Deduplication
 
-`devin:<sessionId>:<step.step_id>`
+`devin:<sessionId>:<request_id>` for `sessions.db` (`node-<node_id>` when a
+node has no request id), `devin:<sessionId>:<step.step_id>` for transcripts.
 
 The provider name is part of the key via the `devin:` prefix.
 
 ## Quirks
 
-- The transcript directory has usage; `sessions.db` is enrichment only.
-- `committed_acu_cost` is per-generation/per-step ACU usage. Never treat it as cumulative. It can appear in `metadata` (legacy) or `extra` (ATIF v1.7); the provider checks both.
+- `committed_acu_cost` is null in current Devin builds and is ignored; cost comes from tokens.
 - Token metrics can live in `step.metrics` (standard ATIF) or `step.metadata.metrics` (legacy Devin). The provider checks `step.metrics` first, falling back to `metadata`.
 - Step messages can be a plain string or an array of `ContentPart` objects (text/image). The parser normalises both when extracting user messages.
-- There is no default ACU-to-USD rate. Missing config intentionally hides Devin.
+- Real transcripts mark the user turn with `source: "user"`; older ones set `metadata.is_user_input`. Either marks a step as the user's, so it is skipped and used as task text.
 - Hidden sessions from `sessions.db` are skipped in discovery and parsing.
 - Tool names come directly from `tool_calls[].function_name`; the provider assumes valid ATIF tool-call records.
 - If SQLite is unavailable or `sessions.db` cannot be opened, the provider still parses transcripts without enrichment.
 
 ## When fixing a bug here
 
-1. First check whether `~/.config/codeburn/config.json` contains a valid
-   `devin.acuUsdRate`. Without it, no Devin sessions should appear.
-2. For usage total bugs, compare against (ACU cost can live in `metadata` or `extra`):
+1. For usage total bugs, compare against the store's distinct requests:
 
    ```bash
-   jq '[.steps[] | select(.metadata.is_user_input != true) | (.metadata.committed_acu_cost // .extra.committed_acu_cost // 0)] | add' ~/.local/share/devin/cli/transcripts/<session>.json
+   sqlite3 -readonly ~/.local/share/devin/cli/sessions.db "SELECT count(DISTINCT json_extract(chat_message,'$.metadata.request_id')) FROM message_nodes WHERE json_extract(chat_message,'$.role')='assistant'"
    ```
+
+2. For cost bugs, check which pricing row the step's `generation_model` hits;
+   an unpriced model costs $0 by design.
 
 3. If project/model/timestamp metadata is wrong, inspect `sessions.db`, not the transcript.
 4. If a hidden session appears, check the `hidden` column. Discovery can only
    hide sessions whose transcript filename matches `sessions.id`; parsing uses
    the transcript `session_id` when present.
-5. Run `tests/providers/devin.test.ts` after parser changes. It covers ACU conversion, disabled-until-configured behavior, timestamp parsing, deduplication, hidden sessions, `sessions.db` enrichment, ATIF v1.7 multimodal messages, `step.metrics` vs `metadata.metrics` priority, and `extra.committed_acu_cost` fallback.
+5. Run `tests/providers/devin.test.ts` and `tests/providers/devin-sessions-db.test.ts` after parser changes. It covers token pricing against the pricing tables, timestamp parsing, deduplication, hidden sessions, `sessions.db` enrichment, ATIF v1.7 multimodal messages, and `step.metrics` vs `metadata.metrics` priority.
 
 [atif]: https://github.com/harbor-framework/harbor/blob/main/rfcs/0001-trajectory-format.md

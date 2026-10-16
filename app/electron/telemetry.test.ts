@@ -1,10 +1,10 @@
 // @vitest-environment node
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { defaultEnabledFor, Telemetry } from './telemetry'
+import { cliErrorReason, cpuBucket, defaultEnabledFor, durationBucket, EVENT_NAMES, memBucket, Telemetry } from './telemetry'
 
 let dir: string
 
@@ -93,6 +93,31 @@ describe('consent gating', () => {
     expect(posts.length).toBe(1)
   })
 
+  it('reports whether the decision reached disk, and never tears the file', () => {
+    const { telemetry } = make()
+    const file = join(dir, 'telemetry.v1.json')
+    expect(telemetry.completeOnboarding(false).persisted).toBe(true)
+    const before = readFileSync(file, 'utf-8')
+
+    // The menu bar app inherits the decision from this file, so a write that
+    // cannot land must be reported, not swallowed behind an in-memory success.
+    chmodSync(dir, 0o500)
+    let status
+    try {
+      status = telemetry.setEnabled(true)
+    } finally {
+      chmodSync(dir, 0o700)
+    }
+
+    expect(status).toMatchObject({ enabled: true, persisted: false })
+    // Old file wholly intact, and no half-written temp left beside it.
+    expect(readFileSync(file, 'utf-8')).toBe(before)
+    expect(readdirSync(dir)).toEqual(['telemetry.v1.json'])
+
+    // And the in-memory decision still holds for this session.
+    expect(telemetry.status().enabled).toBe(true)
+  })
+
   it('persists consent + install id across instances', () => {
     const { telemetry } = make()
     const id = telemetry.completeOnboarding(true).installId
@@ -110,7 +135,7 @@ describe('events', () => {
     telemetry.track('totally_made_up', { a: 1 })
     telemetry.track('section_view', {
       section: 'x'.repeat(500),
-      junk: { nested: 'object' },
+      junk: new Date(),
       fn: () => {},
       nan: NaN,
       ok: 42,
@@ -126,6 +151,46 @@ describe('events', () => {
     expect(props.ok).toBe(42)
     // Day-granularity timestamps only.
     expect(body.events[0]!.day).toMatch(/^\d{4}-\d{2}-\d{2}$/)
+  })
+
+  it('keeps the daily snapshot shape but drops anything deeper or bigger', async () => {
+    const { telemetry, posts } = make()
+    telemetry.completeOnboarding(true)
+    telemetry.track('usage_snapshot', {
+      schema: 2,
+      models: [{ name: 'Sonnet 4.5', tasks: [{ name: 'Coding', share: 0.75 }] }],
+      categories: [{ name: 'Coding', topModels: ['Sonnet 4.5', 'Opus 4.6'] }],
+      sessions: { countBucket: '100-1k' },
+      // One container deeper than the snapshot's own deepest shape.
+      tooDeep: [{ a: [{ b: [{ c: 1 }] }] }],
+      wide: Array.from({ length: 40 }, (_, i) => ({ name: `n${i}` })),
+    })
+    await telemetry.flush()
+    const props = (posts[0]!.body as { events: Array<{ name: string; props: Record<string, unknown> }> }).events[1]!.props
+
+    expect(props.models).toEqual([{ name: 'Sonnet 4.5', tasks: [{ name: 'Coding', share: 0.75 }] }])
+    expect(props.categories).toEqual([{ name: 'Coding', topModels: ['Sonnet 4.5', 'Opus 4.6'] }])
+    expect(props.sessions).toEqual({ countBucket: '100-1k' })
+    expect(props.tooDeep).toBeUndefined()
+    expect(props.wide).toHaveLength(12)
+  })
+
+  it('accepts the name-only interaction events', async () => {
+    const { telemetry, posts } = make()
+    telemetry.completeOnboarding(true)
+    telemetry.track('optimize_apply', { kind: 'claude-md-too-long', fixType: 'file-content' })
+    telemetry.track('plan_set', { provider: 'cursor', plan: 'cursor-pro' })
+    telemetry.track('export', { format: 'json', provider: 'all' })
+    telemetry.track('compare_view', { modelA: 'Sonnet 4.5', modelB: 'Opus 4.6' })
+    telemetry.track('settings_change', { setting: 'theme', value: 'dark' })
+    await telemetry.flush()
+    const events = (posts[0]!.body as { events: Array<{ name: string; props: Record<string, unknown> }> }).events
+
+    expect(events.map(event => event.name)).toEqual([
+      'app_open', 'optimize_apply', 'plan_set', 'export', 'compare_view', 'settings_change',
+    ])
+    expect(events[1]!.props).toEqual({ kind: 'claude-md-too-long', fixType: 'file-content' })
+    expect(events[5]!.props).toEqual({ setting: 'theme', value: 'dark' })
   })
 
   it('stamps events with the LOCAL calendar day, not the UTC day', async () => {
@@ -209,6 +274,47 @@ describe('events', () => {
     expect(reloaded.status()).toMatchObject({ enabled: true, onboarded: true })
   })
 
+  it('sends provider_read_fail once per provider per local day, across restarts', () => {
+    let instant = new Date('2026-07-17T12:00:00')
+    const { telemetry } = make({ now: () => instant })
+    telemetry.completeOnboarding(true)
+    const before = telemetry.queueLength
+    telemetry.track('provider_read_fail', { provider: 'cursor', stage: 'locate', kind: 'eacces' })
+    telemetry.track('provider_read_fail', { provider: 'cursor', stage: 'locate', kind: 'eacces' })
+    telemetry.track('provider_read_fail', { provider: 'cursor', stage: 'parse', kind: 'malformed' })
+    telemetry.track('provider_read_fail', { provider: 'codex', stage: 'parse', kind: 'busy' })
+    expect(telemetry.queueLength).toBe(before + 3)
+
+    const reloaded = new Telemetry({ stateDir: dir, country: 'US', isPackaged: true, appVersion: '1', now: () => instant })
+    reloaded.track('provider_read_fail', { provider: 'cursor', stage: 'locate', kind: 'eacces' })
+    expect(reloaded.queueLength).toBe(0)
+    instant = new Date('2026-07-18T12:00:00')
+    reloaded.track('provider_read_fail', { provider: 'cursor', stage: 'locate', kind: 'eacces' })
+    expect(reloaded.queueLength).toBe(1)
+  })
+
+  it('settles a pending update once on the next launch: ok when newer, install_fail when unchanged, nothing when older', async () => {
+    for (const [running, expected] of [
+      ['0.9.27', [{ from: '0.9.26', to: '0.9.27', outcome: 'ok' }]],
+      ['0.9.26', [{ from: '0.9.26', to: '0.9.27', outcome: 'install_fail' }]],
+      ['0.9.28', [{ from: '0.9.26', to: '0.9.28', outcome: 'ok' }]],
+      ['0.9.25', []],
+    ] as const) {
+      const stateDir = join(dir, running)
+      const first = new Telemetry({ stateDir, country: 'US', isPackaged: true, appVersion: '0.9.26' })
+      first.completeOnboarding(true)
+      first.noteUpdateInstall('0.9.26', '0.9.27')
+      const { telemetry: next, posts } = make({ stateDir, appVersion: running })
+      next.settleUpdate(running)
+      next.settleUpdate(running)
+      await next.flush()
+      const events = (posts[0]?.body as { events: Array<{ name: string; props: unknown }> } | undefined)?.events ?? []
+      expect(events.filter(e => e.name === 'update_result').map(e => e.props))
+        .toEqual(expected)
+      expect(JSON.parse(readFileSync(join(stateDir, 'telemetry.v1.json'), 'utf-8')).pendingUpdate).toBeUndefined()
+    }
+  })
+
   it('evicts the oldest event so app_close survives a full queue', async () => {
     const { telemetry, posts } = make()
     telemetry.completeOnboarding(true)
@@ -256,5 +362,132 @@ describe('events', () => {
     expect(typeof body.installId).toBe('string')
     expect(body.app).toMatchObject({ name: 'codeburn-desktop', version: '1.0.0', country: 'US' })
     expect(Array.isArray(body.events)).toBe(true)
+  })
+})
+
+describe('resource usage buckets', () => {
+  it('places every CPU boundary in the higher bucket', () => {
+    expect(cpuBucket(0)).toBe('<1')
+    expect(cpuBucket(0.99)).toBe('<1')
+    expect(cpuBucket(1)).toBe('1-5')
+    expect(cpuBucket(4.99)).toBe('1-5')
+    expect(cpuBucket(5)).toBe('5-15')
+    expect(cpuBucket(14.99)).toBe('5-15')
+    expect(cpuBucket(15)).toBe('15-40')
+    expect(cpuBucket(39.99)).toBe('15-40')
+    expect(cpuBucket(40)).toBe('40+')
+    expect(cpuBucket(1200)).toBe('40+')
+    // Unmeasurable reads as the lowest bucket, never as a thrown close.
+    expect(cpuBucket(Number.NaN)).toBe('<1')
+    expect(cpuBucket(-5)).toBe('<1')
+  })
+
+  it('places every memory boundary in the higher bucket', () => {
+    expect(memBucket(0)).toBe('<250')
+    expect(memBucket(249.9)).toBe('<250')
+    expect(memBucket(250)).toBe('250-500')
+    expect(memBucket(499.9)).toBe('250-500')
+    expect(memBucket(500)).toBe('500-1k')
+    expect(memBucket(999.9)).toBe('500-1k')
+    expect(memBucket(1000)).toBe('1-3k')
+    expect(memBucket(2999.9)).toBe('1-3k')
+    expect(memBucket(3000)).toBe('3k+')
+    expect(memBucket(Number.NaN)).toBe('<250')
+  })
+})
+
+describe('app_close resource usage', () => {
+  const SESSION_MS = 10 * 60_000
+  const OPENED_AT = Date.parse('2026-09-19T09:00:00Z')
+  /// Both counters are cumulative since their own process started, so the mocks below grow
+  /// with the clock and carry a head start from before telemetry was constructed.
+  const elapsedSec = () => (Date.now() - OPENED_AT) / 1000
+
+  afterEach(() => { vi.useRealTimers() })
+
+  async function closeWith(over: Partial<ConstructorParameters<typeof Telemetry>[0]>, sample = false, sessionMs = SESSION_MS) {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-19T09:00:00Z'))
+    const { telemetry, posts } = make(over)
+    telemetry.completeOnboarding(true)
+    vi.setSystemTime(new Date(Date.now() + sessionMs))
+    if (sample) telemetry.sampleResources()
+    telemetry.trackClose()
+    await telemetry.flush()
+    const body = posts[0]!.body as { events: Array<{ name: string; props: Record<string, unknown> }> }
+    return body.events.find(event => event.name === 'app_close')!.props
+  }
+
+  it('carries app and serve buckets when both report metrics', async () => {
+    const props = await closeWith({
+      // 30 CPU-seconds over a 600s session is 5% of one core; 600MB of working set. The
+      // 400 and 100 already on the clocks belong to the time before this session.
+      getAppMetrics: () => [
+        { cpu: { cumulativeCPUUsage: 400 + elapsedSec() * 0.03, percentCPUUsage: 0 }, memory: { workingSetSize: 400 * 1024 } },
+        { cpu: { cumulativeCPUUsage: 100 + elapsedSec() * 0.02, percentCPUUsage: 0 }, memory: { workingSetSize: 200 * 1024 } },
+      ],
+      getServeUsage: () => ({ cpuSec: 900 + elapsedSec() * 0.2, rssMb: 1200 }),
+    })
+    expect(props).toEqual({ sessionMinutes: 10, cpu: '5-15', mem: '500-1k', serveCpu: '15-40', serveMem: '1-3k' })
+  })
+
+  // The counters run from each process's own start, the wall clock from telemetry's: a
+  // desktop app that had been open for hours read as pinned CPU for a session that did
+  // nothing at all.
+  it('reports the CPU spent during the session, not what was already on the clock', async () => {
+    const props = await closeWith({
+      getAppMetrics: () => [{ cpu: { cumulativeCPUUsage: 500, percentCPUUsage: 0 }, memory: { workingSetSize: 300 * 1024 } }],
+      getServeUsage: () => ({ cpuSec: 900, rssMb: 300 }),
+    })
+    expect(props).toMatchObject({ cpu: '<1', serveCpu: '<1' })
+  })
+
+  it('averages sampled percentages when the platform reports no cumulative CPU', async () => {
+    const props = await closeWith({
+      getAppMetrics: () => [{ cpu: { percentCPUUsage: 8 }, memory: { workingSetSize: 300 * 1024 } }],
+      getServeUsage: () => null,
+    }, true)
+    expect(props).toMatchObject({ cpu: '5-15', mem: '250-500' })
+    expect(props.serveCpu).toBeUndefined()
+    expect(props.serveMem).toBeUndefined()
+  })
+
+  // CPU seconds count from process start, the wall clock from telemetry init, so a
+  // ten-second session read '40+' however idle the app was. Memory is unaffected.
+  it('omits both CPU figures on a session too short to divide by', async () => {
+    const props = await closeWith({
+      getAppMetrics: () => [{ cpu: { cumulativeCPUUsage: 20, percentCPUUsage: 0 }, memory: { workingSetSize: 400 * 1024 } }],
+      getServeUsage: () => ({ cpuSec: 120, rssMb: 1200 }),
+    }, false, 10_000)
+    expect(props).toEqual({ sessionMinutes: 0, mem: '250-500', serveMem: '1-3k' })
+  })
+
+  it('omits every field it could not measure rather than sending zeros', async () => {
+    const props = await closeWith({})
+    expect(props).toEqual({ sessionMinutes: 10 })
+  })
+})
+
+describe('cli_error enrichment', () => {
+  it('buckets durations', () => {
+    expect([0, 999, 1000, 4999, 5000, 14_999, 15_000, 29_999, 30_000, 119_999, 120_000, NaN].map(durationBucket))
+      .toEqual(['<1s', '<1s', '1-5s', '1-5s', '5-15s', '5-15s', '15-30s', '15-30s', '30-120s', '30-120s', '120s+', '<1s'])
+  })
+
+  it('classifies stderr into a fixed label set', () => {
+    expect(cliErrorReason('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory')).toBe('oom')
+    expect(cliErrorReason('SqliteError: database is locked')).toBe('lock-busy')
+    expect(cliErrorReason("EACCES: permission denied, open '/Users/me/.claude/x.jsonl'")).toBe('eacces')
+    expect(cliErrorReason("ENOENT: no such file or directory, open '/Users/me/x'")).toBe('enoent')
+    expect(cliErrorReason('getaddrinfo ENOTFOUND api.example.com')).toBe('network')
+    expect(cliErrorReason('SyntaxError: Unexpected token } in JSON at position 4')).toBe('parse')
+    expect(cliErrorReason('codeburn serve exited')).toBe('serve')
+    expect(cliErrorReason('codeburn is shutting down')).toBe('shutdown')
+    expect(cliErrorReason('something else entirely at /Users/me/project')).toBe('other')
+  })
+
+  it('allows the new event names', () => {
+    expect(EVENT_NAMES.has('provider_read_fail')).toBe(true)
+    expect(EVENT_NAMES.has('update_result')).toBe(true)
   })
 })

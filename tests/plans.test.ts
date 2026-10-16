@@ -6,12 +6,19 @@ import { describe, it, expect } from 'vitest'
 
 import { clearPlan, readPlan, readPlans, saveConfig, savePlan } from '../src/config.js'
 import { getPresetPlan, isPlanId, isPlanProvider } from '../src/plans.js'
+import { setHome } from './setup/home.js'
 
 describe('plan presets', () => {
   it('resolves builtin presets', () => {
     expect(getPresetPlan('claude-pro')).toMatchObject({ id: 'claude-pro', monthlyUsd: 20, provider: 'claude' })
     expect(getPresetPlan('claude-max')).toMatchObject({ id: 'claude-max', monthlyUsd: 200, provider: 'claude' })
     expect(getPresetPlan('cursor-pro')).toMatchObject({ id: 'cursor-pro', monthlyUsd: 20, provider: 'cursor' })
+    expect(getPresetPlan('copilot-pro')).toMatchObject({ id: 'copilot-pro', monthlyCredits: 1500, monthlyUsd: 15, provider: 'copilot' })
+    expect(getPresetPlan('copilot-pro-plus')).toMatchObject({ id: 'copilot-pro-plus', monthlyCredits: 7000, monthlyUsd: 70, provider: 'copilot' })
+    expect(getPresetPlan('copilot-max')).toMatchObject({ id: 'copilot-max', monthlyCredits: 20000, monthlyUsd: 200, provider: 'copilot' })
+    expect(getPresetPlan('google-ai-pro')).toMatchObject({ id: 'google-ai-pro', monthlyUsd: 19.99, provider: 'antigravity' })
+    expect(getPresetPlan('google-ai-ultra-5x')).toMatchObject({ id: 'google-ai-ultra-5x', monthlyUsd: 99.99, provider: 'antigravity' })
+    expect(getPresetPlan('google-ai-ultra-20x')).toMatchObject({ id: 'google-ai-ultra-20x', monthlyUsd: 199.99, provider: 'antigravity' })
     expect(getPresetPlan('custom')).toBeNull()
   })
 
@@ -22,14 +29,17 @@ describe('plan presets', () => {
 
     expect(isPlanProvider('all')).toBe(true)
     expect(isPlanProvider('claude')).toBe(true)
+    expect(isPlanProvider('copilot')).toBe(true)
+    expect(isPlanProvider('antigravity')).toBe(true)
     expect(isPlanProvider('invalid')).toBe(false)
+    expect(isPlanId('copilot-pro')).toBe(true)
   })
 })
 
 describe('plan config persistence', () => {
   it('round-trips per-provider plans and clears one provider at a time', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await savePlan({
@@ -79,7 +89,7 @@ describe('plan config persistence', () => {
 
   it('reads legacy single-plan config as a provider-keyed plan map', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await saveConfig({
@@ -106,7 +116,7 @@ describe('plan config persistence', () => {
 
   it('drops a hand-edited all plan when provider-specific plans are present', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await saveConfig({
@@ -137,7 +147,7 @@ describe('plan config persistence', () => {
 
   it('does not allow an all-provider plan to overlap provider-specific plans', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'codeburn-plan-test-'))
-    process.env['HOME'] = dir
+    setHome(dir)
 
     try {
       await savePlan({

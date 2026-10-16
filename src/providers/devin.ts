@@ -1,11 +1,12 @@
+import { existsSync } from "fs";
 import { readdir, stat } from "fs/promises";
 import { basename, join } from "path";
 import { homedir } from "os";
 
-import { getShortModelName } from "../models.js";
-import { openDatabase } from "../sqlite.js";
-import { readConfig } from "../config.js";
+import { calculateCost, getShortModelName } from "../models.js";
+import { isSqliteBusyError, openDatabase } from "../sqlite.js";
 import type {
+  ProbeRoot,
   Provider,
   SessionParser,
   SessionSource,
@@ -50,7 +51,6 @@ type ToolCall = {
 
 type DevinMetadata = {
   created_at?: string;
-  committed_acu_cost?: number;
   generation_model?: string;
   is_user_input?: boolean;
   num_tokens?: number;
@@ -109,7 +109,6 @@ type DevinTelemetry = {
 };
 
 type DevinStepExtra = {
-  committed_acu_cost?: number;
   generation_model?: string;
   telemetry?: DevinTelemetry;
 };
@@ -151,7 +150,6 @@ type DevinSessionMetadata = {
 };
 
 type DevinUsage = {
-  committedAcuCost: number;
   inputTokens: number;
   outputTokens: number;
   cacheCreationInputTokens: number;
@@ -186,15 +184,6 @@ function parseNumericTimestamp(value: number): string {
   return new Date(millis).toISOString();
 }
 
-function getCommittedAcuCost(step: DevinStep): number {
-  const acuCost = [
-    step.metadata?.committed_acu_cost,
-    step.extra?.committed_acu_cost,
-  ].filter((cost) => isPositiveNumber(cost));
-
-  return acuCost.shift() || 0;
-}
-
 function hasAnyTokenField(
   metrics: Metrics<DevinMetricsExtra> | null | undefined,
 ): boolean {
@@ -227,8 +216,11 @@ function getMetricsFromStep(
 function getDevinMetricsFromMetadata(
   metadata: DevinMetadata,
 ): Metrics<DevinMetricsExtra> {
+  const input = metadata.metrics?.input_tokens;
   return {
-    prompt_tokens: metadata.metrics?.input_tokens,
+    // Devin's own metrics count input_tokens without the cache reads, unlike
+    // the OpenAI-style prompt_tokens getUsage carves them out of.
+    prompt_tokens: input == null ? input : input + safeNumber(metadata.metrics?.cache_read_tokens),
     completion_tokens: metadata.metrics?.output_tokens,
     cached_tokens: metadata.metrics?.cache_read_tokens,
     extra: {
@@ -238,11 +230,9 @@ function getDevinMetricsFromMetadata(
 }
 
 function getUsage(step: DevinStep): DevinUsage | null {
-  const committedAcuCost = getCommittedAcuCost(step);
   const metrics = getMetricsFromStep(step);
 
   const hasAnyUsage = [
-    committedAcuCost,
     metrics?.prompt_tokens,
     metrics?.completion_tokens,
     metrics?.extra?.cache_creation_input_tokens,
@@ -251,14 +241,18 @@ function getUsage(step: DevinStep): DevinUsage | null {
 
   if (!hasAnyUsage) return null;
 
+  const cacheReadInputTokens = safeNumber(metrics?.cached_tokens);
+
   return {
-    committedAcuCost,
-    inputTokens: safeNumber(metrics?.prompt_tokens),
+    // Devin reports OpenAI-style prompt_tokens, with the cached tokens counted
+    // inside it; Anthropic semantics (what calculateCost expects) keep them
+    // apart, so the cached share is carved out instead of billed twice.
+    inputTokens: Math.max(0, safeNumber(metrics?.prompt_tokens) - cacheReadInputTokens),
     outputTokens: safeNumber(metrics?.completion_tokens),
     cacheCreationInputTokens: safeNumber(
       metrics?.extra?.cache_creation_input_tokens,
     ),
-    cacheReadInputTokens: safeNumber(metrics?.cached_tokens),
+    cacheReadInputTokens,
   };
 }
 
@@ -336,6 +330,14 @@ function getFriendlyGptName(model: string): string {
   return reconstructed;
 }
 
+// Devin minor versions are always a single digit (gpt-5-3-codex,
+// swe-1-7-lightning). Restrict the dash-to-dot rewrite to a single-digit minor
+// at a token boundary so a dated snapshot like gpt-4-1106-preview is not
+// misread as version 4.1106.
+function normalizeDevinGptId(model: string): string {
+  return model.replace(/^(gpt|swe)-(\d+)-(\d)(?=-|$)/, "$1-$2.$3");
+}
+
 function getDevinDisplayModelName(
   generationModel: string | undefined,
   modelName: string,
@@ -345,10 +347,7 @@ function getDevinDisplayModelName(
   }
 
   if (generationModel.startsWith("gpt-")) {
-    // Devin minor versions are always a single digit (gpt-5-3-codex). Restrict
-    // the dash-to-dot rewrite to a single-digit minor at a token boundary so a
-    // dated snapshot like gpt-4-1106-preview is not misread as version 4.1106.
-    const normalized = generationModel.replace(/^gpt-(\d+)-(\d)(?=-|$)/, "gpt-$1.$2");
+    const normalized = normalizeDevinGptId(generationModel);
     const effortMatch = normalized.match(/-([^-]+)$/);
     const effort = effortMatch && DEVIN_EFFORT_TIERS.has(effortMatch[1]!)
       ? effortMatch[1]
@@ -361,22 +360,30 @@ function getDevinDisplayModelName(
   return getShortModelName(generationModel);
 }
 
-function getModelName(
-  transcript: DevinAgentTrajectory,
+function getModels(
+  agentModel: string | undefined,
   step: DevinStep,
   session: DevinSessionMetadata | null,
-): string {
+): { pricingModel: string; displayModel: string } {
   const generationModel = firstPresentString(
     step.metadata?.generation_model,
     step.extra?.generation_model,
   );
   const modelName = firstPresentString(
     step.model_name,
-    transcript.agent?.model_name,
+    agentModel,
     session?.model,
   ) ?? DEFAULT_MODEL_NAME;
 
-  return getDevinDisplayModelName(generationModel, modelName);
+  const pricingModel =
+    !generationModel || /^MODEL_/.test(generationModel)
+      ? modelName
+      : normalizeDevinGptId(generationModel);
+
+  return {
+    pricingModel,
+    displayModel: getDevinDisplayModelName(generationModel, modelName),
+  };
 }
 
 function getToolNames(step: DevinStep): string[] {
@@ -398,19 +405,72 @@ function normalizeStepMessage(message: string | Array<ContentPart>): string {
   return message.trim();
 }
 
+// Real transcripts mark the user's turn with source "user" and leave
+// is_user_input unset; older ones do the opposite.
+function isUserStep(step: DevinStep): boolean {
+  return step.metadata?.is_user_input === true || step.source === "user";
+}
+
 function getFirstUserMessageBeforeStep(
   steps: DevinStep[],
   index: number,
 ): string | null {
   for (let i = index - 1; i >= 0; i--) {
     const step = steps[i];
-    if (!step?.metadata?.is_user_input) continue;
+    if (!step || !isUserStep(step)) continue;
     const message = step.message
       ? normalizeStepMessage(step.message)
       : undefined;
     if (message) return message;
   }
   return null;
+}
+
+// Devin only fills sessions.title once it has summarised the session, so an
+// unsummarised session falls back to what the user actually typed first.
+function loadFirstPrompts(db: ReturnType<typeof openDatabase>): Map<string, string> {
+  const prompts = new Map<string, string>();
+  try {
+    const rows = db.query<{ session_id: string; content: string }>(
+      `SELECT session_id, content FROM prompt_history ORDER BY id`,
+    );
+    for (const row of rows) {
+      const content = row.content?.trim();
+      if (!row.session_id || !content || prompts.has(row.session_id)) continue;
+      prompts.set(row.session_id, content);
+    }
+  } catch {
+    // Older Devin builds have no prompt_history table.
+  }
+  return prompts;
+}
+
+type SessionRow = {
+  id: string;
+  working_directory: string;
+  model: string;
+  title: string | null;
+  created_at: number;
+  last_activity_at: number;
+  hidden: number;
+};
+
+const SESSION_COLUMNS =
+  "id, working_directory, model, title, created_at, last_activity_at, hidden";
+
+function toSessionMetadata(
+  row: SessionRow,
+  firstPrompt: string | undefined,
+): DevinSessionMetadata {
+  return {
+    id: row.id,
+    workingDirectory: row.working_directory,
+    model: row.model,
+    title: row.title?.trim() || firstPrompt,
+    createdAt: parseNumericTimestamp(row.created_at),
+    lastActivityAt: parseNumericTimestamp(row.last_activity_at),
+    hidden: !!row.hidden,
+  };
 }
 
 function loadSessionMetadata(
@@ -420,29 +480,11 @@ function loadSessionMetadata(
   let db: ReturnType<typeof openDatabase> | null = null;
   try {
     db = openDatabase(dbPath);
-    const rows = db.query<{
-      id: string;
-      working_directory: string;
-      model: string;
-      title: string | null;
-      created_at: number;
-      last_activity_at: number;
-      hidden: number;
-    }>(
-      `SELECT id, working_directory, model, title, created_at, last_activity_at, hidden
-       FROM sessions`,
-    );
+    const rows = db.query<SessionRow>(`SELECT ${SESSION_COLUMNS} FROM sessions`);
+    const firstPrompts = loadFirstPrompts(db);
     for (const row of rows) {
       if (!row.id) continue;
-      sessions.set(row.id, {
-        id: row.id,
-        workingDirectory: row.working_directory,
-        model: row.model,
-        title: row.title ?? undefined,
-        createdAt: parseNumericTimestamp(row.created_at),
-        lastActivityAt: parseNumericTimestamp(row.last_activity_at),
-        hidden: !!row.hidden,
-      });
+      sessions.set(row.id, toSessionMetadata(row, firstPrompts.get(row.id)));
     }
   } catch {
     return sessions;
@@ -450,11 +492,6 @@ function loadSessionMetadata(
     db?.close();
   }
   return sessions;
-}
-
-async function getCostFactor(): Promise<number | null> {
-  const configRate = (await readConfig()).devin?.acuUsdRate;
-  return isPositiveNumber(configRate) ? configRate : null;
 }
 
 class DevinSessionParser implements SessionParser {
@@ -477,12 +514,10 @@ class DevinSessionParser implements SessionParser {
 
     const project = getProjectName(this.source, session);
     const projectPath = getProjectPath(session);
-    const costFactor = await getCostFactor();
-    if (costFactor === null) return;
 
     for (let index = 0; index < transcript.steps.length; index++) {
       const step = transcript.steps[index];
-      if (step.metadata?.is_user_input) continue;
+      if (isUserStep(step)) continue;
 
       const usage = getUsage(step);
       if (!usage) continue;
@@ -494,38 +529,261 @@ class DevinSessionParser implements SessionParser {
       if (this.seenKeys.has(deduplicationKey)) continue;
       this.seenKeys.add(deduplicationKey);
 
-      const model = getModelName(transcript, step, session);
-      const tools = getToolNames(step);
-      const userMessage =
-        getFirstUserMessageBeforeStep(transcript.steps, index) ?? "";
-
-      yield {
-        provider: DEVIN_PROVIDER_NAME,
-        model,
-        inputTokens: usage.inputTokens,
-        outputTokens: usage.outputTokens,
-        cacheCreationInputTokens: usage.cacheCreationInputTokens,
-        cacheReadInputTokens: usage.cacheReadInputTokens,
-        cachedInputTokens: usage.cacheReadInputTokens,
-        reasoningTokens: 0,
-        webSearchRequests: 0,
-        costUSD: usage.committedAcuCost * costFactor,
-        tools,
-        bashCommands: [],
+      yield toParsedCall({
+        step,
+        usage,
+        agentModel: transcript.agent?.model_name,
+        session,
         timestamp,
-        speed: "standard",
         deduplicationKey,
-        userMessage,
+        userMessage:
+          getFirstUserMessageBeforeStep(transcript.steps, index) ??
+          session?.title ??
+          "",
         sessionId,
         project,
         projectPath,
-      };
+      });
     }
   }
 }
 
-export function createDevinProvider(cliDir: string): Provider {
-  const sessionsDbPath = join(cliDir, DEVIN_SESSIONS_DB);
+function toParsedCall(call: {
+  step: DevinStep;
+  usage: DevinUsage;
+  agentModel: string | undefined;
+  session: DevinSessionMetadata | null;
+  timestamp: string;
+  deduplicationKey: string;
+  userMessage: string;
+  sessionId: string;
+  project: string;
+  projectPath: string | undefined;
+}): ParsedProviderCall {
+  const { step, usage, session } = call;
+  const { pricingModel, displayModel } = getModels(call.agentModel, step, session);
+  return {
+    provider: DEVIN_PROVIDER_NAME,
+    model: displayModel,
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    cacheCreationInputTokens: usage.cacheCreationInputTokens,
+    cacheReadInputTokens: usage.cacheReadInputTokens,
+    cachedInputTokens: usage.cacheReadInputTokens,
+    reasoningTokens: 0,
+    webSearchRequests: 0,
+    costUSD: calculateCost(
+      pricingModel,
+      usage.inputTokens,
+      usage.outputTokens,
+      usage.cacheCreationInputTokens,
+      usage.cacheReadInputTokens,
+      0,
+    ),
+    tools: getToolNames(step),
+    bashCommands: [],
+    timestamp: call.timestamp,
+    speed: "standard",
+    deduplicationKey: call.deduplicationKey,
+    userMessage: call.userMessage,
+    sessionId: call.sessionId,
+    project: call.project,
+    projectPath: call.projectPath,
+  };
+}
+
+type MessageNodeRow = {
+  node_id: number;
+  parent_node_id: number | null;
+  role: string | null;
+  metadata: string | null;
+  tool_names: string | null;
+  content: unknown;
+};
+
+// Keyset batches keep one batch of rows in memory, not a whole session, and
+// the SQL pulls only the fields used so tool output never reaches JS.
+const MESSAGE_BATCH_ROWS = 2000;
+
+// Every sibling retry of a request is stored as its own node carrying the same
+// request_id and metrics, so the request id is the dedup key. Branches off the
+// main chain are real distinct requests and count too.
+class DevinDbSessionParser implements SessionParser {
+  constructor(
+    private source: SessionSource,
+    private seenKeys: Set<string>,
+  ) {}
+
+  async *parse(): AsyncGenerator<ParsedProviderCall> {
+    const idx = this.source.path.lastIndexOf(":");
+    const dbPath = this.source.path.slice(0, idx);
+    const sessionId = this.source.path.slice(idx + 1);
+
+    let db: ReturnType<typeof openDatabase>;
+    try {
+      db = openDatabase(dbPath);
+    } catch (err) {
+      if (isSqliteBusyError(err)) throw err;
+      return;
+    }
+
+    const calls: ParsedProviderCall[] = [];
+    try {
+      const row = db.query<SessionRow>(
+        `SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`,
+        [sessionId],
+      )[0];
+      if (!row || row.hidden) return;
+      const firstPrompt = db.query<{ content: string }>(
+        `SELECT content FROM prompt_history WHERE session_id = ? ORDER BY id LIMIT 1`,
+        [sessionId],
+      )[0]?.content?.trim();
+      const session = toSessionMetadata(row, firstPrompt);
+      const project = getProjectName(this.source, session);
+
+      // Parents always precede children, so one forward pass hands each node
+      // the prompt of its nearest user ancestor.
+      const promptByNode = new Map<number, string | undefined>();
+      let lastNodeId = -1;
+      for (;;) {
+        const rows = db.query<MessageNodeRow>(
+          `SELECT node_id, parent_node_id,
+                  json_extract(chat_message, '$.role') AS role,
+                  CASE WHEN json_type(chat_message, '$.metadata') = 'object'
+                       THEN json_object(
+                         'created_at', chat_message -> '$.metadata.created_at',
+                         'generation_model', chat_message -> '$.metadata.generation_model',
+                         'is_user_input', chat_message -> '$.metadata.is_user_input',
+                         'request_id', chat_message -> '$.metadata.request_id',
+                         'metrics', chat_message -> '$.metadata.metrics') END AS metadata,
+                  (SELECT json_group_array(json_extract(value, '$.name'))
+                     FROM json_each(chat_message, '$.tool_calls')) AS tool_names,
+                  CASE WHEN json_extract(chat_message, '$.role') = 'user'
+                        AND json_type(chat_message, '$.content') = 'text'
+                       THEN json_extract(chat_message, '$.content') END AS content
+           FROM message_nodes
+           WHERE session_id = ? AND node_id > ?
+           ORDER BY node_id
+           LIMIT ?`,
+          [sessionId, lastNodeId, MESSAGE_BATCH_ROWS],
+        );
+        for (const node of rows) {
+          lastNodeId = Number(node.node_id);
+          const metadata = parseJson<DevinMetadata>(node.metadata);
+          const inherited =
+            node.parent_node_id == null
+              ? undefined
+              : promptByNode.get(Number(node.parent_node_id));
+          const ownPrompt =
+            node.role === "user" &&
+            metadata?.is_user_input === true &&
+            typeof node.content === "string"
+              ? node.content.trim() || undefined
+              : undefined;
+          promptByNode.set(lastNodeId, ownPrompt ?? inherited);
+
+          if (node.role !== "assistant" || !metadata) continue;
+          const step: DevinStep = {
+            step_id: lastNodeId,
+            source: "agent",
+            message: "",
+            metadata,
+            tool_calls: (parseJson<Array<string | null>>(node.tool_names) ?? [])
+              .filter((name): name is string => !!name)
+              .map((name) => ({ tool_call_id: "", function_name: name, arguments: null })),
+          };
+          const usage = getUsage(step);
+          if (!usage) continue;
+
+          const deduplicationKey = `devin:${sessionId}:${metadata.request_id ?? `node-${lastNodeId}`}`;
+          if (this.seenKeys.has(deduplicationKey)) continue;
+          this.seenKeys.add(deduplicationKey);
+
+          calls.push(
+            toParsedCall({
+              step,
+              usage,
+              agentModel: undefined,
+              session,
+              timestamp: getTimestamp(step, session) ?? "",
+              deduplicationKey,
+              userMessage: ownPrompt ?? inherited ?? session.title ?? "",
+              sessionId,
+              project,
+              projectPath: getProjectPath(session),
+            }),
+          );
+        }
+        if (rows.length < MESSAGE_BATCH_ROWS) break;
+      }
+    } finally {
+      db.close();
+    }
+    yield* calls;
+  }
+}
+
+function parseJson<T>(raw: string | null): T | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+// null when the database is missing or predates message_nodes, so the
+// caller falls back to transcripts. BUSY propagates so the refresh retries
+// instead of reading a locked store as empty.
+function discoverDbSessions(dbPath: string): SessionSource[] | null {
+  if (!existsSync(dbPath)) return null;
+  let db: ReturnType<typeof openDatabase>;
+  try {
+    db = openDatabase(dbPath);
+  } catch (err) {
+    if (isSqliteBusyError(err)) throw err;
+    return null;
+  }
+  try {
+    const rows = db.query<{ id: string; working_directory: string; title: string | null }>(
+      `SELECT id, working_directory, title FROM sessions
+       WHERE hidden = 0 AND id IN (SELECT DISTINCT session_id FROM message_nodes)
+       ORDER BY id`,
+    );
+    return rows.map((row) => ({
+      path: `${dbPath}:${row.id}`,
+      project:
+        (row.working_directory && projectNameFromPath(row.working_directory)) ||
+        row.title?.trim() ||
+        DEVIN_PROVIDER_NAME,
+      provider: DEVIN_PROVIDER_NAME,
+    }));
+  } catch (err) {
+    if (isSqliteBusyError(err)) throw err;
+    return null;
+  } finally {
+    db.close();
+  }
+}
+
+function resolveDevinCliDir(override?: string): string {
+  return override && override.trim() ? override : DEFAULT_DEVIN_CLI_DIR;
+}
+
+function getDevinDiscoveryRoots(cliDir: string): {
+  transcriptsDir: string;
+  sessionsDbPath: string;
+} {
+  return {
+    transcriptsDir: join(cliDir, DEVIN_TRANSCRIPTS_SUBDIR),
+    sessionsDbPath: join(cliDir, DEVIN_SESSIONS_DB),
+  };
+}
+
+export function createDevinProvider(cliDir?: string): Provider {
+  const resolvedCliDir = resolveDevinCliDir(cliDir);
+  const { transcriptsDir, sessionsDbPath } =
+    getDevinDiscoveryRoots(resolvedCliDir);
   let sessionMetadata: Map<string, DevinSessionMetadata> | null = null;
 
   const getSessionMetadata = () => {
@@ -545,10 +803,19 @@ export function createDevinProvider(cliDir: string): Provider {
       return rawTool;
     },
 
-    async discoverSessions(): Promise<SessionSource[]> {
-      if ((await getCostFactor()) === null) return [];
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [
+        { path: transcriptsDir, label: "transcripts" },
+        { path: sessionsDbPath, label: "sessions.db" },
+      ];
+    },
 
-      const transcriptsDir = join(cliDir, DEVIN_TRANSCRIPTS_SUBDIR);
+    async discoverSessions(): Promise<SessionSource[]> {
+      // Transcripts are export-only snapshots of what sessions.db holds, so
+      // they are read only when the database cannot be.
+      const dbSources = discoverDbSessions(sessionsDbPath);
+      if (dbSources) return dbSources;
+
       const entries = await readdir(transcriptsDir).catch(() => []);
       const metadata = getSessionMetadata();
       const sources: SessionSource[] = [];
@@ -586,7 +853,9 @@ export function createDevinProvider(cliDir: string): Provider {
       source: SessionSource,
       seenKeys: Set<string>,
     ): SessionParser {
-      return new DevinSessionParser(source, seenKeys, getSessionMetadata());
+      return source.path.endsWith(".json")
+        ? new DevinSessionParser(source, seenKeys, getSessionMetadata())
+        : new DevinDbSessionParser(source, seenKeys);
     },
   };
 }

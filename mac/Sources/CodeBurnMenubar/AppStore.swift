@@ -5,9 +5,28 @@ private let cacheTTLSeconds: TimeInterval = 30
 private let interactiveRefreshResetSeconds: TimeInterval = 120
 private let menubarPeriodDefaultsKey = "CodeBurnMenubarPeriod"
 
+private func quotaFetchWasCancelled(_ error: Error) -> Bool {
+    if error is CancellationError { return true }
+    if let error = error as? ClaudeSubscriptionService.FetchError,
+       case let .network(cause) = error,
+       cause is CancellationError {
+        return true
+    }
+    if let error = error as? CodexSubscriptionService.FetchError,
+       case let .network(cause) = error,
+       cause is CancellationError {
+        return true
+    }
+    return false
+}
+
 struct CachedPayload {
     let payload: MenubarPayload
     let fetchedAt: Date
+    /// This scoped payload still disagreed with its all-provider slice after a
+    /// resident-bypassing one-shot re-parse. It is the best answer the CLI can
+    /// give, so it is served rather than discarded, with the UI saying so.
+    var contradictsAll: Bool = false
     var isFresh: Bool { Date().timeIntervalSince(fetchedAt) < cacheTTLSeconds }
 }
 
@@ -44,11 +63,20 @@ struct PayloadCacheKey: Hashable {
 @MainActor
 @Observable
 final class AppStore {
+    private struct QuotaRefreshToken {
+        let requestGeneration: Int
+        let lifecycleGeneration: Int
+    }
+
     var selectedProvider: ProviderFilter = .all
     var selectedPeriod: Period = .today
     var selectedScope: MenubarScope = MenubarScope.savedMenubarScope()
     var selectedClaudeConfigSourceId: String?
     var selectedDays: Set<String> = []
+    /// True while the status-item popover is on screen. The popover's hosting
+    /// view is created once and lives forever, so repeat-forever animations
+    /// must gate on this or they render at display cadence around the clock.
+    var menuPopoverVisible = false
     var activeScope: MenubarScope { effectiveSelectedScope }
 
     private var effectiveSelectedScope: MenubarScope {
@@ -76,6 +104,20 @@ final class AppStore {
     var settingsTab: String = "general"
     var displayMetric: DisplayMetric = DisplayMetric(rawValue: UserDefaults.standard.string(forKey: "CodeBurnDisplayMetric") ?? "") ?? .cost {
         didSet { UserDefaults.standard.set(displayMetric.rawValue, forKey: "CodeBurnDisplayMetric") }
+    }
+    /// Optional second menu-bar line. Off by default, so the status item keeps
+    /// rendering exactly the historical single-row title until asked otherwise.
+    var menubarSecondRowEnabled: Bool = MenubarRowPreferences.load().isSecondRowEnabled {
+        didSet { MenubarRowPreferences.setSecondRowEnabled(menubarSecondRowEnabled) }
+    }
+    var menubarSecondRowMetric: MenubarSecondRowMetric = MenubarRowPreferences.load().secondRowMetric {
+        didSet { MenubarRowPreferences.setSecondRowMetric(menubarSecondRowMetric) }
+    }
+    var menubarRowSettings: MenubarRowSettings {
+        MenubarRowSettings(
+            isSecondRowEnabled: menubarSecondRowEnabled,
+            secondRowMetric: menubarSecondRowMetric
+        )
     }
     var dailyBudget: Double = UserDefaults.standard.double(forKey: "CodeBurnDailyBudget") {
         didSet { UserDefaults.standard.set(dailyBudget, forKey: "CodeBurnDailyBudget") }
@@ -133,16 +175,121 @@ final class AppStore {
     var subscriptionError: String?
     var subscriptionLoadState: SubscriptionLoadState = ClaudeCredentialStore.isBootstrapCompleted ? .dormant : .notBootstrapped
     var capacityEstimates: [String: CapacityEstimate] = [:]
+    @ObservationIgnored var earlyQuotaResetMonitor = EarlyQuotaResetMonitor()
+    @ObservationIgnored var quotaCrossingMonitor = QuotaCrossingMonitor()
 
     var codexUsage: CodexUsage?
     var codexError: String?
-    var codexLoadState: SubscriptionLoadState = CodexCredentialStore.isBootstrapCompleted ? .dormant : .notBootstrapped
+    var codexLoadState: SubscriptionLoadState = (
+        CodexCredentialStore.isBootstrapCompleted || CodexCredentialStore.hasCredentialSource
+    ) ? .dormant : .notBootstrapped
+
+    var kimiUsage: KimiUsage?
+    var kimiError: String?
+    // No keychain dance for Kimi — "connected" just means the CLI's
+    // credential file exists, so we start dormant and auto-activate on the
+    // first refresh tick.
+    var kimiLoadState: SubscriptionLoadState = KimiSubscriptionService.hasCredential ? .dormant : .notBootstrapped
+
+    var geminiUsage: GeminiUsage?
+    var geminiError: String?
+    // Same file-based activation as Kimi — reading ~/.gemini/oauth_creds.json
+    // is prompt-free, so we start dormant and auto-activate on the first
+    // refresh tick.
+    var geminiLoadState: SubscriptionLoadState = GeminiSubscriptionService.hasCredential ? .dormant : .notBootstrapped
+
+    var copilotUsage: CopilotUsage?
+    var copilotError: String?
+    // Same file-based activation as Kimi/Gemini — reading
+    // Copilot discovery never raises a keychain prompt, so we start dormant and
+    // auto-activate on the first refresh tick unless the user explicitly
+    // disconnected. That opt-out is persisted and applied in `init`.
+    var copilotLoadState: SubscriptionLoadState = .notBootstrapped
+
+    var antigravityUsage: AntigravityUsage?
+    var antigravityError: String?
+    // No credential file at all — quota comes from probing the Antigravity
+    // app's local language server, which is prompt-free, so we start dormant
+    // and auto-activate (probe) on the first refresh tick.
+    var antigravityLoadState: SubscriptionLoadState = .dormant
+
+    /// Runtime state for providers that do not use one of the original native
+    /// bespoke CodeBurn adapter. Keys are stable provider IDs from
+    /// `ProviderConnectionCatalog`.
+    var capacityDockProviderSummaries: [String: QuotaSummary] = [:]
+    var capacityDockProviderErrors: [String: String] = [:]
+    var capacityDockProviderStatusTitles: [String: String] = [:]
+    var capacityDockProvidersLoading: Set<String> = []
+    var capacityDockProviderTransientFailures: Set<String> = []
+    private var capacityDockProviderRefreshGenerations: [String: UInt64] = [:]
+    @ObservationIgnored var capacityDockProviderQuotaService = CapacityDockProviderQuotaService.shared
+    /// Injectable seams keep the quota refresh state machine testable without
+    /// making the production tests contact provider endpoints.
+    @ObservationIgnored var claudeQuotaFetcher: @Sendable () async throws -> SubscriptionUsage? = {
+        try await ClaudeSubscriptionService.refreshIfBootstrapped()
+    }
+    @ObservationIgnored var codexQuotaFetcher: @Sendable () async throws -> CodexUsage? = {
+        try await CodexSubscriptionService.refreshIfBootstrapped()
+    }
+    @ObservationIgnored var claudeQuotaBootstrapChecker: @Sendable () -> Bool = {
+        ClaudeCredentialStore.isBootstrapCompleted
+    }
+    @ObservationIgnored var codexQuotaBootstrapChecker: @Sendable () -> Bool = {
+        CodexCredentialStore.isBootstrapCompleted
+    }
+    /// Watches the reset-credit inventory that already rides every successful
+    /// Codex usage fetch and notices when OpenAI banks a new one. Injectable so
+    /// tests never touch the real notification centre or the cache directory.
+    @ObservationIgnored var codexBankedResetAnnouncer = CodexBankedResetAnnouncer()
+    @ObservationIgnored var capacityDockCredentialLoader:
+        @Sendable (String) async throws -> CapacityDockProviderCredential = {
+            try await CapacityDockProviderCredentialStore.loadAsync(for: $0)
+        }
+    @ObservationIgnored var capacityDockCredentialSaver:
+        @Sendable (CapacityDockProviderCredential, String) async throws -> Void = {
+            try await CapacityDockProviderCredentialStore.saveAsync($0, for: $1)
+        }
+    @ObservationIgnored var capacityDockCredentialRemover:
+        @Sendable (String) async throws -> Void = {
+            try await CapacityDockProviderCredentialStore.removeAsync(for: $0)
+        }
+    @ObservationIgnored var capacityDockProviderDeselector:
+        (CapacityDockProvider) -> Void = {
+            CapacityDockPreferences.removeProvider($0)
+        }
+    @ObservationIgnored var capacityDockDefaults: UserDefaults = .standard
+    @ObservationIgnored var copilotQuotaRuntime: CopilotQuotaRuntime
+
+    init(copilotQuotaRuntime: CopilotQuotaRuntime = .live) {
+        self.copilotQuotaRuntime = copilotQuotaRuntime
+        copilotLoadState = Self.initialCopilotLoadState(runtime: copilotQuotaRuntime)
+    }
+
+    private static func initialCopilotLoadState(runtime: CopilotQuotaRuntime) -> SubscriptionLoadState {
+        if CopilotExplicitDisconnect.isSet(defaults: runtime.defaults) {
+            return .notBootstrapped
+        }
+        return runtime.hasCredential() ? .dormant : .notBootstrapped
+    }
 
     /// Generation tokens for the in-flight refresh tasks. Incremented on every
     /// disconnect / reset so a fetch that started before the disconnect cannot
     /// resume after the await and re-populate the freshly-cleared state.
     private var claudeRefreshGen: Int = 0
     private var codexRefreshGen: Int = 0
+    /// Request tokens keep overlapping manual/cadence refreshes from restoring
+    /// an older state over a newer request. The lifecycle generation above still
+    /// handles disconnect; these tokens handle ordinary request supersession.
+    private var claudeRefreshRequestGen: Int = 0
+    private var codexRefreshRequestGen: Int = 0
+    private var claudeRefreshInFlightRequest: Int?
+    private var codexRefreshInFlightRequest: Int?
+    private var claudeRefreshRestoreState: SubscriptionLoadState?
+    private var codexRefreshRestoreState: SubscriptionLoadState?
+    private var kimiRefreshGen: Int = 0
+    private var geminiRefreshGen: Int = 0
+    private var copilotRefreshGen: Int = 0
+    private var antigravityRefreshGen: Int = 0
 
     private var cache: [PayloadCacheKey: CachedPayload] = [:]
     private var cacheDate: String = ""
@@ -217,10 +364,21 @@ final class AppStore {
         )
     }
 
+    /// Capture the keys that must describe one selection before any suspension
+    /// point. Reading `periodAllKey` before an await and `currentKey` afterward
+    /// can otherwise pair evidence from two different user selections.
+    private func selectionRefreshKeys() -> (
+        scoped: PayloadCacheKey,
+        local: PayloadCacheKey,
+        all: PayloadCacheKey
+    ) {
+        (scoped: currentKey, local: localCurrentKey, all: periodAllKey)
+    }
+
     var payload: MenubarPayload {
         if effectiveSelectedScope == .combined {
             let combinedPayload = cache[currentKey]?.payload
-            if let localPayload = cache[localCurrentKey]?.payload {
+            if let localPayload = consistentCachedPayload(for: localCurrentKey) {
                 if let combined = combinedPayload?.combined {
                     return MenubarPayload(
                         generated: combinedPayload?.generated ?? localPayload.generated,
@@ -237,7 +395,11 @@ final class AppStore {
                 return combinedPayload
             }
         }
-        return cache[currentKey]?.payload ?? .empty
+        // No fallback to the PREVIOUS selection's payload. It belonged to a
+        // different provider, so serving it under this tab printed another
+        // provider's dollar figure as if it were this one's. Empty here means
+        // `hasCachedData` is false and the popover renders its loading state.
+        return consistentCachedPayload(for: currentKey) ?? .empty
     }
 
     /// Today (across all providers) backs day-specific views in the popover.
@@ -261,6 +423,49 @@ final class AppStore {
 
     var menubarPayload: MenubarPayload? {
         cache[menubarStatusKey]?.payload
+    }
+
+    private var menubarCombinedKey: PayloadCacheKey {
+        PayloadCacheKey(scope: .combined, period: menubarPeriod, provider: .all, day: nil, claudeConfigSourceId: selectedClaudeConfigSourceId)
+    }
+
+    /// Cross-device totals for the menubar badge's period, used so the badge
+    /// figure matches the popover hero under combined scope. `nil` under local
+    /// scope, or when no combined payload for the badge period is cached yet
+    /// (cold start, or the peer is unreachable) — the badge then falls back to
+    /// the local figure, exactly like the popover.
+    var menubarBadgeCombined: CombinedUsageTotals? {
+        guard effectiveSelectedScope == .combined else { return nil }
+        return cache[menubarCombinedKey]?.payload.combined?.combined
+    }
+
+    /// `(reachable, total)` only when combined scope is active and fewer paired
+    /// devices reported than are paired — i.e. the badge total is degraded to
+    /// the reachable subset (a peer is asleep/off-network this cycle). The badge
+    /// shows this so a momentary drop to the local figure reads as "peer
+    /// unreachable", not a glitch. `nil` when every paired device reported (or
+    /// there is only one), and under local scope.
+    var menubarBadgeDeviceShortfall: (reachable: Int, total: Int)? {
+        guard let totals = menubarBadgeCombined, totals.reachableCount < totals.deviceCount else { return nil }
+        return (totals.reachableCount, totals.deviceCount)
+    }
+
+    /// Refresh the payloads the badge renders for `period`: always the local
+    /// figure, plus the combined cross-device total when combined scope is
+    /// active. Combined is best-effort — a slow or unreachable peer degrades to
+    /// the local figure — so the local fetch alone determines success.
+    @discardableResult
+    func refreshMenubarBadge(period: Period, force: Bool = false, qualityOfService: QualityOfService = .userInitiated) async -> Bool {
+        async let local = refreshQuietly(period: period, force: force, qualityOfService: qualityOfService)
+        guard effectiveSelectedScope == .combined else { return await local }
+        async let combined = refreshQuietly(
+            key: PayloadCacheKey(scope: .combined, period: period, provider: .all, day: nil, claudeConfigSourceId: selectedClaudeConfigSourceId),
+            includeOptimize: false,
+            force: force,
+            qualityOfService: qualityOfService
+        )
+        let (localSucceeded, _) = await (local, combined)
+        return localSucceeded
     }
 
     /// All-provider payload for the selected period. Used by the tab strip to show
@@ -296,7 +501,8 @@ final class AppStore {
     }
 
     var hasCachedData: Bool {
-        cache[currentKey] != nil || (effectiveSelectedScope == .combined && cache[localCurrentKey] != nil)
+        consistentCachedPayload(for: currentKey) != nil
+            || (effectiveSelectedScope == .combined && consistentCachedPayload(for: localCurrentKey) != nil)
     }
 
     var hasStaleLoading: Bool {
@@ -338,7 +544,10 @@ final class AppStore {
         if effectiveSelectedScope == .combined {
             requiredKeys.insert(localCurrentKey)
         }
-        return requiredKeys.contains { cache[$0]?.isFresh != true } || hasStaleLoading
+        return requiredKeys.contains { key in
+            guard let cached = cache[key], cached.isFresh else { return true }
+            return providerPayloadContradictsAll(cached.payload, for: key)
+        } || hasStaleLoading
     }
 
     /// True if any cached payload reports at least one provider. Used to keep the
@@ -370,6 +579,26 @@ final class AppStore {
         cache[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)]?.payload
     }
 
+    func providerPayloadContradictsAllForTesting(_ payload: MenubarPayload,
+                                                  scope: MenubarScope = .local,
+                                                  period: Period,
+                                                  provider: ProviderFilter,
+                                                  day: String? = nil,
+                                                  days: Set<String> = [],
+                                                  claudeConfigSourceId: String? = nil) -> Bool {
+        providerPayloadContradictsAll(
+            payload,
+            for: PayloadCacheKey(
+                scope: scope,
+                period: period,
+                provider: provider,
+                day: day,
+                days: days,
+                claudeConfigSourceId: claudeConfigSourceId
+            )
+        )
+    }
+
     func setLastErrorForTesting(_ error: String,
                                 scope: MenubarScope = .local,
                                 period: Period,
@@ -384,11 +613,45 @@ final class AppStore {
                                 provider: ProviderFilter,
                                 day: String? = nil,
                                 insertedAt: Date) {
-        inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] = insertedAt
+        inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] =
+            InFlightSlot(startedAt: insertedAt, token: UUID())
+    }
+
+    func setCacheDateToTodayForTesting() {
+        cacheDate = currentCacheDate()
     }
 
     func isInFlightForTesting(scope: MenubarScope = .local, period: Period, provider: ProviderFilter, day: String? = nil) -> Bool {
         inFlightKeys[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)] != nil
+    }
+
+    func refreshQuietlyForTesting(scope: MenubarScope = .local,
+                                  period: Period,
+                                  provider: ProviderFilter,
+                                  day: String? = nil) async -> Bool {
+        await refreshQuietly(
+            key: PayloadCacheKey(scope: scope, period: period, provider: provider, day: day),
+            includeOptimize: false
+        )
+    }
+
+    func inFlightWaiterCountForTesting(scope: MenubarScope = .local,
+                                       period: Period,
+                                       provider: ProviderFilter,
+                                       day: String? = nil) -> Int {
+        inFlightWaiters[PayloadCacheKey(scope: scope, period: period, provider: provider, day: day)]?.count ?? 0
+    }
+
+    func finishInFlightForTesting(scope: MenubarScope = .local,
+                                  period: Period,
+                                  provider: ProviderFilter,
+                                  day: String? = nil) {
+        forceFinishInFlight(for: PayloadCacheKey(scope: scope, period: period, provider: provider, day: day))
+    }
+
+    func selectionRefreshKeysForTesting() -> (scoped: PayloadCacheKey, all: PayloadCacheKey) {
+        let snapshot = selectionRefreshKeys()
+        return (snapshot.scoped, snapshot.all)
     }
 
     func suppressRefreshesForTesting() {
@@ -469,9 +732,9 @@ final class AppStore {
         }
     }
 
-    /// Switch to a provider filter. Cancels any in-flight switch so rapid tab tapping only
-    /// runs the CLI for the final selection. Fetches provider-specific and all-provider data
-    /// in parallel so the tab strip costs stay in sync with the hero.
+    /// Switch to a provider filter immediately, then refresh stale data quietly.
+    /// Existing content stays mounted while the background fetch runs, so a tab
+    /// click never becomes a loading gate or resets unrelated in-flight work.
     func switchTo(provider: ProviderFilter) {
         selectedProvider = provider
         // A Claude config scope only applies to All/Claude views; picking any
@@ -507,7 +770,6 @@ final class AppStore {
 
     private func startInteractiveSelectionRefresh() {
         switchTask?.cancel()
-        resetLoadingState()
 #if DEBUG
         if refreshSuppressedForTesting { return }
 #endif
@@ -520,34 +782,107 @@ final class AppStore {
         let key = PayloadCacheKey(scope: scope, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         let localKey = PayloadCacheKey(scope: .local, period: period, provider: provider, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
         let allKey = PayloadCacheKey(scope: .local, period: period, provider: .all, day: day, days: days, claudeConfigSourceId: claudeConfigSourceId)
-        lastErrorByKey[key] = nil
-        switchTask = Task {
+        switchTask = Task { [weak self] in
+            guard let self else { return }
+            // The all-provider slice is the evidence that lets a scoped false
+            // zero be rejected, so it must be present BEFORE the scoped result
+            // is accepted. It does not have to be present before the scoped
+            // fetch STARTS: both run together and only the acceptance is
+            // ordered, via the gate passed as acceptAfter.
+            let allTask: Task<Bool, Never>? = provider == .all
+                ? nil
+                : self.startAllProviderEvidence(key: allKey, force: false)
+            let gate: (@Sendable () async -> Void)? = allTask.map { task in { @Sendable in _ = await task.value } }
             if scope == .combined {
-                async let local = refresh(key: localKey, includeOptimize: false, force: false, showLoading: false)
-                async let combined = refresh(key: key, includeOptimize: false, force: true, showLoading: true)
-                if provider == .all {
-                    _ = await (local, combined)
-                } else {
-                    async let all = refreshQuietly(key: allKey, includeOptimize: false, force: false)
-                    _ = await (local, combined, all)
-                }
-            } else if provider == .all {
-                await refresh(key: key, includeOptimize: false, force: true, showLoading: true)
+                async let local = self.refresh(key: localKey, includeOptimize: false, force: false, showLoading: false, acceptAfter: gate)
+                async let combined = self.refresh(key: key, includeOptimize: false, force: false, showLoading: false, acceptAfter: gate)
+                _ = await (local, combined)
             } else {
-                async let main = refresh(key: key, includeOptimize: false, force: true, showLoading: true)
-                async let all = refreshQuietly(key: allKey, includeOptimize: false, force: false)
-                _ = await (main, all)
+                await self.refresh(key: key, includeOptimize: false, force: false, showLoading: false, acceptAfter: gate)
             }
+            _ = await allTask?.value
         }
     }
 
-    private var inFlightKeys: [PayloadCacheKey: Date] = [:]
+    /// Start the all-provider fetch immediately and hand back its task, so a
+    /// scoped fetch can run alongside it and merely AWAIT it before accepting.
+    private func startAllProviderEvidence(
+        key: PayloadCacheKey,
+        force: Bool,
+        qualityOfService: QualityOfService = .userInitiated
+    ) -> Task<Bool, Never> {
+        Task { [weak self] in
+            guard let self else { return false }
+            return await self.refreshQuietly(
+                key: key,
+                includeOptimize: false,
+                force: force,
+                qualityOfService: qualityOfService
+            )
+        }
+    }
+
+    /// One occupancy of a key's in-flight slot. The token identifies WHICH
+    /// fetch owns the slot right now: the watchdog and the display-sleep reset
+    /// can evict an occupant, after which a later fetch legitimately claims the
+    /// same key. Without the token the evicted fetch's `defer` would then clear
+    /// the NEW owner's slot and resume its waiters, so a task parked on the
+    /// live fetch woke to an empty cache and reported failure.
+    private struct InFlightSlot {
+        let startedAt: Date
+        let token: UUID
+    }
+
+    private var inFlightKeys: [PayloadCacheKey: InFlightSlot] = [:]
+    private var inFlightWaiters: [PayloadCacheKey: [CheckedContinuation<Void, Never>]] = [:]
+
+    private func waitForInFlight(_ key: PayloadCacheKey) async {
+        guard inFlightKeys[key] != nil else { return }
+        await withCheckedContinuation { continuation in
+            guard inFlightKeys[key] != nil else {
+                continuation.resume()
+                return
+            }
+            inFlightWaiters[key, default: []].append(continuation)
+        }
+    }
+
+    private func claimInFlight(_ key: PayloadCacheKey) -> UUID {
+        let token = UUID()
+        inFlightKeys[key] = InFlightSlot(startedAt: Date(), token: token)
+        return token
+    }
+
+    /// Release the slot only if this fetch still owns it. A fetch whose slot was
+    /// evicted has nothing left to release and no waiters of its own.
+    private func finishInFlight(for key: PayloadCacheKey, token: UUID) {
+        guard inFlightKeys[key]?.token == token else { return }
+        forceFinishInFlight(for: key)
+    }
+
+    /// Evict whoever holds the slot and wake everyone parked on it. Only the
+    /// watchdog and the pipeline resets use this: they are declaring the slot
+    /// dead, not reporting a fetch that ended.
+    private func forceFinishInFlight(for key: PayloadCacheKey) {
+        inFlightKeys[key] = nil
+        let waiters = inFlightWaiters.removeValue(forKey: key) ?? []
+        for waiter in waiters {
+            waiter.resume()
+        }
+    }
+
+    private func finishAllInFlight() {
+        let keys = Set(inFlightKeys.keys).union(inFlightWaiters.keys)
+        for key in keys {
+            forceFinishInFlight(for: key)
+        }
+    }
 
     func resetLoadingState() {
         payloadRefreshGeneration &+= 1
         loadingCountsByKey.removeAll()
         loadingStartedAtByKey.removeAll()
-        inFlightKeys.removeAll()
+        finishAllInFlight()
         attemptedKeys.removeAll()
     }
 
@@ -570,8 +905,8 @@ final class AppStore {
         let staleLoading = loadingStartedAtByKey.filter {
             now.timeIntervalSince($0.value) > loadingWatchdogSeconds
         }
-        let staleInFlight = inFlightKeys.filter { (key, insertedAt) in
-            now.timeIntervalSince(insertedAt) > loadingWatchdogSeconds &&
+        let staleInFlight = inFlightKeys.filter { (key, slot) in
+            now.timeIntervalSince(slot.startedAt) > loadingWatchdogSeconds &&
             loadingStartedAtByKey[key] == nil
         }
         guard !staleLoading.isEmpty || !staleInFlight.isEmpty else { return false }
@@ -581,15 +916,15 @@ final class AppStore {
                   Int(now.timeIntervalSince(started)), key.label, key.provider.rawValue)
             loadingCountsByKey[key] = nil
             loadingStartedAtByKey[key] = nil
-            inFlightKeys[key] = nil
+            forceFinishInFlight(for: key)
             if cache[key] == nil {
                 lastErrorByKey[key] = "Refresh took longer than expected. CodeBurn will keep retrying in the background."
             }
         }
-        for (key, insertedAt) in staleInFlight {
+        for (key, slot) in staleInFlight {
             NSLog("CodeBurn: orphaned in-flight key stuck for %ds on %@/%@ — clearing",
-                  Int(now.timeIntervalSince(insertedAt)), key.label, key.provider.rawValue)
-            inFlightKeys[key] = nil
+                  Int(now.timeIntervalSince(slot.startedAt)), key.label, key.provider.rawValue)
+            forceFinishInFlight(for: key)
         }
         return true
     }
@@ -624,7 +959,7 @@ final class AppStore {
             cache.removeAll()
             loadingCountsByKey.removeAll()
             loadingStartedAtByKey.removeAll()
-            inFlightKeys.removeAll()
+            finishAllInFlight()
             attemptedKeys.removeAll()
             lastErrorByKey.removeAll()
             cacheDate = today
@@ -643,6 +978,128 @@ final class AppStore {
         if !valid || payload.claudeConfigs?.selectedId != selected {
             selectedClaudeConfigSourceId = nil
         }
+    }
+
+    /// A cached payload the refresh paths may keep instead of refetching. A
+    /// contradicting one is refetched; one already VERIFIED as contradicting is
+    /// not, or every poll would re-run the expensive one-shot parse forever.
+    private func cachedPayloadIsUsable(_ cached: CachedPayload, for key: PayloadCacheKey) -> Bool {
+        cached.contradictsAll || !providerPayloadContradictsAll(cached.payload, for: key)
+    }
+
+    private func consistentCachedPayload(for key: PayloadCacheKey) -> MenubarPayload? {
+        guard let cached = cache[key] else { return nil }
+        // A payload already verified by a resident-bypassing re-parse is served
+        // even though it still disagrees: it is the CLI's real answer, and
+        // `selectedPayloadMayBeIncomplete` is what tells the user so.
+        if cached.contradictsAll { return cached.payload }
+        guard !providerPayloadContradictsAll(cached.payload, for: key) else { return nil }
+        return cached.payload
+    }
+
+    /// The visible payload was verified against its all-provider slice and
+    /// still disagreed. The popover shows one subdued line rather than an error.
+    var selectedPayloadMayBeIncomplete: Bool {
+        if cache[currentKey]?.contradictsAll == true { return true }
+        return effectiveSelectedScope == .combined && cache[localCurrentKey]?.contradictsAll == true
+    }
+
+    /// An all-provider payload and its scoped sibling describe the same period,
+    /// day selection, scope, and Claude config. If the all-provider slice has a
+    /// positive contribution for the selected provider, a scoped 0/0 payload is
+    /// stale or incomplete rather than an honest answer. This is the exact
+    /// contract that prevents a provider tab advertising spend and then opening
+    /// onto a fabricated zero.
+    private func providerPayloadContradictsAll(_ payload: MenubarPayload, for key: PayloadCacheKey) -> Bool {
+        guard key.scope == .local,
+              key.provider != .all else { return false }
+
+        let allKey = PayloadCacheKey(
+            scope: .local,
+            period: key.period,
+            provider: .all,
+            day: key.day,
+            days: key.days,
+            claudeConfigSourceId: key.claudeConfigSourceId
+        )
+        guard let all = cache[allKey]?.payload else { return false }
+        let providerKeys = Set(key.provider.providerKeys + [key.provider.cliArg])
+        let detail = all.current.providerDetails.first(where: {
+            providerKeys.contains($0.id.lowercased()) || providerKeys.contains($0.label.lowercased())
+        })
+        let allCost = detail?.cost ?? key.provider.providerKeys.reduce(0.0) { sum, providerKey in
+            sum + (all.current.providers[providerKey] ?? 0)
+        }
+        let allCalls = detail?.calls
+        let allHasUsage = detail?.hasUsage ?? (allCost > 0)
+
+        // Cost and call dimensions are independent. A scoped result that keeps
+        // its calls but loses the spend (or vice versa) is still stale.
+        if allCost > 0, payload.current.cost == 0 { return true }
+        if let allCalls, allCalls > 0, payload.current.calls == 0 { return true }
+
+        // `hasUsage` is authoritative for subscription/token-only providers,
+        // where both cost and behavioral calls may legitimately be zero.
+        let scopedDetail = payload.current.providerDetails.first(where: {
+            providerKeys.contains($0.id.lowercased()) || providerKeys.contains($0.label.lowercased())
+        })
+        let scopedHasUsage = scopedDetail?.hasUsage ?? (
+            payload.current.cost > 0
+                || payload.current.calls > 0
+                || payload.current.sessions > 0
+                || payload.current.inputTokens > 0
+                || payload.current.outputTokens > 0
+        )
+        return allHasUsage && !scopedHasUsage
+    }
+
+    private func fetchPayload(
+        for key: PayloadCacheKey,
+        includeOptimize: Bool,
+        qualityOfService: QualityOfService,
+        acceptAfter: (@Sendable () async -> Void)? = nil
+    ) async throws -> (payload: MenubarPayload, contradictsAll: Bool) {
+        let fresh = try await DataClient.fetch(
+            period: key.period,
+            day: key.day,
+            days: key.days,
+            provider: key.provider,
+            includeOptimize: includeOptimize,
+            scope: key.scope,
+            claudeConfigSourceId: key.claudeConfigSourceId,
+            qualityOfService: qualityOfService
+        )
+        // The all-provider slice is the evidence providerPayloadContradictsAll
+        // reads. It is awaited HERE, after this fetch has already run, so the
+        // two parses overlap and only the ACCEPTANCE is ordered. Waiting for it
+        // before starting cost a full serialized parse on every tab click.
+        await acceptAfter?()
+        guard providerPayloadContradictsAll(fresh, for: key) else { return (fresh, false) }
+
+        NSLog("CodeBurn: resident %@ payload contradicted its all-provider slice; verifying with a one-shot parse",
+              key.provider.rawValue)
+        let verified = try await DataClient.fetch(
+            period: key.period,
+            day: key.day,
+            days: key.days,
+            provider: key.provider,
+            includeOptimize: includeOptimize,
+            scope: key.scope,
+            claudeConfigSourceId: key.claudeConfigSourceId,
+            bypassResident: true,
+            qualityOfService: qualityOfService
+        )
+        // A second contradiction is not an error to show the user. The one-shot
+        // parse bypassed the resident child, so this IS what the CLI reports for
+        // this provider right now; throwing here replaced a real number with an
+        // error banner and left the tab with nothing at all. Serve it, flagged,
+        // and let the popover add one subdued line saying it may be incomplete.
+        let stillContradicts = providerPayloadContradictsAll(verified, for: key)
+        if stillContradicts {
+            NSLog("CodeBurn: verified %@ payload still contradicted its all-provider slice; serving it as possibly incomplete",
+                  key.provider.rawValue)
+        }
+        return (verified, stillContradicts)
     }
 
     @discardableResult
@@ -680,29 +1137,39 @@ final class AppStore {
         showLoading: Bool = false,
         qualityOfService: QualityOfService = .userInitiated
     ) async -> Bool {
-        if effectiveSelectedScope == .combined {
+        let keys = selectionRefreshKeys()
+        // Runs concurrently with the scoped fetch below; only the acceptance is
+        // ordered behind it (see fetchPayload's acceptAfter).
+        let allTask: Task<Bool, Never>? = keys.scoped.provider == .all
+            ? nil
+            : startAllProviderEvidence(key: keys.all, force: force, qualityOfService: qualityOfService)
+        let gate: (@Sendable () async -> Void)? = allTask.map { task in { @Sendable in _ = await task.value } }
+        if keys.scoped.scope == .combined {
             async let local = refreshQuietly(
-                key: localCurrentKey,
+                key: keys.local,
                 includeOptimize: includeOptimize,
                 force: force,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: gate
             )
             async let combined = refresh(
-                key: currentKey,
+                key: keys.scoped,
                 includeOptimize: includeOptimize,
                 force: force,
                 showLoading: showLoading,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: gate
             )
             let (localSucceeded, combinedSucceeded) = await (local, combined)
             return localSucceeded && combinedSucceeded
         } else {
             return await refresh(
-                key: currentKey,
+                key: keys.scoped,
                 includeOptimize: includeOptimize,
                 force: force,
                 showLoading: showLoading,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: gate
             )
         }
     }
@@ -716,13 +1183,34 @@ final class AppStore {
             days: selectedDays,
             claudeConfigSourceId: selectedClaudeConfigSourceId
         )
+        let localKey = PayloadCacheKey(
+            scope: .local,
+            period: scopedKey.period,
+            provider: scopedKey.provider,
+            day: scopedKey.day,
+            days: scopedKey.days,
+            claudeConfigSourceId: scopedKey.claudeConfigSourceId
+        )
+        let allKey = PayloadCacheKey(
+            scope: .local,
+            period: scopedKey.period,
+            provider: .all,
+            day: scopedKey.day,
+            days: scopedKey.days,
+            claudeConfigSourceId: scopedKey.claudeConfigSourceId
+        )
+        let allTask: Task<Bool, Never>? = scopedKey.provider == .all
+            ? nil
+            : startAllProviderEvidence(key: allKey, force: force)
+        let gate: (@Sendable () async -> Void)? = allTask.map { task in { @Sendable in _ = await task.value } }
         if scope == .combined {
-            async let local = refreshQuietly(key: localCurrentKey, includeOptimize: false, force: false)
-            async let combined = refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
+            async let local = refreshQuietly(key: localKey, includeOptimize: false, force: false, acceptAfter: gate)
+            async let combined = refreshQuietly(key: scopedKey, includeOptimize: false, force: force, acceptAfter: gate)
             _ = await (local, combined)
         } else {
-            await refreshQuietly(key: scopedKey, includeOptimize: false, force: force)
+            await refreshQuietly(key: scopedKey, includeOptimize: false, force: force, acceptAfter: gate)
         }
+        _ = await allTask?.value
     }
 
     @discardableResult
@@ -731,15 +1219,26 @@ final class AppStore {
         includeOptimize: Bool,
         force: Bool = false,
         showLoading: Bool = false,
-        qualityOfService: QualityOfService = .userInitiated
+        qualityOfService: QualityOfService = .userInitiated,
+        acceptAfter: (@Sendable () async -> Void)? = nil
     ) async -> Bool {
         invalidateStaleDayCache()
         let cacheDateAtStart = cacheDate
         let generationAtStart = payloadRefreshGeneration
         if Task.isCancelled { return false }
-        if !force, cache[key]?.isFresh == true { return true }
-        if inFlightKeys[key] != nil { return false }
-        inFlightKeys[key] = Date()
+        if !force,
+           let cached = cache[key],
+           cached.isFresh,
+           cachedPayloadIsUsable(cached, for: key) { return true }
+        // Join an in-flight fetch instead of reporting failure. Returning false
+        // here made recoverFromStuckLoading() announce a failed recovery while a
+        // perfectly healthy fetch was still running, which is what the quiet
+        // path already avoided by waiting.
+        if inFlightKeys[key] != nil {
+            await waitForInFlight(key)
+            return consistentCachedPayload(for: key) != nil
+        }
+        let inFlightToken = claimInFlight(key)
         attemptedKeys.insert(key)
         lastErrorByKey[key] = nil
         let didShowLoading = showLoading || cache[key] == nil
@@ -759,7 +1258,7 @@ final class AppStore {
         }
         defer {
             let abandonedAttempt = Task.isCancelled || generationAtStart != payloadRefreshGeneration
-            inFlightKeys[key] = nil
+            finishInFlight(for: key, token: inFlightToken)
             if didShowLoading {
                 finishLoading(for: key)
             }
@@ -769,15 +1268,11 @@ final class AppStore {
         }
         var succeeded = false
         do {
-            let fresh = try await DataClient.fetch(
-                period: key.period,
-                day: key.day,
-                days: key.days,
-                provider: key.provider,
+            let fresh = try await fetchPayload(
+                for: key,
                 includeOptimize: includeOptimize,
-                scope: key.scope,
-                claudeConfigSourceId: key.claudeConfigSourceId,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: acceptAfter
             )
             if generationAtStart != payloadRefreshGeneration {
                 NSLog("CodeBurn: dropping fetch result for \(key.label)/\(key.provider.rawValue) — refresh pipeline reset mid-fetch")
@@ -800,8 +1295,9 @@ final class AppStore {
                 NSLog("CodeBurn: dropping fetch result for \(key.label)/\(key.provider.rawValue) — calendar rolled mid-fetch")
                 return false
             }
-            cache[key] = CachedPayload(payload: fresh, fetchedAt: Date())
-            reconcileClaudeConfigSelection(from: fresh, for: key)
+            cache[key] = CachedPayload(payload: fresh.payload, fetchedAt: Date(), contradictsAll: fresh.contradictsAll)
+            Telemetry.shared.trackUsageSnapshot(fresh.payload.telemetrySnapshot)
+            reconcileClaudeConfigSelection(from: fresh.payload, for: key)
             lastSuccessByKey[key] = Date()
             lastErrorByKey[key] = nil
             succeeded = true
@@ -810,14 +1306,9 @@ final class AppStore {
             NSLog("CodeBurn: fetch failed for \(key.label)/\(key.provider.rawValue): \(error)")
             if includeOptimize, cache[key] == nil {
                 do {
-                    let fallback = try await DataClient.fetch(
-                        period: key.period,
-                        day: key.day,
-                        days: key.days,
-                        provider: key.provider,
+                    let fallback = try await fetchPayload(
+                        for: key,
                         includeOptimize: false,
-                        scope: key.scope,
-                        claudeConfigSourceId: key.claudeConfigSourceId,
                         qualityOfService: qualityOfService
                     )
                     guard !Task.isCancelled else { return false }
@@ -826,8 +1317,8 @@ final class AppStore {
                         invalidateStaleDayCache()
                         return false
                     }
-                    cache[key] = CachedPayload(payload: fallback, fetchedAt: Date())
-                    reconcileClaudeConfigSelection(from: fallback, for: key)
+                    cache[key] = CachedPayload(payload: fallback.payload, fetchedAt: Date(), contradictsAll: fallback.contradictsAll)
+                    reconcileClaudeConfigSelection(from: fallback.payload, for: key)
                     lastSuccessByKey[key] = Date()
                     lastErrorByKey[key] = nil
                     return true
@@ -885,12 +1376,19 @@ final class AppStore {
         key: PayloadCacheKey,
         includeOptimize: Bool,
         force: Bool = false,
-        qualityOfService: QualityOfService = .userInitiated
+        qualityOfService: QualityOfService = .userInitiated,
+        acceptAfter: (@Sendable () async -> Void)? = nil
     ) async -> Bool {
         invalidateStaleDayCache()
-        if !force, cache[key]?.isFresh == true { return true }
-        if inFlightKeys[key] != nil { return false }
-        inFlightKeys[key] = Date()
+        if !force,
+           let cached = cache[key],
+           cached.isFresh,
+           cachedPayloadIsUsable(cached, for: key) { return true }
+        if inFlightKeys[key] != nil {
+            await waitForInFlight(key)
+            return consistentCachedPayload(for: key) != nil
+        }
+        let inFlightToken = claimInFlight(key)
         attemptedKeys.insert(key)
         let cacheDateAtStart = cacheDate
         let generationAtStart = payloadRefreshGeneration
@@ -898,18 +1396,14 @@ final class AppStore {
             NSLog("CodeBurn: refreshing stale today status payload after %ds", age)
         }
         defer {
-            inFlightKeys[key] = nil
+            finishInFlight(for: key, token: inFlightToken)
         }
         do {
-            let fresh = try await DataClient.fetch(
-                period: key.period,
-                day: key.day,
-                days: key.days,
-                provider: key.provider,
+            let fresh = try await fetchPayload(
+                for: key,
                 includeOptimize: includeOptimize,
-                scope: key.scope,
-                claudeConfigSourceId: key.claudeConfigSourceId,
-                qualityOfService: qualityOfService
+                qualityOfService: qualityOfService,
+                acceptAfter: acceptAfter
             )
             if generationAtStart != payloadRefreshGeneration {
                 NSLog("CodeBurn: dropping quiet fetch result for \(key.label) — refresh pipeline reset mid-fetch")
@@ -921,8 +1415,9 @@ final class AppStore {
                 invalidateStaleDayCache()
                 return false
             }
-            cache[key] = CachedPayload(payload: fresh, fetchedAt: Date())
-            reconcileClaudeConfigSelection(from: fresh, for: key)
+            cache[key] = CachedPayload(payload: fresh.payload, fetchedAt: Date(), contradictsAll: fresh.contradictsAll)
+            Telemetry.shared.trackUsageSnapshot(fresh.payload.telemetrySnapshot)
+            reconcileClaudeConfigSelection(from: fresh.payload, for: key)
             lastSuccessByKey[key] = Date()
             lastErrorByKey[key] = nil
         } catch {
@@ -935,7 +1430,8 @@ final class AppStore {
         return true
     }
 
-    /// User-initiated. Reads Claude's source (this is what triggers the macOS keychain
+    /// User-initiated. Reuses Claude's source credential; only the source-owned
+    /// Keychain access may ask for consent, and only on this explicit action.
     func activateClaudeFromDormant() async {
         guard case .dormant = subscriptionLoadState else { return }
         await bootstrapSubscription()
@@ -946,6 +1442,74 @@ final class AppStore {
         await bootstrapCodex()
     }
 
+    private func beginClaudeQuotaRefresh() -> QuotaRefreshToken {
+        claudeRefreshRequestGen &+= 1
+        let token = QuotaRefreshToken(
+            requestGeneration: claudeRefreshRequestGen,
+            lifecycleGeneration: claudeRefreshGen
+        )
+        if claudeRefreshInFlightRequest == nil {
+            claudeRefreshRestoreState = subscriptionLoadState
+        }
+        claudeRefreshInFlightRequest = token.requestGeneration
+        // A populated subscription remains available to the plan bar, but its
+        // pace projection must be treated as stale for the whole await.
+        subscriptionLoadState = .loading
+        return token
+    }
+
+    private func isCurrentClaudeQuotaRefresh(_ token: QuotaRefreshToken) -> Bool {
+        token.lifecycleGeneration == claudeRefreshGen
+            && token.requestGeneration == claudeRefreshRequestGen
+            && claudeRefreshInFlightRequest == token.requestGeneration
+    }
+
+    private func finishClaudeQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentClaudeQuotaRefresh(token) else { return }
+        claudeRefreshInFlightRequest = nil
+        claudeRefreshRestoreState = nil
+    }
+
+    private func restoreClaudeQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentClaudeQuotaRefresh(token) else { return }
+        subscriptionLoadState = claudeRefreshRestoreState
+            ?? (subscription == nil ? .failed : .loaded)
+        finishClaudeQuotaRefresh(token)
+    }
+
+    private func beginCodexQuotaRefresh() -> QuotaRefreshToken {
+        codexRefreshRequestGen &+= 1
+        let token = QuotaRefreshToken(
+            requestGeneration: codexRefreshRequestGen,
+            lifecycleGeneration: codexRefreshGen
+        )
+        if codexRefreshInFlightRequest == nil {
+            codexRefreshRestoreState = codexLoadState
+        }
+        codexRefreshInFlightRequest = token.requestGeneration
+        codexLoadState = .loading
+        return token
+    }
+
+    private func isCurrentCodexQuotaRefresh(_ token: QuotaRefreshToken) -> Bool {
+        token.lifecycleGeneration == codexRefreshGen
+            && token.requestGeneration == codexRefreshRequestGen
+            && codexRefreshInFlightRequest == token.requestGeneration
+    }
+
+    private func finishCodexQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentCodexQuotaRefresh(token) else { return }
+        codexRefreshInFlightRequest = nil
+        codexRefreshRestoreState = nil
+    }
+
+    private func restoreCodexQuotaRefresh(_ token: QuotaRefreshToken) {
+        guard isCurrentCodexQuotaRefresh(token) else { return }
+        codexLoadState = codexRefreshRestoreState
+            ?? (codexUsage == nil ? .failed : .loaded)
+        finishCodexQuotaRefresh(token)
+    }
+
     func bootstrapSubscription() async {
         subscriptionLoadState = .bootstrapping
         do {
@@ -953,7 +1517,7 @@ final class AppStore {
             subscription = usage
             subscriptionError = nil
             subscriptionLoadState = .loaded
-            await captureSnapshots(for: usage)
+            await captureSnapshots(for: usage, baselineIsTrusted: false)
         } catch let err as ClaudeSubscriptionService.FetchError {
             applyFetchError(err)
         } catch {
@@ -962,8 +1526,8 @@ final class AppStore {
         }
     }
 
-    /// Background refresh. No-op if the user has not yet connected. Never triggers
-    /// a keychain prompt — uses our own keychain item exclusively.
+    /// Background refresh. No-op if the user has not yet connected. Source reads
+    /// are prompt-suppressed and any historical CodeBurn cache is fallback-only.
     func refreshSubscription() async {
         _ = await refreshSubscriptionReportingSuccess()
     }
@@ -973,55 +1537,92 @@ final class AppStore {
     /// rather than every attempt.
     @discardableResult
     func refreshSubscriptionReportingSuccess() async -> Bool {
-        if case .dormant = subscriptionLoadState { return false }
-        guard ClaudeCredentialStore.isBootstrapCompleted else {
+        guard claudeQuotaBootstrapChecker() else {
             if subscriptionLoadState != .notBootstrapped {
                 subscriptionLoadState = .notBootstrapped
             }
             return false
         }
-        let gen = claudeRefreshGen
-        if subscription == nil { subscriptionLoadState = .loading }
+        // Read before `beginClaudeQuotaRefresh` moves the state to `.loading`;
+        // with a refresh already in flight the restore state is the real one.
+        let stateBeforeFetch = claudeRefreshInFlightRequest == nil
+            ? subscriptionLoadState
+            : (claudeRefreshRestoreState ?? subscriptionLoadState)
+        let token = beginClaudeQuotaRefresh()
         do {
-            guard let usage = try await ClaudeSubscriptionService.refreshIfBootstrapped() else {
+            guard let usage = try await claudeQuotaFetcher() else {
+                restoreClaudeQuotaRefresh(token)
                 return false
             }
             // Disconnect-during-fetch guard: if the user clicked Disconnect
             // while we were awaiting Anthropic, the generation token will
             // have advanced and we must drop this result instead of writing
             // it back over the freshly-cleared state.
-            guard gen == claudeRefreshGen else { return false }
+            guard isCurrentClaudeQuotaRefresh(token) else { return false }
+            guard !Task.isCancelled else {
+                restoreClaudeQuotaRefresh(token)
+                return false
+            }
             subscription = usage
             subscriptionError = nil
             subscriptionLoadState = .loaded
-            await captureSnapshots(for: usage)
+            finishClaudeQuotaRefresh(token)
+            await captureSnapshots(
+                for: usage,
+                baselineIsTrusted: stateBeforeFetch.earlyResetBaselineIsTrusted
+            )
             return true
         } catch let err as ClaudeSubscriptionService.FetchError {
-            guard gen == claudeRefreshGen else { return false }
+            guard isCurrentClaudeQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(err) {
+                restoreClaudeQuotaRefresh(token)
+                return false
+            }
             applyFetchError(err)
+            finishClaudeQuotaRefresh(token)
             return false
         } catch {
-            guard gen == claudeRefreshGen else { return false }
-            subscriptionError = sanitizeForUI(String(describing: error))
+            guard isCurrentClaudeQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(error) {
+                restoreClaudeQuotaRefresh(token)
+                return false
+            }
+            subscriptionError = sanitizeForUI(error.localizedDescription)
             subscriptionLoadState = .failed
+            finishClaudeQuotaRefresh(token)
             return false
         }
     }
 
-    /// User-initiated disconnect — clears our keychain item and bootstrap flag,
+    /// User-initiated disconnect — clears CodeBurn continuity state, any legacy
+    /// private cache, and the bootstrap flag,
     /// plus all derived state so a reconnect (potentially under a different
     /// account or tier) starts clean. capacityEstimates and the snapshot store
     /// would otherwise contaminate "Based on last cycle" projections.
     func disconnectSubscription() {
-        ClaudeSubscriptionService.disconnect()
+        let result = ClaudeSubscriptionService.disconnect()
         // Bump the generation token so any in-flight refreshSubscription that
         // resumes after this point detects the disconnect and discards its
         // result instead of re-populating the cleared state.
+        let refreshRestoreState = claudeRefreshRestoreState
         claudeRefreshGen &+= 1
+        claudeRefreshInFlightRequest = nil
+        claudeRefreshRestoreState = nil
+        guard result.isSuccess else {
+            // Nothing was removed, so nothing is disconnected. Leave the
+            // connected state exactly as it was — the bootstrap flag is still
+            // set, Disconnect stays available, and the banner says to retry.
+            if let refreshRestoreState {
+                subscriptionLoadState = refreshRestoreState
+            }
+            subscriptionError = "Could not fully remove the local Claude credential cache. Disconnect again to retry."
+            return
+        }
         subscription = nil
         subscriptionError = nil
         subscriptionLoadState = .notBootstrapped
         capacityEstimates = [:]
+        earlyQuotaResetMonitor.forget(providerID: CapacityDockProvider.claude.rawValue)
         Task.detached { await SubscriptionSnapshotStore.clearAll() }
         // Notify the AppDelegate to clear its cadence-loop anchor so the next
         // reconnect doesn't measure against a pre-disconnect timestamp.
@@ -1037,10 +1638,14 @@ final class AppStore {
             codexUsage = usage
             codexError = nil
             codexLoadState = .loaded
+            await codexBankedResetAnnouncer.observe(usage.resetCredits)
+            // A bootstrap is the far side of a gap, so this fetch only seeds a
+            // baseline — the same discipline `bootstrapSubscription` uses.
+            await detectCodexEarlyResets(baselineIsTrusted: false)
         } catch let err as CodexSubscriptionService.FetchError {
             applyCodexFetchError(err)
         } catch {
-            codexError = sanitizeForUI(String(describing: error))
+            codexError = sanitizeForUI(error.localizedDescription)
             codexLoadState = .failed
         }
     }
@@ -1051,40 +1656,87 @@ final class AppStore {
 
     @discardableResult
     func refreshCodexReportingSuccess() async -> Bool {
-        if case .dormant = codexLoadState { return false }
-        guard CodexCredentialStore.isBootstrapCompleted else {
+        if case .dormant = codexLoadState, !codexQuotaBootstrapChecker() {
+            await bootstrapCodex()
+            return codexLoadState == .loaded
+        }
+        guard codexQuotaBootstrapChecker() else {
             if codexLoadState != .notBootstrapped { codexLoadState = .notBootstrapped }
             return false
         }
-        let gen = codexRefreshGen
-        if codexUsage == nil { codexLoadState = .loading }
+        // Read before `beginCodexQuotaRefresh` moves the state to `.loading`;
+        // with a refresh already in flight the restore state is the real one.
+        let stateBeforeFetch = codexRefreshInFlightRequest == nil
+            ? codexLoadState
+            : (codexRefreshRestoreState ?? codexLoadState)
+        let token = beginCodexQuotaRefresh()
         do {
-            guard let usage = try await CodexSubscriptionService.refreshIfBootstrapped() else {
+            guard let usage = try await codexQuotaFetcher() else {
+                restoreCodexQuotaRefresh(token)
                 return false
             }
-            guard gen == codexRefreshGen else { return false }
+            guard isCurrentCodexQuotaRefresh(token) else { return false }
+            guard !Task.isCancelled else {
+                restoreCodexQuotaRefresh(token)
+                return false
+            }
             codexUsage = usage
             codexError = nil
             codexLoadState = .loaded
+            finishCodexQuotaRefresh(token)
+            // After the refresh is finished, not inside it: announcing is a
+            // side-effect of a successful fetch and must not be able to hold the
+            // single-flight token open.
+            await codexBankedResetAnnouncer.observe(usage.resetCredits)
+            await detectCodexEarlyResets(
+                baselineIsTrusted: stateBeforeFetch.earlyResetBaselineIsTrusted
+            )
             return true
         } catch let err as CodexSubscriptionService.FetchError {
-            guard gen == codexRefreshGen else { return false }
+            guard isCurrentCodexQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(err) {
+                restoreCodexQuotaRefresh(token)
+                return false
+            }
             applyCodexFetchError(err)
+            finishCodexQuotaRefresh(token)
             return false
         } catch {
-            guard gen == codexRefreshGen else { return false }
-            codexError = sanitizeForUI(String(describing: error))
+            guard isCurrentCodexQuotaRefresh(token) else { return false }
+            if Task.isCancelled || quotaFetchWasCancelled(error) {
+                restoreCodexQuotaRefresh(token)
+                return false
+            }
+            codexError = sanitizeForUI(error.localizedDescription)
             codexLoadState = .failed
+            finishCodexQuotaRefresh(token)
             return false
         }
     }
 
     func disconnectCodex() {
-        CodexSubscriptionService.disconnect()
+        let result = CodexSubscriptionService.disconnect()
+        let refreshRestoreState = codexRefreshRestoreState
         codexRefreshGen &+= 1
+        codexRefreshInFlightRequest = nil
+        codexRefreshRestoreState = nil
+        guard result.isSuccess else {
+            // Nothing removed means nothing disconnected; keep state intact so
+            // Disconnect stays available for a retry.
+            if let refreshRestoreState {
+                codexLoadState = refreshRestoreState
+            }
+            codexError = "Could not fully remove the local Codex credential cache. Disconnect again to retry."
+            return
+        }
         codexUsage = nil
         codexError = nil
         codexLoadState = .notBootstrapped
+        earlyQuotaResetMonitor.forget(providerID: CapacityDockProvider.codex.rawValue)
+        // Same reason the snapshot store is wiped on the Claude side: a
+        // reconnect under a different account must baseline again rather than
+        // announce that account's entire inventory as new grants.
+        Task.detached { await CodexBankedResetStore.clearAll() }
         NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
     }
 
@@ -1101,6 +1753,361 @@ final class AppStore {
             codexLoadState = .noCredentials
         } else {
             codexLoadState = .failed
+        }
+    }
+
+    // MARK: - Kimi Code
+
+    /// Unlike Claude/Codex there is no keychain bootstrap: reading the CLI's
+    /// credential file is prompt-free, so the first refresh tick activates
+    /// the dormant state automatically.
+    func bootstrapKimi() async {
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = kimiRefreshGen
+        kimiLoadState = .bootstrapping
+        do {
+            let usage = try await KimiSubscriptionService.refresh()
+            guard gen == kimiRefreshGen else { return }
+            kimiUsage = usage
+            kimiError = nil
+            kimiLoadState = .loaded
+        } catch let err as KimiSubscriptionService.FetchError {
+            guard gen == kimiRefreshGen else { return }
+            applyKimiFetchError(err)
+        } catch {
+            guard gen == kimiRefreshGen else { return }
+            kimiError = sanitizeForUI(error.localizedDescription)
+            kimiLoadState = .failed
+        }
+    }
+
+    func refreshKimi() async {
+        _ = await refreshKimiReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshKimiReportingSuccess() async -> Bool {
+        if case .dormant = kimiLoadState {
+            await bootstrapKimi()
+            return kimiLoadState == .loaded
+        }
+        guard KimiSubscriptionService.hasCredential else {
+            if kimiLoadState != .notBootstrapped { kimiLoadState = .notBootstrapped }
+            return false
+        }
+        let gen = kimiRefreshGen
+        if kimiUsage == nil { kimiLoadState = .loading }
+        do {
+            let usage = try await KimiSubscriptionService.refresh()
+            guard gen == kimiRefreshGen else { return false }
+            kimiUsage = usage
+            kimiError = nil
+            kimiLoadState = .loaded
+            return true
+        } catch let err as KimiSubscriptionService.FetchError {
+            guard gen == kimiRefreshGen else { return false }
+            applyKimiFetchError(err)
+            return false
+        } catch {
+            guard gen == kimiRefreshGen else { return false }
+            kimiError = sanitizeForUI(error.localizedDescription)
+            kimiLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectKimi() {
+        KimiSubscriptionService.disconnect()
+        kimiRefreshGen &+= 1
+        kimiUsage = nil
+        kimiError = nil
+        kimiLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyKimiFetchError(_ err: KimiSubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        kimiError = sanitized
+        if case .noCredentials = err {
+            kimiLoadState = .noCredentials
+        } else if err.isTerminal {
+            kimiLoadState = .terminalFailure(reason: sanitized)
+        } else if let retryAt = err.rateLimitRetryAt {
+            kimiLoadState = .transientFailure(retryAt: retryAt)
+        } else {
+            kimiLoadState = .failed
+        }
+    }
+
+    // MARK: - Gemini
+
+    /// Same prompt-free activation as Kimi: reading the CLI's credential file
+    /// needs no keychain, so the first refresh tick activates dormant state.
+    func bootstrapGemini() async {
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = geminiRefreshGen
+        geminiLoadState = .bootstrapping
+        do {
+            let usage = try await GeminiSubscriptionService.refresh()
+            guard gen == geminiRefreshGen else { return }
+            geminiUsage = usage
+            geminiError = nil
+            geminiLoadState = .loaded
+        } catch let err as GeminiSubscriptionService.FetchError {
+            guard gen == geminiRefreshGen else { return }
+            applyGeminiFetchError(err)
+        } catch {
+            guard gen == geminiRefreshGen else { return }
+            geminiError = sanitizeForUI(error.localizedDescription)
+            geminiLoadState = .failed
+        }
+    }
+
+    func refreshGemini() async {
+        _ = await refreshGeminiReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshGeminiReportingSuccess() async -> Bool {
+        if case .dormant = geminiLoadState {
+            await bootstrapGemini()
+            return geminiLoadState == .loaded
+        }
+        guard GeminiSubscriptionService.hasCredential else {
+            if geminiLoadState != .notBootstrapped { geminiLoadState = .notBootstrapped }
+            return false
+        }
+        let gen = geminiRefreshGen
+        if geminiUsage == nil { geminiLoadState = .loading }
+        do {
+            let usage = try await GeminiSubscriptionService.refresh()
+            guard gen == geminiRefreshGen else { return false }
+            geminiUsage = usage
+            geminiError = nil
+            geminiLoadState = .loaded
+            return true
+        } catch let err as GeminiSubscriptionService.FetchError {
+            guard gen == geminiRefreshGen else { return false }
+            applyGeminiFetchError(err)
+            return false
+        } catch {
+            guard gen == geminiRefreshGen else { return false }
+            geminiError = sanitizeForUI(error.localizedDescription)
+            geminiLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectGemini() {
+        GeminiSubscriptionService.disconnect()
+        geminiRefreshGen &+= 1
+        geminiUsage = nil
+        geminiError = nil
+        geminiLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyGeminiFetchError(_ err: GeminiSubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        geminiError = sanitized
+        if case .noCredentials = err {
+            geminiLoadState = .noCredentials
+        } else if err.isTerminal {
+            geminiLoadState = .terminalFailure(reason: sanitized)
+        } else if let retryAt = err.rateLimitRetryAt {
+            geminiLoadState = .transientFailure(retryAt: retryAt)
+        } else {
+            // 5xx / network blips back off automatically, mirroring the
+            // Electron provider's transientFailure mapping.
+            geminiLoadState = .transientFailure(retryAt: nil)
+        }
+    }
+
+    // MARK: - Copilot
+
+    /// Same prompt-free activation as Kimi/Gemini: the whole Copilot discovery
+    /// chain is prompt-free, so the first refresh tick activates dormant state.
+    /// Automatic cadence must not clear an explicit disconnect; that happens
+    /// only in `connectCopilot`.
+    func bootstrapCopilot() async {
+        if CopilotExplicitDisconnect.isSet(defaults: copilotQuotaRuntime.defaults) {
+            copilotLoadState = .notBootstrapped
+            return
+        }
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = copilotRefreshGen
+        copilotLoadState = .bootstrapping
+        do {
+            let usage = try await copilotQuotaRuntime.refresh()
+            guard gen == copilotRefreshGen else { return }
+            copilotUsage = usage
+            copilotError = nil
+            copilotLoadState = .loaded
+        } catch let err as CopilotSubscriptionService.FetchError {
+            guard gen == copilotRefreshGen else { return }
+            applyCopilotFetchError(err)
+        } catch {
+            guard gen == copilotRefreshGen else { return }
+            copilotError = sanitizeForUI(error.localizedDescription)
+            copilotLoadState = .failed
+        }
+    }
+
+    /// User-initiated Connect / Reconnect / Load Quota. Clears persisted
+    /// explicit disconnect so discovery may run again.
+    func connectCopilot() async {
+        CopilotExplicitDisconnect.clear(defaults: copilotQuotaRuntime.defaults)
+        await bootstrapCopilot()
+    }
+
+    func refreshCopilot() async {
+        _ = await refreshCopilotReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshCopilotReportingSuccess() async -> Bool {
+        if CopilotExplicitDisconnect.isSet(defaults: copilotQuotaRuntime.defaults) {
+            if copilotLoadState != .notBootstrapped { copilotLoadState = .notBootstrapped }
+            return false
+        }
+        if case .dormant = copilotLoadState {
+            await bootstrapCopilot()
+            return copilotLoadState == .loaded
+        }
+        guard copilotQuotaRuntime.hasCredential() else {
+            if copilotLoadState != .notBootstrapped { copilotLoadState = .notBootstrapped }
+            return false
+        }
+        let gen = copilotRefreshGen
+        if copilotUsage == nil { copilotLoadState = .loading }
+        do {
+            let usage = try await copilotQuotaRuntime.refresh()
+            guard gen == copilotRefreshGen else { return false }
+            copilotUsage = usage
+            copilotError = nil
+            copilotLoadState = .loaded
+            return true
+        } catch let err as CopilotSubscriptionService.FetchError {
+            guard gen == copilotRefreshGen else { return false }
+            applyCopilotFetchError(err)
+            return false
+        } catch {
+            guard gen == copilotRefreshGen else { return false }
+            copilotError = sanitizeForUI(error.localizedDescription)
+            copilotLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectCopilot() {
+        copilotQuotaRuntime.disconnectService()
+        CopilotExplicitDisconnect.mark(defaults: copilotQuotaRuntime.defaults)
+        copilotRefreshGen &+= 1
+        copilotUsage = nil
+        copilotError = nil
+        copilotLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyCopilotFetchError(_ err: CopilotSubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        copilotError = sanitized
+        if case .noCredentials = err {
+            copilotLoadState = .noCredentials
+        } else if err.isTerminal {
+            copilotLoadState = .terminalFailure(reason: sanitized)
+        } else if let retryAt = err.rateLimitRetryAt {
+            copilotLoadState = .transientFailure(retryAt: retryAt)
+        } else {
+            // 5xx / network blips and a rejected-but-unchanged token back off
+            // automatically, mirroring the Electron provider's
+            // transientFailure mapping.
+            copilotLoadState = .transientFailure(retryAt: nil)
+        }
+    }
+
+    // MARK: - Antigravity
+
+    /// No credential dance at all: discovery is `ps` + loopback probes of the
+    /// local language server, so the first refresh tick activates dormant
+    /// state, like Kimi/Gemini/Copilot.
+    func bootstrapAntigravity() async {
+        // Capture the generation before the await so a disconnect that lands
+        // mid-fetch cannot be resurrected into .loaded when the fetch returns.
+        let gen = antigravityRefreshGen
+        antigravityLoadState = .bootstrapping
+        do {
+            let usage = try await AntigravitySubscriptionService.refresh()
+            guard gen == antigravityRefreshGen else { return }
+            antigravityUsage = usage
+            antigravityError = nil
+            antigravityLoadState = .loaded
+        } catch let err as AntigravitySubscriptionService.FetchError {
+            guard gen == antigravityRefreshGen else { return }
+            applyAntigravityFetchError(err)
+        } catch {
+            guard gen == antigravityRefreshGen else { return }
+            antigravityError = sanitizeForUI(error.localizedDescription)
+            antigravityLoadState = .failed
+        }
+    }
+
+    func refreshAntigravity() async {
+        _ = await refreshAntigravityReportingSuccess()
+    }
+
+    @discardableResult
+    func refreshAntigravityReportingSuccess() async -> Bool {
+        if case .dormant = antigravityLoadState {
+            await bootstrapAntigravity()
+            return antigravityLoadState == .loaded
+        }
+        // Only an explicit Disconnect stops the cadence probe; there is no
+        // credential file to poll for, the probe IS the availability check.
+        if case .notBootstrapped = antigravityLoadState { return false }
+        let gen = antigravityRefreshGen
+        if antigravityUsage == nil { antigravityLoadState = .loading }
+        do {
+            let usage = try await AntigravitySubscriptionService.refresh()
+            guard gen == antigravityRefreshGen else { return false }
+            antigravityUsage = usage
+            antigravityError = nil
+            antigravityLoadState = .loaded
+            return true
+        } catch let err as AntigravitySubscriptionService.FetchError {
+            guard gen == antigravityRefreshGen else { return false }
+            applyAntigravityFetchError(err)
+            return false
+        } catch {
+            guard gen == antigravityRefreshGen else { return false }
+            antigravityError = sanitizeForUI(error.localizedDescription)
+            antigravityLoadState = .failed
+            return false
+        }
+    }
+
+    func disconnectAntigravity() {
+        antigravityRefreshGen &+= 1
+        antigravityUsage = nil
+        antigravityError = nil
+        antigravityLoadState = .notBootstrapped
+        NotificationCenter.default.post(name: .codeBurnSubscriptionDisconnected, object: nil)
+    }
+
+    private func applyAntigravityFetchError(_ err: AntigravitySubscriptionService.FetchError) {
+        let sanitized = sanitizeForUI(err.errorDescription)
+        antigravityError = sanitized
+        if case .disconnected = err {
+            // No local server answered — the routine "app not running" state,
+            // not an error; the UI shows the Connect affordance.
+            antigravityLoadState = .noCredentials
+        } else {
+            // Unexpected discovery/probe failures back off automatically,
+            // mirroring the Electron provider's transientFailure mapping.
+            antigravityLoadState = .transientFailure(retryAt: nil)
         }
     }
 
@@ -1145,38 +2152,84 @@ final class AppStore {
 
     /// Snapshot of live quota state for a given provider. Returns nil when the user
     /// has not connected yet — the bar slot stays empty so we never trigger a
-    /// keychain prompt at startup. Once bootstrapped, the bar persists across all
+    /// source-owned Keychain prompt at startup. Once bootstrapped, the bar persists across all
     /// subsequent states (loading / stale / transient failure / terminal failure)
     /// so it doesn't flicker on every refresh tick.
     /// Aggregate quota status across all connected providers, used by the menu
     /// bar flame icon (color) and the popover warning row. Severity = worst
     /// observed across any provider's worst window. Warning providers are
-    /// every connected provider at >= 70% utilization.
+    /// every connected provider at >= 70% utilization, each carrying the window
+    /// that put it there so the row can name it (`QuotaWarningPresentation`).
     struct AggregateQuotaStatus {
         let severity: QuotaSummary.Severity
-        let warnings: [(name: String, percent: Double)]   // sorted desc by percent
+        let warnings: [QuotaWarning]   // sorted desc by percent
+    }
+
+    /// Every connected provider's quota windows, flattened. The warning banner
+    /// and the crossing notifier read the same list, so the two can never
+    /// disagree about what a provider is reporting.
+    var quotaWindows: [QuotaCrossingWindow] {
+        var windows: [QuotaCrossingWindow] = []
+        func include(_ name: String, _ candidates: [QuotaWarning.Candidate]) {
+            windows += candidates.map {
+                QuotaCrossingWindow(providerName: name, label: $0.label, percent: $0.percent, resetsAt: $0.resetsAt)
+            }
+        }
+        if let usage = subscription, shouldIncludeCachedQuota(loadState: subscriptionLoadState) {
+            // Labelled as `claudeQuotaSummary` labels them, so the warning row
+            // names a window the way the Plan tab and the Capacity Dock do.
+            include("Claude", [
+                .init(label: "5-hour", percent: usage.fiveHourPercent, resetsAt: usage.fiveHourResetsAt),
+                .init(label: "Weekly", percent: usage.sevenDayPercent, resetsAt: usage.sevenDayResetsAt),
+                .init(label: "Weekly · Opus", percent: usage.sevenDayOpusPercent, resetsAt: usage.sevenDayOpusResetsAt),
+                .init(label: "Weekly · Sonnet", percent: usage.sevenDaySonnetPercent, resetsAt: usage.sevenDaySonnetResetsAt),
+            ])
+        }
+        if let usage = codexUsage, shouldIncludeCachedQuota(loadState: codexLoadState) {
+            include("Codex", [usage.primary, usage.secondary].compactMap { $0 }.map {
+                QuotaWarning.Candidate(label: $0.windowLabel, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
+        }
+        if let usage = kimiUsage, shouldIncludeCachedQuota(loadState: kimiLoadState) {
+            var windows: [QuotaWarning.Candidate] = []
+            if let w = usage.primary {
+                windows.append(.init(label: w.label, percent: w.usedPercent, resetsAt: w.resetsAt))
+            }
+            windows += usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            }
+            include("Kimi Code", windows)
+        }
+        if let usage = geminiUsage, shouldIncludeCachedQuota(loadState: geminiLoadState) {
+            include("Gemini", usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
+        }
+        if let usage = copilotUsage, shouldIncludeCachedQuota(loadState: copilotLoadState) {
+            include("Copilot", usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
+        }
+        if let usage = antigravityUsage, shouldIncludeCachedQuota(loadState: antigravityLoadState) {
+            include("Antigravity", usage.details.map {
+                QuotaWarning.Candidate(label: $0.label, percent: $0.usedPercent, resetsAt: $0.resetsAt)
+            })
+        }
+        return windows
     }
 
     var aggregateQuotaStatus: AggregateQuotaStatus {
-        var providers: [(name: String, percent: Double)] = []
-        if let usage = subscription, shouldIncludeCachedQuota(loadState: subscriptionLoadState) {
-            let worst = [
-                usage.fiveHourPercent,
-                usage.sevenDayPercent,
-                usage.sevenDayOpusPercent,
-                usage.sevenDaySonnetPercent,
-            ].compactMap { $0 }.max() ?? 0
-            if worst > 0 { providers.append(("Claude", worst)) }
+        var order: [String] = []
+        var byProvider: [String: [QuotaWarning.Candidate]] = [:]
+        for window in quotaWindows {
+            if byProvider[window.providerName] == nil { order.append(window.providerName) }
+            byProvider[window.providerName, default: []].append(
+                .init(label: window.label, percent: window.percent, resetsAt: window.resetsAt)
+            )
         }
-        if let usage = codexUsage, shouldIncludeCachedQuota(loadState: codexLoadState) {
-            let worst = max(usage.primary?.usedPercent ?? 0, usage.secondary?.usedPercent ?? 0)
-            if worst > 0 { providers.append(("Codex", worst)) }
-        }
-        let worst = providers.map(\.percent).max() ?? 0
-        let severity = QuotaSummary.severity(for: worst / 100)
-        let sorted = providers.sorted { $0.percent > $1.percent }
-        let warnings = sorted.filter { $0.percent >= 70 }
-        return AggregateQuotaStatus(severity: severity, warnings: warnings)
+        let providers = order.compactMap { QuotaWarning.worst(name: $0, windows: byProvider[$0] ?? []) }
+        let result = QuotaWarningPresentation.aggregate(providers)
+        return AggregateQuotaStatus(severity: result.severity, warnings: result.warnings)
     }
 
     private func shouldIncludeCachedQuota(loadState: SubscriptionLoadState) -> Bool {
@@ -1192,7 +2245,348 @@ final class AppStore {
         switch filter {
         case .claude: return claudeQuotaSummary(filter: filter)
         case .codex:  return codexQuotaSummary(filter: filter)
+        case .kimiCode: return kimiQuotaSummary(filter: filter)
+        case .gemini:  return geminiQuotaSummary(filter: filter)
+        case .copilot: return copilotQuotaSummary(filter: filter)
+        case .antigravity: return antigravityQuotaSummary(filter: filter)
         default:      return nil
+        }
+    }
+
+    /// Sessions the CLI reported as live under this provider, newest first. Nil
+    /// when the payload carries no live-session block at all (a CLI that predates
+    /// it), which the popover renders as an absent section rather than as
+    /// "none running".
+    func capacityDockLiveSessions(for provider: CapacityDockProvider) -> [LiveSession]? {
+        guard let block = menubarPayload?.liveSessions else { return nil }
+        // The CLI names providers by their own ids ("kimicode", "cursor-agent"),
+        // not by the dock's raw identifiers ("kimi"); match the payload ids.
+        let ids = provider.payloadProviderIDs
+        return block.sessions.filter { ids.contains($0.provider) }
+    }
+
+    /// Today's totals for the dock popover. The background loop keeps the
+    /// menu-bar status payload fresh, so it wins whenever the badge is already
+    /// scoped to today; otherwise fall back to the popover's own today cache.
+    var capacityDockToday: CurrentBlock? {
+        if menubarPeriod == .today, let payload = menubarPayload { return payload.current }
+        return todayPayload?.current
+    }
+
+    /// Providers that report a quota window, as plain values. Bounded on
+    /// purpose: the six adapters with a native quota path, plus the
+    /// CodeBurn-owned adapters whose summary has already been fetched. Nothing
+    /// here starts a fetch, so the menu-bar title stays a pure read.
+    ///
+    /// Which window each provider contributes, and which connection states still
+    /// count, are `MenubarQuotaRowSelection`'s business — it takes the worst
+    /// window, the same one the flame tints by, and keeps a backing-off provider
+    /// on its last-known data the way the Capacity Dock does.
+    var menubarQuotaCandidates: [MenubarQuotaCandidate] {
+        var candidates: [MenubarQuotaCandidate] = []
+        var seen: Set<String> = []
+
+        func append(label: String, summary: QuotaSummary?) {
+            guard let summary,
+                  let candidate = MenubarQuotaRowSelection.candidate(label: label, summary: summary),
+                  seen.insert(label).inserted else { return }
+            candidates.append(candidate)
+        }
+
+        for provider in CapacityDockPreferences.supportedProviders {
+            guard let filter = provider.legacyFilter else { continue }
+            append(label: provider.displayName, summary: quotaSummary(for: filter))
+        }
+        for (id, summary) in capacityDockProviderSummaries {
+            guard let provider = CapacityDockProvider(rawValue: id) else { continue }
+            // Same z.ai plan endpoint as Z.ai: while the deliberately
+            // configured Z.ai connection is live, the ambient ZCode summary
+            // duplicates its row.
+            if id == "zcode",
+               capacityDockProviderSummaries["zai"]?.connection == .connected {
+                continue
+            }
+            append(label: provider.displayName, summary: summary)
+        }
+        return candidates
+    }
+
+    /// Plain-value snapshot the second menu-bar row formats. Reads only figures
+    /// the app already keeps for the popover.
+    var menubarRowSnapshot: MenubarRowSnapshot {
+        let today = capacityDockToday
+        return MenubarRowSnapshot(
+            quota: MenubarQuotaRowSelection.primary(from: menubarQuotaCandidates),
+            todayCost: today?.cost,
+            todayTotalTokens: today.map { $0.inputTokens + $0.outputTokens },
+            activeSessionCount: menubarPayload?.liveSessions?.sessions.count,
+            currencySymbol: CurrencyState.shared.symbol,
+            currencyRate: CurrencyState.shared.rate
+        )
+    }
+
+    /// Today's totals for ONE provider's glance card. The card is provider
+    /// scoped, so the machine-wide `capacityDockToday` block is the wrong number
+    /// in it; `providerDetails` carries the per-provider row.
+    ///
+    /// Nil when the payload has no provider breakdown at all (a CLI old enough
+    /// to omit `providerDetails`), which hides the section rather than showing a
+    /// figure that belongs to every other provider too. A provider simply absent
+    /// from a breakdown that IS present had no usage today, which is a real
+    /// zero, not missing data.
+    func capacityDockToday(for provider: CapacityDockProvider) -> ProviderDetail? {
+        guard let current = capacityDockToday, !current.providerDetails.isEmpty else { return nil }
+        let ids = Set(provider.payloadProviderIDs)
+        let rows = current.providerDetails.filter { ids.contains($0.id) }
+        let id = provider.payloadProviderID
+        guard let first = rows.first else {
+            return ProviderDetail(id: id, label: provider.displayName, cost: 0, calls: 0, hasUsage: false)
+        }
+        guard rows.count > 1 else { return first }
+        // A token field stays absent until some row reports it, so that "an old CLI
+        // sent none" keeps reading differently from "this account used none".
+        func sum(_ value: (ProviderDetail) -> Int?) -> Int? {
+            let present = rows.compactMap(value)
+            return present.isEmpty ? nil : present.reduce(0, +)
+        }
+        // Cache read is stricter than the other token fields: a tile whose rows
+        // are split across a legacy and a current CLI must not present a partial
+        // known sum as complete. If any ACTIVE row lacks the cache field, the
+        // tile reports none — an idle row (hasUsage false) carries a genuine
+        // zero and does not force unknown.
+        let cacheRead: Int? = {
+            let activeMissing = rows.contains { $0.hasUsage && $0.cacheReadTokens == nil }
+            guard !activeMissing else { return nil }
+            return sum(\.cacheReadTokens)
+        }()
+        return ProviderDetail(
+            id: id,
+            label: provider.displayName,
+            cost: rows.reduce(0) { $0 + $1.cost },
+            calls: rows.reduce(0) { $0 + $1.calls },
+            hasUsage: rows.contains { $0.hasUsage },
+            inputTokens: sum(\.inputTokens),
+            outputTokens: sum(\.outputTokens),
+            sessions: sum(\.sessions),
+            cacheReadTokens: cacheRead
+        )
+    }
+
+    func capacityDockQuotaSummary(for provider: CapacityDockProvider) -> QuotaSummary? {
+        if let filter = provider.legacyFilter {
+            return quotaSummary(for: filter)
+        }
+        if let summary = capacityDockProviderSummaries[provider.id] {
+            if capacityDockProvidersLoading.contains(provider.id)
+                || capacityDockProviderTransientFailures.contains(provider.id)
+            {
+                return QuotaSummary(
+                    providerFilter: .all,
+                    connection: .stale,
+                    primary: summary.primary,
+                    details: summary.details,
+                    planLabel: summary.planLabel,
+                    footerLines: summary.footerLines + (
+                        capacityDockProviderErrors[provider.id]
+                            .map { ["Refresh failed: \($0)"] } ?? []
+                    )
+                )
+            }
+            return summary
+        }
+        if capacityDockProvidersLoading.contains(provider.id) {
+            return QuotaSummary(
+                providerFilter: .all,
+                connection: .loading,
+                primary: nil,
+                details: [],
+                planLabel: nil,
+                footerLines: []
+            )
+        }
+        if let error = capacityDockProviderErrors[provider.id] {
+            return QuotaSummary(
+                providerFilter: .all,
+                connection: capacityDockProviderTransientFailures.contains(provider.id)
+                    ? .transientFailure
+                    : .terminalFailure(reason: error),
+                primary: nil,
+                details: [],
+                planLabel: nil,
+                footerLines: [error]
+            )
+        }
+        return nil
+    }
+
+    /// Whether a quota fetch for this provider is actually awaiting a response.
+    /// Claude and Codex now read `.stale` on sample age alone, which a manual
+    /// refresh cadence makes permanent, so the surfaces that say "refreshing"
+    /// have to ask. Every other provider still reaches `.stale` only from an
+    /// in-flight or just-failed fetch.
+    func quotaRefreshIsInFlight(for provider: CapacityDockProvider) -> Bool {
+        switch provider.legacyFilter {
+        case .claude: claudeRefreshInFlightRequest != nil
+        case .codex: codexRefreshInFlightRequest != nil
+        default: true
+        }
+    }
+
+    func capacityDockProviderIsConnected(_ provider: CapacityDockProvider) -> Bool {
+        guard let connection = capacityDockQuotaSummary(for: provider)?.connection else { return false }
+        return connection == .connected || connection == .stale
+    }
+
+    func capacityDockProviderIsDockEligible(_ provider: CapacityDockProvider) -> Bool {
+        CapacityDockProviderSelection.isDockEligible(
+            provider,
+            isConnected: capacityDockProviderIsConnected(provider),
+            hasSavedCredential: CapacityDockProviderCredentialPresence.contains(provider.id)
+        )
+    }
+
+    func capacityDockCredential(for provider: CapacityDockProvider) async -> CapacityDockProviderCredential {
+        (try? await capacityDockCredentialLoader(provider.id))
+            ?? CapacityDockProviderCredential()
+    }
+
+    func saveCapacityDockCredential(
+        _ credential: CapacityDockProviderCredential,
+        for provider: CapacityDockProvider
+    ) async throws {
+        try await capacityDockCredentialSaver(credential, provider.id)
+        capacityDockProviderRefreshGenerations[provider.id, default: 0] &+= 1
+        capacityDockProviderSummaries[provider.id] = nil
+        capacityDockProviderErrors[provider.id] = nil
+        capacityDockProviderStatusTitles[provider.id] = nil
+        capacityDockProvidersLoading.remove(provider.id)
+        capacityDockProviderTransientFailures.remove(provider.id)
+    }
+
+    /// `explicit` is the Disconnect action. Clearing an override only returns
+    /// the provider to automatic discovery, so it leaves the opt-out unset.
+    func disconnectCapacityDockProvider(_ provider: CapacityDockProvider, explicit: Bool = false) async throws {
+        if let filter = provider.legacyFilter {
+            switch filter {
+            case .claude: disconnectSubscription()
+            case .codex: disconnectCodex()
+            case .kimiCode: disconnectKimi()
+            case .gemini: disconnectGemini()
+            case .copilot: disconnectCopilot()
+            case .antigravity: disconnectAntigravity()
+            default: break
+            }
+            return
+        }
+        capacityDockProviderRefreshGenerations[provider.id, default: 0] &+= 1
+        do {
+            try await capacityDockCredentialRemover(provider.id)
+        } catch {
+            // The generation invalidates any read that began before the user's
+            // disconnect. If deletion itself fails, keep the last-known summary
+            // and credential, but never leave the row permanently loading.
+            capacityDockProvidersLoading.remove(provider.id)
+            throw error
+        }
+        capacityDockProviderSummaries[provider.id] = nil
+        capacityDockProviderErrors[provider.id] = nil
+        capacityDockProviderStatusTitles[provider.id] = nil
+        capacityDockProvidersLoading.remove(provider.id)
+        capacityDockProviderTransientFailures.remove(provider.id)
+        // Drop the provider from the persisted dock selection too. A
+        // credential-less adapter (Cursor) still selected there would be
+        // silently reconnected by the next scheduled refresh, undoing the
+        // user's explicit disconnect.
+        capacityDockProviderDeselector(provider)
+        if explicit { ProviderExplicitDisconnect.mark(provider.id, defaults: capacityDockDefaults) }
+    }
+
+    func connectCapacityDockProvider(_ provider: CapacityDockProvider) async {
+        if let filter = provider.legacyFilter {
+            await connectQuotaProvider(filter)
+            return
+        }
+        ProviderExplicitDisconnect.clear(provider.id, defaults: capacityDockDefaults)
+        await CapacityDockProviderRefreshInteraction.userInitiated {
+            await refreshCapacityDockProvider(provider)
+        }
+    }
+
+    /// `quiet` records nothing when the provider is simply not signed in, so it
+    /// stays "Not connected" instead of "Reconnect required"; any other failure
+    /// is recorded as usual. It skips a provider the user disconnected until
+    /// they connect it again.
+    func refreshCapacityDockProvider(_ provider: CapacityDockProvider, quiet: Bool = false) async {
+        guard provider.legacyFilter == nil,
+              provider.catalogEntry.hasLiveCodeBurnQuotaAdapter,
+              !capacityDockProvidersLoading.contains(provider.id),
+              !(quiet && ProviderExplicitDisconnect.isSet(provider.id, defaults: capacityDockDefaults)) else { return }
+        let generation = capacityDockProviderRefreshGenerations[provider.id, default: 0]
+        capacityDockProvidersLoading.insert(provider.id)
+        defer {
+            if capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation {
+                capacityDockProvidersLoading.remove(provider.id)
+            }
+        }
+
+        do {
+            let credential = try await capacityDockCredentialLoader(provider.id)
+            let summary = try await capacityDockProviderQuotaService.fetch(
+                provider: provider,
+                credential: credential
+            )
+            guard capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation else {
+                return
+            }
+            capacityDockProviderSummaries[provider.id] = summary
+            capacityDockProviderErrors[provider.id] = nil
+            capacityDockProviderStatusTitles[provider.id] = nil
+            capacityDockProviderTransientFailures.remove(provider.id)
+        } catch {
+            guard capacityDockProviderRefreshGenerations[provider.id, default: 0] == generation,
+                  !(quiet && (error as? CapacityDockProviderFetchFailure)?.notSignedIn == true) else {
+                return
+            }
+            let failure = error as? CapacityDockProviderFetchFailure
+            // Without a last quota the pane offers Retry; with one it shows Disconnect.
+            let retryShown = capacityDockProviderSummaries[provider.id] == nil
+            capacityDockProviderErrors[provider.id] = sanitizeForUI(
+                (retryShown ? failure?.retryMessage : nil) ?? error.localizedDescription
+            )
+            capacityDockProviderStatusTitles[provider.id] = failure?.statusTitle
+            if let failure = error as? CapacityDockProviderFetchFailure,
+               failure.disposition == .transient {
+                capacityDockProviderTransientFailures.insert(provider.id)
+            } else {
+                capacityDockProviderTransientFailures.remove(provider.id)
+                capacityDockProviderSummaries[provider.id] = nil
+            }
+        }
+    }
+
+    /// Refreshes selected generic providers sequentially. Browser-cookie and
+    /// local CLI probes can touch shared system state, so serial execution is
+    /// deliberately calmer than fanning 60+ connection attempts out at once.
+    func refreshSelectedCapacityDockProviders() async {
+        let selected = CapacityDockPreferences.load().selectedProviders
+        for provider in selected
+        where provider.legacyFilter == nil && provider.catalogEntry.hasLiveCodeBurnQuotaAdapter {
+            await refreshCapacityDockProvider(provider)
+        }
+    }
+
+    /// Shared direct-connect path used by Settings, Plan, and Capacity Dock.
+    /// Providers whose credentials live in local files or localhost services
+    /// perform passive discovery; Claude alone may request Keychain consent.
+    func connectQuotaProvider(_ filter: ProviderFilter) async {
+        switch filter {
+        case .claude: await bootstrapSubscription()
+        case .codex: await bootstrapCodex()
+        case .kimiCode: await bootstrapKimi()
+        case .gemini: await bootstrapGemini()
+        case .copilot: await connectCopilot()
+        case .antigravity: await bootstrapAntigravity()
+        default: break
         }
     }
 
@@ -1200,12 +2594,13 @@ final class AppStore {
         if case .notBootstrapped = subscriptionLoadState { return nil }
         if case .bootstrapping = subscriptionLoadState { return nil }
         if case .noCredentials = subscriptionLoadState { return nil }
+        let usageIsFresh = QuotaSummary.isFresh(fetchedAt: subscription?.fetchedAt)
 
         let connection: QuotaSummary.Connection = {
             switch subscriptionLoadState {
             case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
             case .loading: return subscription == nil ? .loading : .stale
-            case .loaded: return .connected
+            case .loaded: return usageIsFresh ? .connected : .stale
             case .failed: return subscription == nil ? .loading : .stale
             case let .terminalFailure(reason): return .terminalFailure(reason: reason)
             case .transientFailure: return .transientFailure
@@ -1215,38 +2610,61 @@ final class AppStore {
         var primary: QuotaSummary.Window?
         var details: [QuotaSummary.Window] = []
         if let usage = subscription {
+            // Claude's rate-limit windows are fixed lengths, so each row
+            // carries its validated duration for pace presentation.
             if let pct = usage.fiveHourPercent {
-                details.append(.init(label: "5-hour", percent: pct / 100, resetsAt: usage.fiveHourResetsAt))
+                details.append(.init(
+                    label: "5-hour", percent: pct / 100, resetsAt: usage.fiveHourResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeFiveHourSeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
             if let pct = usage.sevenDayPercent {
-                let weekly = QuotaSummary.Window(label: "Weekly", percent: pct / 100, resetsAt: usage.sevenDayResetsAt)
+                let weekly = QuotaSummary.Window(
+                    label: "Weekly", percent: pct / 100, resetsAt: usage.sevenDayResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                )
                 primary = weekly
                 details.append(weekly)
             }
             if let pct = usage.sevenDayOpusPercent {
-                details.append(.init(label: "Weekly · Opus", percent: pct / 100, resetsAt: usage.sevenDayOpusResetsAt))
+                details.append(.init(
+                    label: "Weekly · Opus", percent: pct / 100, resetsAt: usage.sevenDayOpusResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
             if let pct = usage.sevenDaySonnetPercent {
-                details.append(.init(label: "Weekly · Sonnet", percent: pct / 100, resetsAt: usage.sevenDaySonnetResetsAt))
+                details.append(.init(
+                    label: "Weekly · Sonnet", percent: pct / 100, resetsAt: usage.sevenDaySonnetResetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
             for scoped in usage.scopedWeekly {
-                details.append(.init(label: "Weekly · \(scoped.label)", percent: scoped.percent / 100, resetsAt: scoped.resetsAt))
+                details.append(.init(
+                    label: "Weekly · \(scoped.label)", percent: scoped.percent / 100, resetsAt: scoped.resetsAt,
+                    windowSeconds: QuotaPacePresentation.claudeSevenDaySeconds,
+                    fetchedAt: usage.fetchedAt
+                ))
             }
         }
         let plan = subscription?.tier.displayName
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: plan, footerLines: [])
     }
 
-    private func codexQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+    private func codexQuotaSummary(filter: ProviderFilter, includeZeroAdditionalLimits: Bool = false) -> QuotaSummary? {
         if case .notBootstrapped = codexLoadState { return nil }
         if case .bootstrapping = codexLoadState { return nil }
         if case .noCredentials = codexLoadState { return nil }
+        let usageIsFresh = QuotaSummary.isFresh(fetchedAt: codexUsage?.fetchedAt)
 
         let connection: QuotaSummary.Connection = {
             switch codexLoadState {
             case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
             case .loading: return codexUsage == nil ? .loading : .stale
-            case .loaded: return .connected
+            case .loaded: return usageIsFresh ? .connected : .stale
             case .failed: return codexUsage == nil ? .loading : .stale
             case let .terminalFailure(reason): return .terminalFailure(reason: reason)
             case .transientFailure: return .transientFailure
@@ -1256,13 +2674,23 @@ final class AppStore {
         var primary: QuotaSummary.Window?
         var details: [QuotaSummary.Window] = []
         if let usage = codexUsage {
+            // Codex reports each rate window's length itself, so every row
+            // carries its own validated duration for pace presentation.
             if let w = usage.primary {
-                let row = QuotaSummary.Window(label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                let row = QuotaSummary.Window(
+                    label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt,
+                    windowSeconds: w.limitWindowSeconds,
+                    fetchedAt: usage.fetchedAt
+                )
                 primary = row
                 details.append(row)
             }
             if let w = usage.secondary {
-                let row = QuotaSummary.Window(label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                let row = QuotaSummary.Window(
+                    label: w.windowLabel, percent: w.usedPercent / 100, resetsAt: w.resetsAt,
+                    windowSeconds: w.limitWindowSeconds,
+                    fetchedAt: usage.fetchedAt
+                )
                 // Some Codex plans (free / guest tiers) only return a secondary
                 // window. Promote it to primary so the chip bar always has a
                 // data source instead of rendering as an empty track.
@@ -1272,36 +2700,209 @@ final class AppStore {
             // Surface per-model additional rate limits (e.g. "GPT-5.3-Codex-Spark")
             // only when the user has actually hit them. Skipping zero rows keeps
             // the popover compact for the common case where the user only uses
-            // the main Codex window.
+            // the main Codex window. The early-reset detector opts in to the
+            // zero rows: a window can reset early while still sitting at 0%.
             for extra in usage.additionalLimits {
-                if let p = extra.primary, p.usedPercent > 0 {
-                    details.append(.init(label: "\(extra.name) · \(p.windowLabel)", percent: p.usedPercent / 100, resetsAt: p.resetsAt))
+                if let p = extra.primary, includeZeroAdditionalLimits || p.usedPercent > 0 {
+                    details.append(.init(
+                        label: "\(extra.name) · \(p.windowLabel)", percent: p.usedPercent / 100, resetsAt: p.resetsAt,
+                        windowSeconds: p.limitWindowSeconds,
+                        fetchedAt: usage.fetchedAt
+                    ))
                 }
-                if let s = extra.secondary, s.usedPercent > 0 {
-                    details.append(.init(label: "\(extra.name) · \(s.windowLabel)", percent: s.usedPercent / 100, resetsAt: s.resetsAt))
+                if let s = extra.secondary, includeZeroAdditionalLimits || s.usedPercent > 0 {
+                    details.append(.init(
+                        label: "\(extra.name) · \(s.windowLabel)", percent: s.usedPercent / 100, resetsAt: s.resetsAt,
+                        windowSeconds: s.limitWindowSeconds,
+                        fetchedAt: usage.fetchedAt
+                    ))
                 }
+            }
+            // No rate windows here, so the allowance feeds the bar and badge.
+            if let credits = usage.creditLimit {
+                let row = QuotaSummary.Window(
+                    label: credits.shortLabel,
+                    percent: credits.usedPercent / 100,
+                    resetsAt: credits.resetsAt,
+                    windowSeconds: credits.windowSeconds,
+                    fetchedAt: usage.fetchedAt,
+                    storageLabel: credits.storageLabel,
+                    usedUnits: credits.used
+                )
+                if primary == nil { primary = row }
+                details.append(row)
             }
         }
         let plan = codexUsage?.plan.displayName
         var footerLines: [String] = []
         if let balance = codexUsage?.creditsBalance, balance > 0 {
-            // Format as plain dollars; ChatGPT settles in USD regardless of
-            // the user's display-currency preference.
+            // Credit-settled accounts denominate in credits, so no symbol.
+            let inCredits = codexUsage?.hasCredits == true
             let formatter = NumberFormatter()
-            formatter.numberStyle = .currency
-            formatter.currencyCode = "USD"
-            formatter.maximumFractionDigits = 2
-            let formatted = formatter.string(from: NSNumber(value: balance)) ?? "$\(balance)"
+            formatter.numberStyle = inCredits ? .decimal : .currency
+            formatter.maximumFractionDigits = inCredits ? 0 : 2
+            // Half-up matches the desktop decoder's Math.round; the default is
+            // half-even, which disagrees on exact-half balances.
+            formatter.roundingMode = .halfUp
+            // `en_US`, not `en_US_POSIX`: the latter drops grouping entirely.
+            formatter.locale = Locale(identifier: "en_US")
+            if !inCredits { formatter.currencyCode = "USD" }
+            let fallback = inCredits ? "\(Int(balance.rounded()))" : "$\(balance)"
+            let formatted = formatter.string(from: NSNumber(value: balance)) ?? fallback
             footerLines.append("Credits remaining · \(formatted)")
         }
+        if codexUsage?.creditLimit == nil, codexUsage?.creditsUnlimited == true {
+            footerLines.append("Credits · Unlimited")
+        }
+        // Limit-reset credits, banked ones included. Same sentence the Plan tab
+        // and `codeburn quota` print; omitted entirely when the account holds none.
+        if let resets = codexUsage?.resetCredits,
+           let line = CodexBankedResetPresentation.line(resets, now: Date()) {
+            footerLines.append(line)
+        }
         return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: plan, footerLines: footerLines)
+    }
+
+    private func kimiQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = kimiLoadState { return nil }
+        if case .bootstrapping = kimiLoadState { return nil }
+        if case .noCredentials = kimiLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch kimiLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return kimiUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return kimiUsage == nil ? .loading : .stale
+            // Kimi tokens expire ~every 15 min and only the CLI renews them, so
+            // terminal is the steady state between CLI uses. Keep the last-known
+            // bars (marked stale) instead of flapping the chip to a reconnect
+            // card; the reconnect card is reserved for the genuinely-no-data case.
+            case let .terminalFailure(reason): return kimiUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = kimiUsage {
+            if let w = usage.primary {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                primary = row
+                details.append(row)
+            }
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: kimiUsage?.plan ?? "Kimi Code", footerLines: [])
+    }
+
+    private func geminiQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = geminiLoadState { return nil }
+        if case .bootstrapping = geminiLoadState { return nil }
+        if case .noCredentials = geminiLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch geminiLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return geminiUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return geminiUsage == nil ? .loading : .stale
+            // An expired Gemini login without a refresh path sits terminal
+            // until the user runs the CLI. Keep the last-known bars (marked
+            // stale) instead of flapping the chip to a reconnect card.
+            case let .terminalFailure(reason): return geminiUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = geminiUsage {
+            // details is sorted most-constrained first, so the first row is
+            // the headline bar.
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: geminiUsage?.plan ?? "Gemini", footerLines: [])
+    }
+
+    private func copilotQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = copilotLoadState { return nil }
+        if case .bootstrapping = copilotLoadState { return nil }
+        if case .noCredentials = copilotLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch copilotLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return copilotUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return copilotUsage == nil ? .loading : .stale
+            // A revoked Copilot token sits terminal until the user signs in via
+            // an editor's Copilot plugin again. Keep the last-known bars
+            // (marked stale) instead of flapping the chip to a reconnect card.
+            case let .terminalFailure(reason): return copilotUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = copilotUsage {
+            // details leads with the premium-requests window, so the first row
+            // is the headline bar.
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: copilotUsage?.plan ?? "Copilot", footerLines: [])
+    }
+
+    private func antigravityQuotaSummary(filter: ProviderFilter) -> QuotaSummary? {
+        if case .notBootstrapped = antigravityLoadState { return nil }
+        if case .bootstrapping = antigravityLoadState { return nil }
+        if case .noCredentials = antigravityLoadState { return nil }
+
+        let connection: QuotaSummary.Connection = {
+            switch antigravityLoadState {
+            case .notBootstrapped, .dormant, .bootstrapping, .noCredentials: return .disconnected
+            case .loading: return antigravityUsage == nil ? .loading : .stale
+            case .loaded: return .connected
+            case .failed: return antigravityUsage == nil ? .loading : .stale
+            // A vanished local server maps to noCredentials above, so terminal
+            // is unreachable today; kept for switch exhaustivity.
+            case let .terminalFailure(reason): return antigravityUsage == nil ? .terminalFailure(reason: reason) : .stale
+            case .transientFailure: return .transientFailure
+            }
+        }()
+
+        var primary: QuotaSummary.Window?
+        var details: [QuotaSummary.Window] = []
+        if let usage = antigravityUsage {
+            // details is sorted most-constrained first, so the first row is
+            // the headline bar.
+            for w in usage.details {
+                let row = QuotaSummary.Window(label: w.label, percent: w.usedPercent / 100, resetsAt: w.resetsAt)
+                if primary == nil { primary = row }
+                details.append(row)
+            }
+        }
+        return QuotaSummary(providerFilter: filter, connection: connection, primary: primary, details: details, planLabel: antigravityUsage?.plan ?? "Antigravity", footerLines: [])
     }
 
     /// Persist one snapshot per window so we can answer "what did the prior cycle end at?"
     /// when the current window has just reset and projection from current data isn't meaningful.
     /// Also computes the effective_tokens consumed inside each 7-day window from local history,
     /// which the CapacityEstimator uses to derive the absolute token capacity per tier.
-    private func captureSnapshots(for usage: SubscriptionUsage) async {
+    private func captureSnapshots(for usage: SubscriptionUsage, baselineIsTrusted: Bool) async {
         let now = Date()
         let history = payload.history.daily
 
@@ -1312,6 +2913,13 @@ final class AppStore {
             ("seven_day_opus", usage.sevenDayOpusPercent, usage.sevenDayOpusResetsAt, nil),
             ("seven_day_sonnet", usage.sevenDaySonnetPercent, usage.sevenDaySonnetResetsAt, nil),
         ]
+        await detectEarlyResets(
+            captures: captures.map { ($0.key, $0.percent, $0.resetsAt) },
+            planLabel: usage.tier.displayName,
+            baselineIsTrusted: baselineIsTrusted,
+            now: now
+        )
+
         for capture in captures {
             guard let percent = capture.percent, let resetsAt = capture.resetsAt else { continue }
             await SubscriptionSnapshotStore.record(SubscriptionSnapshot(
@@ -1324,6 +2932,92 @@ final class AppStore {
         }
 
         await refreshCapacityEstimates()
+    }
+
+    /// Hand this fetch's windows to the early-reset monitor, which compares them
+    /// against the previous fetch's readings and announces at most one event.
+    /// A window the API did not report this time is passed as absent rather than
+    /// omitted, so a window that comes and goes never reads as a reset.
+    private func detectEarlyResets(
+        captures: [(key: String, percent: Double?, resetsAt: Date?)],
+        planLabel: String?,
+        baselineIsTrusted: Bool,
+        now: Date
+    ) async {
+        let provider = CapacityDockProvider.claude
+        let observations = captures.map { capture in
+            EarlyQuotaResetMonitor.Observation(
+                windowKey: capture.key,
+                windowName: EarlyQuotaResetFormat.claudeWindowName(forKey: capture.key),
+                windowSeconds: Self.claudeWindowSeconds(forKey: capture.key),
+                reading: {
+                    guard let percent = capture.percent, let resetsAt = capture.resetsAt else { return nil }
+                    return EarlyQuotaResetReading(percent: percent, resetsAt: resetsAt, observedAt: now)
+                }()
+            )
+        }
+        await earlyQuotaResetMonitor.record(
+            providerID: provider.rawValue,
+            providerName: provider.displayName,
+            planLabel: planLabel,
+            baselineIsTrusted: baselineIsTrusted,
+            observations: observations,
+            now: now
+        )
+    }
+
+    /// Hand Codex's freshly fetched windows to the same monitor. Codex windows
+    /// have no keys of their own, so each is identified by its pre-localization
+    /// `storageLabel` when the row has one, else by its display label (a period
+    /// or model name, which does not translate).
+    ///
+    /// A window with no `resetsAt` is passed with no reading, and one with no
+    /// validated duration with no duration: both make the detector say nothing.
+    private func detectCodexEarlyResets(baselineIsTrusted: Bool, now: Date = Date()) async {
+        guard let summary = codexQuotaSummary(filter: .codex, includeZeroAdditionalLimits: true) else { return }
+        let provider = CapacityDockProvider.codex
+        var observations: [EarlyQuotaResetMonitor.Observation] = []
+        var seen: Set<String> = []
+        for row in summary.details {
+            let identity = row.storageLabel ?? row.label
+            guard !identity.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            let key = EarlyQuotaResetFormat.windowKey(forLabel: identity)
+            guard seen.insert(key).inserted else { continue }
+            observations.append(EarlyQuotaResetMonitor.Observation(
+                windowKey: key,
+                windowName: EarlyQuotaResetFormat.windowName(forLabel: identity),
+                windowSeconds: row.windowSeconds,
+                // `QuotaSummary.Window` carries a 0...1 fraction; the detector
+                // reasons in 0...100 points.
+                reading: row.resetsAt.map {
+                    EarlyQuotaResetReading(
+                        percent: row.percent * 100,
+                        resetsAt: $0,
+                        observedAt: now,
+                        usedUnits: row.usedUnits
+                    )
+                }
+            ))
+        }
+        guard !observations.isEmpty else { return }
+        await earlyQuotaResetMonitor.record(
+            providerID: provider.rawValue,
+            providerName: provider.displayName,
+            planLabel: summary.planLabel,
+            baselineIsTrusted: baselineIsTrusted,
+            observations: observations,
+            now: now
+        )
+    }
+
+    /// Claude's rate-limit windows are fixed lengths, the same durations the
+    /// pace captions project against.
+    private static func claudeWindowSeconds(forKey key: String) -> Int? {
+        switch key {
+        case "five_hour": QuotaPacePresentation.claudeFiveHourSeconds
+        case "seven_day", "seven_day_opus", "seven_day_sonnet": QuotaPacePresentation.claudeSevenDaySeconds
+        default: nil
+        }
     }
 
     /// Sum effective tokens (input + 5*output + cache_creation + 0.1*cache_read) across the
@@ -1360,27 +3054,29 @@ final class AppStore {
 enum SupportedCurrency: String, CaseIterable, Identifiable {
     case USD, GBP, EUR, AUD, CAD, NZD, JPY, CNY, CHF, INR, BRL, SEK, SGD, HKD, KRW, MXN, ZAR, DKK, RON
     var id: String { rawValue }
+    /// "USD · US Dollar" — the code is never translated, the name is.
+    var pickerLabel: String { "\(rawValue) · \(displayName)" }
     var displayName: String {
         switch self {
-        case .USD: "US Dollar"
-        case .GBP: "British Pound"
-        case .EUR: "Euro"
-        case .AUD: "Australian Dollar"
-        case .CAD: "Canadian Dollar"
-        case .NZD: "New Zealand Dollar"
-        case .JPY: "Japanese Yen"
-        case .CNY: "Chinese Yuan"
-        case .CHF: "Swiss Franc"
-        case .INR: "Indian Rupee"
-        case .BRL: "Brazilian Real"
-        case .SEK: "Swedish Krona"
-        case .SGD: "Singapore Dollar"
-        case .HKD: "Hong Kong Dollar"
-        case .KRW: "South Korean Won"
-        case .MXN: "Mexican Peso"
-        case .ZAR: "South African Rand"
-        case .DKK: "Danish Krone"
-        case .RON: "Romanian Leu"
+        case .USD: L("US Dollar")
+        case .GBP: L("British Pound")
+        case .EUR: L("Euro")
+        case .AUD: L("Australian Dollar")
+        case .CAD: L("Canadian Dollar")
+        case .NZD: L("New Zealand Dollar")
+        case .JPY: L("Japanese Yen")
+        case .CNY: L("Chinese Yuan")
+        case .CHF: L("Swiss Franc")
+        case .INR: L("Indian Rupee")
+        case .BRL: L("Brazilian Real")
+        case .SEK: L("Swedish Krona")
+        case .SGD: L("Singapore Dollar")
+        case .HKD: L("Hong Kong Dollar")
+        case .KRW: L("South Korean Won")
+        case .MXN: L("Mexican Peso")
+        case .ZAR: L("South African Rand")
+        case .DKK: L("Danish Krone")
+        case .RON: L("Romanian Leu")
         }
     }
 }
@@ -1400,14 +3096,15 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
     case ibmBob = "IBM Bob"
     case kiro = "Kiro"
     case kimi = "Kimi"
+    case kimiCode = "Kimi Code"
     case lingtaiTui = "LingTai TUI"
     case kiloCode = "KiloCode"
     case openclaw = "OpenClaw"
+    case openclaude = "OpenClaude"
     case opencode = "OpenCode"
     case pi = "Pi"
     case qwen = "Qwen"
     case omp = "OMP"
-    case rooCode = "Roo Code"
     case crush = "Crush"
     case antigravity = "Antigravity"
     case goose = "Goose"
@@ -1417,13 +3114,18 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
+    /// Tab and empty-state label. Provider names are product names and stay
+    /// verbatim; only the synthetic "All" filter is translated.
+    var displayLabel: String {
+        self == .all ? L("All") : rawValue
+    }
+
     var providerKeys: [String] {
         switch self {
         case .cursor: ["cursor"]
         case .cursorAgent: ["cursor-agent", "cursor agent"]
         case .cline: ["cline"]
         case .codewhale: ["codewhale"]
-        case .rooCode: ["roo-code", "roo code"]
         case .kiloCode: ["kilo-code", "kilocode"]
         case .ibmBob: ["ibm-bob", "ibm bob"]
         case .openclaw: ["openclaw"]
@@ -1432,6 +3134,7 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
         case .grok: ["grok", "grok build"]
         case .hermes: ["hermes", "hermes agent"]
         case .lingtaiTui: ["lingtai-tui", "lingtai tui"]
+        case .kimiCode: ["kimicode", "kimi code"]
         default: [rawValue.lowercased()]
         }
     }
@@ -1453,13 +3156,14 @@ enum ProviderFilter: String, CaseIterable, Identifiable {
         case .kiloCode: "kilo-code"
         case .kiro: "kiro"
         case .kimi: "kimi"
+        case .kimiCode: "kimicode"
         case .lingtaiTui: "lingtai-tui"
         case .openclaw: "openclaw"
+        case .openclaude: "openclaude"
         case .opencode: "opencode"
         case .pi: "pi"
         case .qwen: "qwen"
         case .omp: "omp"
-        case .rooCode: "roo-code"
         case .crush: "crush"
         case .antigravity: "antigravity"
         case .goose: "goose"
@@ -1475,15 +3179,30 @@ extension Notification.Name {
 }
 
 enum SubscriptionLoadState: Sendable, Equatable {
-    case notBootstrapped  // no Keychain access yet — waiting for user to click Connect
-    case dormant          // previously bootstrapped; keychain not yet accessed this session
-    case bootstrapping    // user clicked Connect; reading Claude's keychain (PROMPTS)
+    case notBootstrapped  // no usable source discovered yet — waiting for Connect
+    case dormant          // source exists; prompt-free background activation is available
+    case bootstrapping    // user clicked Connect; source-owned auth may request consent
     case loading          // background fetch in progress (subscription may already be populated)
     case loaded           // success; subscription is populated
     case noCredentials    // bootstrap tried; user has no Claude credentials at all
     case failed           // generic non-recoverable failure
     case terminalFailure(reason: String?)  // refresh-token invalid; user must reconnect
     case transientFailure(retryAt: Date?)  // 429 / network blip; backing off automatically
+}
+
+extension SubscriptionLoadState {
+    /// Whether the reading stored before this fetch can be compared against it.
+    /// A provider coming back from a terminal failure, a fresh bootstrap or no
+    /// credentials has a baseline from the far side of a gap, where stale state
+    /// looks like a jump. `.dormant` is a launch state, not a gap: its baseline
+    /// is the last successful fetch, and the skew, plan and new-cycle guards
+    /// still apply to it.
+    var earlyResetBaselineIsTrusted: Bool {
+        switch self {
+        case .loaded, .loading, .dormant, .failed, .transientFailure: true
+        case .notBootstrapped, .bootstrapping, .noCredentials, .terminalFailure: false
+        }
+    }
 }
 
 enum DisplayMetric: String {
@@ -1499,6 +3218,19 @@ enum InsightMode: String, CaseIterable, Identifiable {
     case stats = "Stats"
     case optimize = "Optimize"
     var id: String { rawValue }
+
+    /// Tab label. `rawValue` stays the persisted identity.
+    var displayLabel: String {
+        switch self {
+        case .plan: L("Plan")
+        case .trend: L("Trend")
+        case .forecast: L("Forecast")
+        case .calendar: L("Calendar")
+        case .pulse: L("Pulse")
+        case .stats: L("Stats")
+        case .optimize: L("Optimize")
+        }
+    }
 }
 
 enum Period: String, CaseIterable, Identifiable {
@@ -1513,6 +3245,19 @@ enum Period: String, CaseIterable, Identifiable {
     case lifetime = "Life"
 
     var id: String { rawValue }
+
+    /// Segment label. `rawValue` stays the stable identity used for `id` and
+    /// for cache keys.
+    var displayLabel: String {
+        switch self {
+        case .today: L("Today")
+        case .sevenDays: L("7D")
+        case .thirtyDays: L("30D")
+        case .month: L("Month")
+        case .all: L("6M")
+        case .lifetime: L("Life")
+        }
+    }
 
     /// Maps to the CLI's `--period` argument values.
     var cliArg: String {
@@ -1530,12 +3275,12 @@ enum Period: String, CaseIterable, Identifiable {
 
     var menubarMetricLabel: String {
         switch self {
-        case .today: "Today"
-        case .sevenDays: "Week"
-        case .thirtyDays: "30 Days"
-        case .month: "Month"
-        case .all: "6 Months"
-        case .lifetime: "Lifetime"
+        case .today: L("Today")
+        case .sevenDays: L("Week")
+        case .thirtyDays: L("30 Days")
+        case .month: L("Month")
+        case .all: L("6 Months")
+        case .lifetime: L("Lifetime")
         }
     }
 

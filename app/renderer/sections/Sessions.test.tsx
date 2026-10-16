@@ -3,15 +3,18 @@ import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SessionRow } from '../lib/types'
-import { INITIAL_VISIBLE, Sessions } from './Sessions'
+import { formatDayLong } from '../lib/format'
+import { EMPTY_FILTERS } from '../lib/investigation'
+import type { SessionDrillRow, SessionRow } from '../lib/types'
+import { INITIAL_VISIBLE, sessionRowKey, Sessions } from './Sessions'
 
-const { getSessions } = vi.hoisted(() => ({
+const { getSessions, getSessionsContributions } = vi.hoisted(() => ({
   getSessions: vi.fn<(period: string, provider: string) => Promise<SessionRow[]>>(),
+  getSessionsContributions: vi.fn<(period: string, provider: string) => Promise<SessionRow[]>>(),
 }))
 vi.mock('../lib/ipc', async orig => {
   const actual = await orig<typeof import('../lib/ipc')>()
-  return { ...actual, codeburn: { getSessions } }
+  return { ...actual, codeburn: { getSessions, getSessionsContributions } }
 })
 
 function session(overrides: Partial<SessionRow> & Pick<SessionRow, 'sessionId' | 'project' | 'provider'>): SessionRow {
@@ -35,7 +38,7 @@ function session(overrides: Partial<SessionRow> & Pick<SessionRow, 'sessionId' |
 const rows: SessionRow[] = [
   session({
     sessionId: 'claude-session-123456789',
-    project: '-Users-torukmakto-Projects-codeburn',
+    project: '-Users-devuser-Projects-codeburn',
     provider: 'claude',
     models: ['Opus 4.8'],
     cost: 8.41,
@@ -112,7 +115,7 @@ const rows: SessionRow[] = [
 ]
 
 describe('Sessions', () => {
-  beforeEach(() => getSessions.mockReset())
+  beforeEach(() => { getSessions.mockReset(); getSessionsContributions.mockReset() })
 
   it('shows the first-load skeleton, then yields to the session list', async () => {
     let resolve!: (value: SessionRow[]) => void
@@ -136,7 +139,7 @@ describe('Sessions', () => {
     expect(screen.getByText('Codex').closest('.provider-h')).toHaveTextContent('Codex3 sessions$11.92')
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
     expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
-    expect(screen.queryByText('-Users-torukmakto-Projects-codeburn')).not.toBeInTheDocument()
+    expect(screen.queryByText('-Users-devuser-Projects-codeburn')).not.toBeInTheDocument()
   })
 
   it('filters by project and offers to clear a search with no matches', async () => {
@@ -146,7 +149,7 @@ describe('Sessions', () => {
     const search = await screen.findByRole('textbox', { name: 'Search sessions' })
 
     await user.type(search, 'codeb')
-    expect(screen.getByText('1 sessions · $8.41 · 1.5M tokens')).toBeInTheDocument()
+    expect(screen.getByText('1 session · $8.41 · 1.5M tokens')).toBeInTheDocument()
     expect(container.querySelectorAll('.session-row')).toHaveLength(1)
     expect(screen.getByText('projects/codeburn')).toBeInTheDocument()
     expect(screen.queryByText('client-api')).not.toBeInTheDocument()
@@ -187,7 +190,10 @@ describe('Sessions', () => {
     expect(container.querySelectorAll('.provider-h')).toHaveLength(2)
   })
 
-  it('caps a large list and reveals the remaining rows without another fetch', async () => {
+  // 15s timeout: the 125-row render runs the selection math over the full
+  // population and the suite executes files in parallel, so the default 5s
+  // can trip under load even though the invariant is instant in isolation.
+  it('caps a large list and reveals the remaining rows without another fetch', { timeout: 15_000 }, async () => {
     const user = userEvent.setup()
     const largeRows = Array.from({ length: INITIAL_VISIBLE + 5 }, (_, index) => session({
       sessionId: `session-${index}`,
@@ -207,7 +213,24 @@ describe('Sessions', () => {
     expect(getSessions).toHaveBeenCalledTimes(1)
   })
 
-  it('expands the live eight-stat detail inline and collapses the row in place', async () => {
+  it('opens a session row on Enter and keeps its cost breakdown out of the tab order', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue(rows)
+    render(<Sessions period="30days" provider="all" />)
+    await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
+
+    const row = screen.getByRole('button', { name: /projects\/codeburn/ })
+    // The cost breakdown inside the row is not its own tab stop.
+    expect(row.querySelector('[data-usd]')).toHaveAttribute('tabindex', '-1')
+
+    // Enter on the focused row opens it — the nested trigger no longer swallows it.
+    row.focus()
+    await user.keyboard('{Enter}')
+    expect(row).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('dialog', { name: /session details/i })).toBeInTheDocument()
+  })
+
+  it('opens the session in a side drawer, closes on Escape, and returns focus to the row', async () => {
     const user = userEvent.setup()
     getSessions.mockResolvedValue(rows)
     const { container } = render(<Sessions period="30days" provider="all" />)
@@ -217,24 +240,279 @@ describe('Sessions', () => {
     await user.click(row)
 
     expect(row).toHaveAttribute('aria-expanded', 'true')
-    const detail = screen.getByRole('region', { name: 'projects/codeburn session details' })
-    expect(detail).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '← Back to sessions' })).not.toBeInTheDocument()
-    expect(screen.getByText('claude · Opus 4.8')).toBeInTheDocument()
-    expect(screen.getByText(/Jul 11, 2026 → Jul 11, 2026 · 1h 35m/)).toBeInTheDocument()
-    expect(container.querySelectorAll('.stat')).toHaveLength(8)
+    const drawer = screen.getByRole('dialog', { name: /session details/i })
+    expect(drawer).toBeInTheDocument()
+    expect(within(drawer).getByText(/claude · projects\/codeburn/)).toBeInTheDocument()
+    // Local dates: 10:00Z is already Jul 12 at UTC+14.
+    const span = `${formatDayLong('2026-07-11T10:00:00.000Z')} → ${formatDayLong('2026-07-11T11:35:00.000Z')} · 1h 35m`
+    expect(within(drawer).getByText(new RegExp(span))).toBeInTheDocument()
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
-    for (const label of ['Cost', 'Calls', 'Turns', 'Saved', 'Input', 'Output', 'Cache read', 'Cache write']) {
-      expect(within(detail).getByText(label)).toBeInTheDocument()
+    expect(container.querySelector('.drawer-lead')).toHaveTextContent('This session cost $8.41, about 2.8x your usual.')
+    for (const label of ['Cost', 'Turns', 'Duration']) {
+      expect(within(drawer).getByText(label)).toBeInTheDocument()
     }
-    expect(screen.getByText('44')).toBeInTheDocument()
-    expect(screen.getByText('44% hit')).toBeInTheDocument()
-    expect(screen.queryByText('Context window')).not.toBeInTheDocument()
+    expect(within(drawer).getByText('2.8x your median')).toBeInTheDocument()
+    expect(within(drawer).getByText('44 calls')).toBeInTheDocument()
+    expect(within(drawer).queryByText('Selected')).not.toBeInTheDocument()
+    expect(within(drawer).getByText('Saved vs baseline: $1.25.')).toBeInTheDocument()
+    expect(within(drawer).getByText('44% hit')).toBeInTheDocument()
 
-    await user.click(row)
+    // Escape closes the drawer (the drawer's own key handler), focus returns
+    // to the row control that opened it, and the list keeps all rows.
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog', { name: /session details/i })).not.toBeInTheDocument()
     expect(row).toHaveAttribute('aria-expanded', 'false')
-    expect(screen.queryByRole('region', { name: 'projects/codeburn session details' })).not.toBeInTheDocument()
+    expect(row).toHaveFocus()
     expect(container.querySelectorAll('.session-row')).toHaveLength(6)
+  })
+
+  it('folds the token tiles behind a summary line and opens them on click', async () => {
+    const user = userEvent.setup()
+    getSessions.mockResolvedValue(rows)
+    const { container } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(rows[0]!)} />)
+    await screen.findByRole('dialog', { name: /session details/i })
+
+    // Plain rows carry no contributions, so branches and PRs have nothing to
+    // fold: the token fold is the only one.
+    const folds = container.querySelectorAll('.session-drawer details')
+    expect(folds).toHaveLength(1)
+    const fold = folds[0]!
+    expect(fold).toHaveTextContent('Tokens: 1.4M in, 64K out, 12K written to cache, 44% cache hits')
+    expect(fold).not.toHaveAttribute('open')
+
+    await user.click(container.querySelector('.session-drawer summary')!)
+    expect(fold).toHaveAttribute('open')
+    for (const label of ['Input', 'Output', 'Cache read', 'Cache write']) {
+      expect(within(fold as HTMLElement).getByText(label)).toBeInTheDocument()
+    }
+  })
+
+  it('lists folded subagents on the parent row and breaks them down in the drawer', async () => {
+    const user = userEvent.setup()
+    const parent = {
+      ...rows[0]!,
+      subagents: [
+        session({ sessionId: 'agent-small', project: rows[0]!.project, provider: 'claude', cost: 0.4 }),
+        session({ sessionId: 'agent-big', project: rows[0]!.project, provider: 'claude', cost: 2.1 }),
+      ],
+    }
+    getSessions.mockResolvedValue([parent, ...rows.slice(1)])
+    const { container } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(parent)} />)
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    expect([...container.querySelectorAll('.session-row .session-project')].map(node => node.textContent)).toContain('claude-session-123 · 2 subagents')
+    const fold = [...drawer.querySelectorAll('details')].find(node => node.textContent?.includes('2 subagents, $2.50'))!
+    expect(fold).toBeDefined()
+    const labels = [...fold.querySelectorAll('.drawer-breakdown-label')].map(node => node.textContent)
+    expect(labels).toEqual(['agent-big', 'agent-small'])
+  })
+
+  it('finds a parent by its subagent, opens the parent for a subagent key, and counts subagents apart', async () => {
+    const user = userEvent.setup()
+    const child = session({ sessionId: 'agent-needle', title: 'Fix flaky login', project: 'elsewhere', provider: 'claude', cost: 0.4 })
+    const parent = { ...rows[0]!, subagents: [child] }
+    getSessions.mockResolvedValue([parent, ...rows.slice(1)])
+    const { container } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(child)} />)
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    expect(within(drawer).getAllByText(/claude-session-123/).length).toBeGreaterThan(0)
+    expect(container.querySelector('.sessions-summary')?.textContent).toMatch(/^6 sessions \+ 1 subagent · /)
+    expect(screen.getByText(`Showing 6 of 6 top-level sessions`)).toBeInTheDocument()
+
+    for (const query of ['agent-needle', 'flaky login']) {
+      await user.clear(screen.getByLabelText('Search sessions'))
+      await user.type(screen.getByLabelText('Search sessions'), query)
+      expect([...container.querySelectorAll('.session-row .session-project')].map(node => node.textContent)).toEqual(['claude-session-123 · 1 subagent'])
+    }
+  })
+
+  it('drops the median comparison under five loaded sessions and dims an empty saving', async () => {
+    const small = [{ ...rows[0]!, savingsUSD: 0 }, rows[1]!, rows[2]!]
+    getSessions.mockResolvedValue(small)
+    const { container } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(small[0]!)} />)
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    expect(container.querySelector('.drawer-lead')).toHaveTextContent('This session cost $8.41.')
+    expect(within(drawer).getByText('full session')).toBeInTheDocument()
+    expect(within(drawer).queryByText(/your median/)).not.toBeInTheDocument()
+    expect(within(drawer).getByText('Saved vs baseline: none this session.')).toBeInTheDocument()
+  })
+
+  it('drops a multiple past 100x, floors a tiny one, shows Calls without a duration, and folds nothing for a lone main', async () => {
+    const usual = [0, 1, 2, 3, 4].map(index => session({
+      sessionId: `usual-${index}`, project: 'usual-project', provider: 'claude', cost: 1,
+    }))
+    const subject: SessionDrillRow = {
+      ...session({ sessionId: 'outlier-session', project: 'outlier-project', provider: 'claude', cost: 500, calls: 1, turns: 1, durationMs: 0 }),
+      contributions: { segments: [
+        { day: '2026-09-10', category: 'coding', branch: 'main', models: { 'Opus 4.8': 500 }, prs: [], cost: 500, calls: 1, savingsUSD: 0, inputTokens: 1_000, outputTokens: 100 },
+      ] },
+    }
+    getSessions.mockResolvedValue([subject, ...usual])
+    const { container, rerender } = render(<Sessions period="30days" provider="all" openSessionId={sessionRowKey(subject)} />)
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    // 500x the median is no more informative than the dollar figure itself.
+    expect(container.querySelector('.drawer-lead')).toHaveTextContent('This session cost $500.00.')
+    expect(within(drawer).queryByText(/your median/)).not.toBeInTheDocument()
+    expect(within(drawer).getByText('full session')).toBeInTheDocument()
+    expect(within(drawer).getByText('Calls')).toBeInTheDocument()
+    expect(within(drawer).queryByText('Duration')).not.toBeInTheDocument()
+    expect(within(drawer).getByText('1 call')).toBeInTheDocument()
+    expect(container.querySelector('.session-drawer details')).not.toHaveTextContent('Branches and pull requests')
+
+    const tiny = { ...subject, cost: 0.02 }
+    getSessions.mockResolvedValue([tiny, ...usual])
+    rerender(<Sessions period="30days" provider="all" refreshToken={1} openSessionId={sessionRowKey(tiny)} />)
+    await waitFor(() => expect(container.querySelector('.drawer-lead')).toHaveTextContent('a fraction of your usual'))
+  })
+
+  it('puts the selected figure in the Cost tile and the lead, with the session total as its caption', async () => {
+    const drillRows: SessionDrillRow[] = [
+      {
+        ...session({ sessionId: 'mixed-1', project: 'mixed-project', provider: 'claude', cost: 1.0, calls: 10, turns: 8 }),
+        contributions: { segments: [
+          { day: '2026-09-10', category: 'coding', branch: null, models: { 'Sonnet 4.5': 0.2 }, prs: [], cost: 0.2, calls: 2, savingsUSD: 0, inputTokens: 140_000, outputTokens: 20_000 },
+          { day: '2026-09-10', category: 'debugging', branch: null, models: { 'Sonnet 4.5': 0.8 }, prs: [], cost: 0.8, calls: 8, savingsUSD: 0, inputTokens: 560_000, outputTokens: 80_000 },
+        ] },
+      },
+    ]
+    getSessionsContributions.mockResolvedValue(drillRows)
+    const { container } = render(
+      <Sessions
+        period="30days"
+        provider="all"
+        filters={{ ...EMPTY_FILTERS, categories: ['coding'] }}
+        openSessionId={sessionRowKey(drillRows[0]!)}
+      />,
+    )
+    const drawer = await screen.findByRole('dialog', { name: /session details/i })
+
+    expect(container.querySelector('.drawer-lead')).toHaveTextContent('Your selection of this session cost $0.20.')
+    const cost = container.querySelector('.drawer-tiles .stat')!
+    expect(cost.querySelector('.v')).toHaveTextContent('$0.20')
+    expect(cost.querySelector('.d')).toHaveTextContent('of $1.00 total')
+    expect(within(drawer).queryByText(/^Selected/)).not.toBeInTheDocument()
+  })
+
+  it('closes (invalidates) the drawer when the open session leaves the population', async () => {
+    getSessions.mockResolvedValue(rows)
+    const onSessionClose = vi.fn()
+    const openKey = sessionRowKey(rows[0]!)
+    const view = render(<Sessions period="30days" provider="all" openSessionId={openKey} onSessionClose={onSessionClose} />)
+    await screen.findByText('6 sessions · $21.93 · 4.2M tokens')
+    expect(screen.getByRole('dialog', { name: /session details/i })).toBeInTheDocument()
+
+    // The session disappears from the refreshed population (a manual refresh
+    // bumps refreshToken): the drawer must close instead of showing a session
+    // that no longer reconciles.
+    getSessions.mockResolvedValue(rows.slice(1))
+    view.rerender(<Sessions period="30days" provider="all" refreshToken={1} openSessionId={openKey} onSessionClose={onSessionClose} />)
+    await screen.findByText(/5 sessions · \$13\.52/)
+    await waitFor(() => expect(onSessionClose).toHaveBeenCalled())
+  })
+
+  it('shows the selection chips, per-row contributions, and the separately-labeled full cost', async () => {
+    const user = userEvent.setup()
+    const drillRows: SessionRow[] = [
+      session({
+        sessionId: 'mixed-1',
+        project: 'mixed-project',
+        provider: 'claude',
+        cost: 1.0,
+        calls: 10,
+        turns: 8,
+        inputTokens: 700_000,
+        outputTokens: 100_000,
+      }),
+      session({
+        sessionId: 'other-2',
+        project: 'other-project',
+        provider: 'codex',
+        cost: 2.0,
+        calls: 4,
+        turns: 4,
+        inputTokens: 100_000,
+        outputTokens: 100_000,
+      }),
+    ].map((row, index) => index === 0
+      ? {
+          ...row,
+          contributions: { segments: [
+            { day: '2026-09-10', category: 'coding', branch: null, models: { 'Sonnet 4.5': 0.2 }, prs: [], cost: 0.2, calls: 2, savingsUSD: 0, inputTokens: 140_000, outputTokens: 20_000 },
+            { day: '2026-09-10', category: 'debugging', branch: null, models: { 'Sonnet 4.5': 0.8 }, prs: [], cost: 0.8, calls: 8, savingsUSD: 0, inputTokens: 560_000, outputTokens: 80_000 },
+          ] },
+        }
+      : row)
+    getSessionsContributions.mockResolvedValue(drillRows)
+
+    const onFiltersChange = vi.fn()
+    const { container } = render(
+      <Sessions
+        period="30days"
+        provider="all"
+        filters={{ ...EMPTY_FILTERS, categories: ['coding'] }}
+        onFiltersChange={onFiltersChange}
+      />,
+    )
+
+    // The chips bar explains the selection and offers per-chip removal + Clear.
+    await screen.findByText(/sessions? in selection/)
+    const chips = screen.getByRole('group', { name: /active investigation filters/i })
+    expect(within(chips).getByText('coding')).toBeInTheDocument()
+    expect(within(chips).getByRole('button', { name: /remove category filter coding/i })).toBeInTheDocument()
+    expect(within(chips).getByRole('button', { name: 'Clear' })).toBeInTheDocument()
+
+    // The summary reports the 0.20 contribution and keeps the session's full
+    // 1.00 visible as a separate, clearly-labeled figure.
+    const summaryBlock = within(container.querySelector('.sessions-summary') as HTMLElement)
+    expect(summaryBlock.getByText('$0.20')).toBeInTheDocument()
+    expect(summaryBlock.getByText(/full cost of these sessions \$1\.00/)).toBeInTheDocument()
+    // The non-contributing session is not listed under the selection.
+    expect(container.querySelectorAll('.session-row')).toHaveLength(1)
+
+    // The row shows its contribution first, its full cost second.
+    const row = container.querySelector('.session-row')!
+    expect(row).toHaveTextContent('$0.20')
+    expect(row).toHaveTextContent('of $1.00')
+
+    // Removing the chip clears the dimension through the callback.
+    await user.click(within(chips).getByRole('button', { name: /remove category filter coding/i }))
+    expect(onFiltersChange).toHaveBeenCalledWith(EMPTY_FILTERS)
+    expect(getSessions).not.toHaveBeenCalled()
+  })
+
+  it('paginates the selection over the full population, not just the visible page', async () => {
+    const drillRows: SessionRow[] = Array.from({ length: INITIAL_VISIBLE + 3 }, (_, index) => ({
+      ...session({
+        sessionId: `drill-${index}`,
+        project: `project-${index}`,
+        provider: 'claude',
+        cost: 1,
+        calls: 1,
+        inputTokens: 1_000,
+      }),
+      contributions: { segments: [
+        { day: '2026-09-10', category: 'coding', branch: null, models: {}, prs: [], cost: 0.5, calls: 1, savingsUSD: 0, inputTokens: 1_000, outputTokens: 0 },
+      ] },
+    }))
+    getSessionsContributions.mockResolvedValue(drillRows)
+    const { container } = render(
+      <Sessions period="30days" provider="all" filters={{ ...EMPTY_FILTERS, days: ['2026-09-10'] }} onFiltersChange={() => {}} />,
+    )
+
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 3}`)).toBeInTheDocument()
+    // One CLI read serves the whole selection: pagination must not refetch.
+    expect(getSessionsContributions).toHaveBeenCalledTimes(1)
+    // The selection totals cover the WHOLE filtered population (every row
+    // contributes its 0.5), never just the rows on the visible page. The
+    // full cost of the listed sessions ($1 each) is a separate figure.
+    const summaryBlock = within(container.querySelector('.sessions-summary') as HTMLElement)
+    expect(summaryBlock.getByText(`$${((INITIAL_VISIBLE + 3) / 2).toFixed(2)}`)).toBeInTheDocument()
+    expect(container.querySelectorAll('.session-row')).toHaveLength(INITIAL_VISIBLE)
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Show 3 more · 3 remaining' }))
+    expect(container.querySelectorAll('.session-row')).toHaveLength(INITIAL_VISIBLE + 3)
+    expect(getSessionsContributions).toHaveBeenCalledTimes(1)
   })
 
   it('renders the honest empty state', async () => {

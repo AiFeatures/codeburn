@@ -1,11 +1,14 @@
+import { readdirSync, statSync } from 'fs'
 import { readFile, readdir, stat } from 'fs/promises'
 import { basename, delimiter as pathDelimiter, join, resolve } from 'path'
 import { homedir } from 'os'
 import { createHash } from 'crypto'
 
 import type { Provider, ProbeRoot, SessionSource, SessionParser } from './types.js'
-import { getShortModelName } from '../models.js'
+import { calculateCost, getShortModelName } from '../models.js'
 import { readConfig } from '../config.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency, readSessionLines } from '../fs-utils.js'
+import { wslHomes } from '../wsl.js'
 
 export type ClaudeConfigSource = {
   id: string
@@ -31,13 +34,34 @@ function dedupeResolved(paths: string[]): string[] {
   return out
 }
 
-function claudeConfigSourceId(path: string): string {
+/// Stable id for one config directory, shared by session sources, the menubar's
+/// claudeConfigs selector, live sessions and the quota payload's claudeProfiles.
+export function claudeConfigSourceId(path: string): string {
   return 'claude-config:' + createHash('sha256').update(path).digest('hex').slice(0, 16)
 }
 
-function baseClaudeConfigLabel(path: string): string {
+/// Stable id for a Claude Desktop sessions directory.
+export function claudeDesktopSourceId(base: string): string {
+  return 'claude-desktop:' + createHash('sha256').update(resolve(base)).digest('hex').slice(0, 16)
+}
+
+// `\\wsl$\<distro>\home\<user>\.claude` -> distro, and the home's own name
+// (`<user>`, or `root`). Either separator after the prefix: the join that
+// builds these follows the host platform, which is `/` under test.
+const WSL_CONFIG_DIR = /^\\\\wsl(?:\$|\.localhost)\\([^\\/]+)[\\/](?:home[\\/])?([^\\/]+)[\\/]/i
+
+function baseClaudeConfigLabel(path: string, siblings: string[]): string {
   const normalized = resolve(path)
   if (normalized === resolve(join(homedir(), '.claude'))) return 'Default Claude'
+  // Every WSL root basenames to ".claude", so name them by distro instead of
+  // letting makeUniqueLabels number them "claude 1", "claude 2" (#1059). Two
+  // homes in the same distro would collide on the distro alone, so those also
+  // carry the user name.
+  const wsl = WSL_CONFIG_DIR.exec(path)
+  if (wsl) {
+    const shared = siblings.filter(p => WSL_CONFIG_DIR.exec(p)?.[1]?.toLowerCase() === wsl[1]!.toLowerCase())
+    return shared.length > 1 ? `${wsl[1]} (WSL, ${wsl[2]})` : `${wsl[1]} (WSL)`
+  }
   const name = basename(normalized).replace(/^\./, '').trim()
   return name || normalized
 }
@@ -66,6 +90,14 @@ function makeUniqueLabels(sources: ClaudeConfigSource[]): ClaudeConfigSource[] {
 /// ProjectSummary per project name in `src/parser.ts:scanProjectDirs`, so two
 /// dirs holding the same sanitized project slug naturally aggregate (#208).
 export async function getClaudeConfigDirs(): Promise<string[]> {
+  // WSL homes are additive, not an override: a Windows user who points
+  // CLAUDE_CONFIG_DIRS at a second Windows account still wants the sessions
+  // Claude Code wrote inside their distro (#1059). Off-win32 this is empty.
+  const wsl = wslHomes().map(home => join(home, '.claude'))
+  return dedupeResolved([...await configuredClaudeConfigDirs(), ...wsl])
+}
+
+async function configuredClaudeConfigDirs(): Promise<string[]> {
   const multi = process.env['CLAUDE_CONFIG_DIRS']
   if (multi !== undefined && multi !== '') {
     const dirs = multi
@@ -96,20 +128,92 @@ export async function discoverClaudeConfigSources(): Promise<ClaudeConfigSource[
   const dirs = await getClaudeConfigDirs()
   return makeUniqueLabels(dirs.map(path => ({
     id: claudeConfigSourceId(path),
-    label: baseClaudeConfigLabel(path),
+    label: baseClaudeConfigLabel(path, dirs),
     path,
   })))
 }
 
-export function getDesktopSessionsDir(): string {
+// Filesystem changes under an unchanged input key intentionally do not invalidate this cache.
+const desktopSessionsDirsCache = new Map<string, string[]>()
+
+function cacheDesktopSessionsDirs(key: string, candidates: string[]): string[] {
+  const dirs = dedupeResolved(candidates.map(candidate => resolve(candidate)))
+  desktopSessionsDirsCache.set(key, dirs)
+  return [...dirs]
+}
+
+export function getDesktopSessionsDirs(): string[] {
   const override = process.env['CODEBURN_DESKTOP_SESSIONS_DIR']
-  if (override) return override
-  if (process.platform === 'darwin') return join(homedir(), 'Library', 'Application Support', 'Claude', 'local-agent-mode-sessions')
-  if (process.platform === 'win32') {
-    const appData = process.env['APPDATA']?.trim()
-    return join(appData || join(homedir(), 'AppData', 'Roaming'), 'Claude', 'local-agent-mode-sessions')
+  const appDataInput = process.env['APPDATA']
+  const localAppDataInput = process.env['LOCALAPPDATA']
+  const platform = process.platform
+  // homedir() feeds every non-override branch below, so a key without it hands
+  // back the previous home's paths once the home directory moves.
+  const cacheKey = JSON.stringify([
+    platform,
+    override ?? null,
+    appDataInput ?? null,
+    localAppDataInput ?? null,
+    homedir(),
+  ])
+  const cached = desktopSessionsDirsCache.get(cacheKey)
+  if (cached) return [...cached]
+
+  if (override) return cacheDesktopSessionsDirs(cacheKey, [override])
+  if (platform === 'darwin') {
+    const appSupport = join(homedir(), 'Library', 'Application Support')
+    return cacheDesktopSessionsDirs(
+      cacheKey,
+      [
+        join(appSupport, 'Claude', 'local-agent-mode-sessions'),
+        // Current Claude Desktop 3p builds use a distinct Electron user-data
+        // directory for Cowork, while the Code surface continues to use the
+        // traditional ~/.claude project store.
+        join(appSupport, 'Claude-3p', 'local-agent-mode-sessions'),
+      ],
+    )
   }
-  return join(homedir(), '.config', 'Claude', 'local-agent-mode-sessions')
+  if (platform === 'win32') {
+    const appData = appDataInput?.trim()
+    const candidates = [
+      join(appData || join(homedir(), 'AppData', 'Roaming'), 'Claude', 'local-agent-mode-sessions'),
+    ]
+
+    const localAppData = localAppDataInput?.trim()
+    const packagesDir = join(localAppData || join(homedir(), 'AppData', 'Local'), 'Packages')
+    try {
+      const entries = readdirSync(packagesDir, { withFileTypes: true })
+        .filter(entry =>
+          entry.isDirectory() &&
+          (entry.name.startsWith('Claude_') || entry.name.includes('.Claude_')),
+        )
+        .sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0)
+
+      for (const entry of entries) {
+        const sessionsDir = join(
+          packagesDir,
+          entry.name,
+          'LocalCache',
+          'Roaming',
+          'Claude',
+          'local-agent-mode-sessions',
+        )
+        try {
+          if (statSync(sessionsDir).isDirectory()) candidates.push(sessionsDir)
+        } catch {
+          // A package may disappear or be unreadable while Packages is scanned.
+        }
+      }
+    } catch {
+      // Missing or unreadable Packages is equivalent to no MSIX candidates.
+    }
+
+    return cacheDesktopSessionsDirs(cacheKey, candidates)
+  }
+  return cacheDesktopSessionsDirs(
+    cacheKey,
+    [join(homedir(), '.config', 'Claude', 'local-agent-mode-sessions')],
+  )
 }
 
 async function findDesktopProjectDirs(base: string): Promise<string[]> {
@@ -136,6 +240,159 @@ async function findDesktopProjectDirs(base: string): Promise<string[]> {
   }
   await walk(base, 0)
   return results
+}
+
+async function findDesktopUsageLedgerFiles(base: string): Promise<string[]> {
+  const results: string[] = []
+
+  async function walk(dir: string, depth: number): Promise<void> {
+    if (depth > 8) return
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (entry.name === 'node_modules' || entry.name === '.git') continue
+
+      const full = join(dir, entry.name)
+      if (entry.name === 'usage-ledger') {
+        const ledgerEntries = await readdir(full, { withFileTypes: true }).catch(() => [])
+        for (const ledgerEntry of ledgerEntries) {
+          if (ledgerEntry.isFile() && ledgerEntry.name.endsWith('.ndjson')) {
+            results.push(join(full, ledgerEntry.name))
+          }
+        }
+        continue
+      }
+      await walk(full, depth + 1)
+    }
+  }
+
+  await walk(base, 0)
+  return results
+}
+
+type CoworkLedgerObject = Record<string, unknown>
+
+function ledgerObject(value: unknown): CoworkLedgerObject | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as CoworkLedgerObject
+    : null
+}
+
+function ledgerNumber(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return undefined
+}
+
+function ledgerTimestamp(value: unknown): string | undefined {
+  const raw = ledgerNumber(value)
+  if (raw === undefined) return undefined
+  const milliseconds = raw >= 1_000_000_000_000 ? raw : raw * 1000
+  const date = new Date(milliseconds)
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
+}
+
+function createCoworkLedgerParser(
+  source: SessionSource,
+  seenKeys: Set<string>,
+): SessionParser {
+  return {
+    async *parse() {
+      if (source.sourceKind !== 'claude-desktop-ledger') return
+
+      let lineNumber = 0
+      for await (const rawLine of readSessionLines(source.path)) {
+        lineNumber++
+        let parsed: unknown
+        try {
+          parsed = JSON.parse(rawLine)
+        } catch {
+          // Cowork appends records while a turn is in flight. Ignore a torn
+          // final line; valid records elsewhere in the ledger remain usable.
+          continue
+        }
+
+        const record = ledgerObject(parsed)
+        const surface = record?.['surface']
+        if (!record || (surface !== 'cowork' && surface !== 'code')) continue
+
+        const sessionId = typeof record['sessionId'] === 'string' ? record['sessionId'] : ''
+        const timestamp = ledgerTimestamp(record['ts'])
+        if (!sessionId || !timestamp) continue
+
+        const models = ledgerObject(record['models'])
+        if (!models) continue
+
+        for (const [model, rawUsage] of Object.entries(models)) {
+          const usage = ledgerObject(rawUsage)
+          if (!usage) continue
+
+          const inputTokens = Math.max(0, ledgerNumber(usage['inputTokens']) ?? 0)
+          const outputTokens = Math.max(0, ledgerNumber(usage['outputTokens']) ?? 0)
+          const cacheReadInputTokens = Math.max(0, ledgerNumber(usage['cacheReadTokens']) ?? 0)
+          const cacheCreationInputTokens = Math.max(0, ledgerNumber(usage['cacheWriteTokens']) ?? 0)
+          const webSearchRequests = Math.max(0, ledgerNumber(usage['webSearchRequests']) ?? 0)
+          const recordedCost = ledgerNumber(ledgerObject(usage['cost'])?.['usd'])
+          const estimatedCost = calculateCost(
+            model,
+            inputTokens,
+            outputTokens,
+            cacheCreationInputTokens,
+            cacheReadInputTokens,
+            webSearchRequests,
+            'standard',
+            0,
+            'claude',
+          )
+
+          if (
+            inputTokens === 0 &&
+            outputTokens === 0 &&
+            cacheReadInputTokens === 0 &&
+            cacheCreationInputTokens === 0 &&
+            recordedCost === undefined
+          ) {
+            continue
+          }
+
+          const deduplicationKey = `claude-cowork-ledger:${source.path}:${sessionId}:${timestamp}:${model}`
+          if (seenKeys.has(deduplicationKey)) continue
+          seenKeys.add(deduplicationKey)
+
+          yield {
+            provider: 'claude',
+            model,
+            inputTokens,
+            outputTokens,
+            cacheCreationInputTokens,
+            cacheReadInputTokens,
+            cachedInputTokens: cacheReadInputTokens,
+            reasoningTokens: 0,
+            webSearchRequests,
+            // Keep the ledger's dollar amount only as a fallback for a model
+            // CodeBurn cannot price. Known models must use CodeBurn's pricing
+            // and overrides so cached usage can be repriced later.
+            costUSD: estimatedCost,
+            ...(recordedCost !== undefined ? { fallbackCostUSD: recordedCost } : {}),
+            tools: [],
+            bashCommands: [],
+            skills: [],
+            subagentTypes: [],
+            timestamp,
+            speed: 'standard',
+            deduplicationKey,
+            userMessage: '',
+            sessionId,
+            project: surface === 'code' ? 'Claude Code' : 'Claude Cowork',
+            turnId: `${timestamp}:${lineNumber}`,
+          }
+        }
+      }
+    },
+  }
 }
 
 // ── Cowork space resolution ────────────────────────────────────────────
@@ -221,7 +478,7 @@ export const claude: Provider = {
   async probeRoots(): Promise<ProbeRoot[]> {
     const dirs = await getClaudeConfigDirs()
     const roots: ProbeRoot[] = dirs.map(dir => ({ path: join(dir, 'projects'), label: 'projects' }))
-    roots.push({ path: getDesktopSessionsDir(), label: 'desktop' })
+    roots.push(...getDesktopSessionsDirs().map(path => ({ path, label: 'desktop' })))
     return roots
   },
 
@@ -243,14 +500,19 @@ export const claude: Provider = {
         // a real and a stale path in CLAUDE_CONFIG_DIRS without breaking.
         continue
       }
-      for (const dirName of entries) {
+      // stat() (not the readdir Dirent) decides directory-ness so a symlinked
+      // project dir still counts; issue them concurrently, then apply the
+      // order-sensitive dedup serially.
+      const dirStats = await mapWithConcurrency(entries, FS_SCAN_CONCURRENCY, dirName =>
+        stat(join(projectsDir, dirName)).catch(() => null))
+      for (const [i, dirName] of entries.entries()) {
         const dirPath = join(projectsDir, dirName)
         // Resolve before deduping so two CLAUDE_CONFIG_DIRS entries that
         // reach the same projects/<slug> directory (via symlinks or
         // overlapping configs) emit only one SessionSource.
         const resolved = resolve(dirPath)
         if (seenProjectDirs.has(resolved)) continue
-        const dirStat = await stat(dirPath).catch(() => null)
+        const dirStat = dirStats[i]
         if (!dirStat?.isDirectory()) continue
         seenProjectDirs.add(resolved)
         // `project: dirName` is identical across config dirs for the same
@@ -282,59 +544,75 @@ export const claude: Provider = {
       )
     }
 
-    const desktopBase = getDesktopSessionsDir()
-    const desktopDirs = await findDesktopProjectDirs(desktopBase)
-    const sep = desktopBase.includes('\\') ? '\\' : '/'
-    // Desktop / Cowork sessions belong to no CLAUDE_CONFIG_DIR. Tag them with a
-    // distinct source so a per-config view can account for them as their own
-    // "Claude Desktop" bucket instead of silently dropping them (which made
-    // sum-of-configs < All).
-    const desktopSourceId = 'claude-desktop:' + createHash('sha256').update(resolve(desktopBase)).digest('hex').slice(0, 16)
-    for (const dirPath of desktopDirs) {
-      const resolved = resolve(dirPath)
-      if (seenProjectDirs.has(resolved)) continue
-      seenProjectDirs.add(resolved)
+    for (const desktopBase of getDesktopSessionsDirs()) {
+      const desktopDirs = await findDesktopProjectDirs(desktopBase)
+      const sep = desktopBase.includes('\\') ? '\\' : '/'
+      // Desktop / Cowork sessions belong to no CLAUDE_CONFIG_DIR. Tag them with a
+      // distinct source so a per-config view can account for them as their own
+      // "Claude Desktop" bucket instead of silently dropping them (which made
+      // sum-of-configs < All).
+      const desktopSourceId = claudeDesktopSourceId(desktopBase)
+      for (const dirPath of desktopDirs) {
+        const resolved = resolve(dirPath)
+        if (seenProjectDirs.has(resolved)) continue
+        seenProjectDirs.add(resolved)
 
-      // For Claude Desktop local-agent-mode (Cowork) sessions, the project dir
-      // lives inside local_<sessionId>/.claude/projects/. We resolve the space
-      // name from the sibling .json and spaces.json so it groups correctly.
-      // Path structure: <desktopBase>/<appId>/<workspaceId>/local_<id>/.claude/projects/<slug>
-      let projectName = basename(dirPath)
-      const resolvedBase = resolve(desktopBase)
-      if (resolved.startsWith(resolvedBase + sep) || resolved.startsWith(resolvedBase + '/')) {
-        const rel = resolved.slice(resolvedBase.length + 1)
-        const parts = rel.split(/[/\\]/)
-        // parts = [appId, workspaceId, local_sessionId, .claude, projects, slug]
-        if (
-          parts.length >= 6 &&
-          parts[2]?.startsWith('local_') &&
-          parts[3] === '.claude' &&
-          parts[4] === 'projects'
-        ) {
-          const workspaceDir = join(resolvedBase, parts[0]!, parts[1]!)
-          const sessionId = parts[2]!
-          const spaceName = await resolveCoworkSpaceName(workspaceDir, sessionId)
-          if (spaceName) projectName = spaceName
+        // For Claude Desktop local-agent-mode (Cowork) sessions, the project dir
+        // lives inside local_<sessionId>/.claude/projects/. We resolve the space
+        // name from the sibling .json and spaces.json so it groups correctly.
+        // Path structure: <desktopBase>/<appId>/<workspaceId>/local_<id>/.claude/projects/<slug>
+        let projectName = basename(dirPath)
+        const resolvedBase = resolve(desktopBase)
+        if (resolved.startsWith(resolvedBase + sep) || resolved.startsWith(resolvedBase + '/')) {
+          const rel = resolved.slice(resolvedBase.length + 1)
+          const parts = rel.split(/[/\\]/)
+          // parts = [appId, workspaceId, local_sessionId, .claude, projects, slug]
+          if (
+            parts.length >= 6 &&
+            parts[2]?.startsWith('local_') &&
+            parts[3] === '.claude' &&
+            parts[4] === 'projects'
+          ) {
+            const workspaceDir = join(resolvedBase, parts[0]!, parts[1]!)
+            const sessionId = parts[2]!
+            const spaceName = await resolveCoworkSpaceName(workspaceDir, sessionId)
+            if (spaceName) projectName = spaceName
+          }
         }
+
+        sources.push({
+          path: dirPath,
+          project: projectName,
+          provider: 'claude',
+          sourceId: desktopSourceId,
+          sourceLabel: 'Claude Desktop',
+          sourcePath: desktopBase,
+          sourceKind: 'claude-desktop',
+        })
       }
 
-      sources.push({
-        path: dirPath,
-        project: projectName,
-        provider: 'claude',
-        sourceId: desktopSourceId,
-        sourceLabel: 'Claude Desktop',
-        sourcePath: desktopBase,
-        sourceKind: 'claude-desktop',
-      })
+      // Current Claude Desktop Cowork builds also keep metered usage in a
+      // workspace-level usage-ledger/*.ndjson file. These records are separate
+      // from the Claude Code JSONL transcripts above and must be exposed as
+      // leaf sources so the generic provider cache can fingerprint and parse
+      // them incrementally.
+      for (const ledgerPath of await findDesktopUsageLedgerFiles(desktopBase)) {
+        sources.push({
+          path: ledgerPath,
+          project: 'Claude Cowork',
+          provider: 'claude',
+          sourceId: desktopSourceId,
+          sourceLabel: 'Claude Desktop',
+          sourcePath: desktopBase,
+          sourceKind: 'claude-desktop-ledger',
+        })
+      }
     }
 
     return sources
   },
 
-  createSessionParser(): SessionParser {
-    return {
-      async *parse() {},
-    }
+  createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+    return createCoworkLedgerParser(source, seenKeys)
   },
 }

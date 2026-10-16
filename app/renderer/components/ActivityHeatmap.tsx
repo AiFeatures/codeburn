@@ -1,7 +1,8 @@
 import { useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
 
-import { formatUsd } from '../lib/format'
+import { ChartTip } from './ChartTip'
+import { localeTag, t } from '../i18n'
+import { formatCount, formatUsd } from '../lib/format'
 import { dataStartKey, localDateKey } from '../lib/period'
 import type { DailyHistoryEntry } from '../lib/types'
 
@@ -16,8 +17,25 @@ type HeatmapDay = {
   noData: boolean
 }
 
-const WEEK_COUNT = 26
-const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+/** Cell box and gutter, in CSS px — must match `.ov-heat-cell` / `.ov-heatmap-cells`. */
+const CELL = 11
+const GAP = 3
+/** Six months of history: the most weeks the card ever draws. */
+const MAX_WEEKS = 26
+/** Fewest week columns between two month labels before the later one is dropped. */
+const MIN_LABEL_COLUMNS = 3
+
+function weekdays(): string[] {
+  return [
+    t('shared.weekday.sun'),
+    t('shared.weekday.mon'),
+    t('shared.weekday.tue'),
+    t('shared.weekday.wed'),
+    t('shared.weekday.thu'),
+    t('shared.weekday.fri'),
+    t('shared.weekday.sat'),
+  ]
+}
 
 function dateFromKey(key: string): Date {
   const [year, month, day] = key.split('-').map(Number)
@@ -25,7 +43,7 @@ function dateFromKey(key: string): Date {
 }
 
 function formatDate(key: string): string {
-  return dateFromKey(key).toLocaleString('en-US', {
+  return dateFromKey(key).toLocaleString(localeTag(), {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
@@ -41,24 +59,24 @@ function intensityLevel(cost: number, maxCost: number): number {
   return 4
 }
 
-function buildHeatmapDays(daily: DailyHistoryEntry[], now: Date): HeatmapDay[] {
+function buildHeatmapDays(daily: DailyHistoryEntry[], now: Date, weeks: number): HeatmapDay[] {
   const today = new Date(now.getFullYear(), now.getMonth(), now.getDate())
   const startOfWeek = new Date(today)
   startOfWeek.setDate(today.getDate() - today.getDay())
   const firstDay = new Date(startOfWeek)
-  firstDay.setDate(startOfWeek.getDate() - (WEEK_COUNT - 1) * 7)
+  firstDay.setDate(startOfWeek.getDate() - (weeks - 1) * 7)
   const byDate = new Map(daily.map(day => [day.date, day]))
   const dataStart = dataStartKey(daily)
   const visibleCosts: number[] = []
 
-  for (let offset = 0; offset < WEEK_COUNT * 7; offset++) {
+  for (let offset = 0; offset < weeks * 7; offset++) {
     const date = new Date(firstDay)
     date.setDate(firstDay.getDate() + offset)
     if (date <= today) visibleCosts.push(byDate.get(localDateKey(date))?.cost ?? 0)
   }
   const maxCost = Math.max(...visibleCosts, 0)
 
-  return Array.from({ length: WEEK_COUNT * 7 }, (_, offset) => {
+  return Array.from({ length: weeks * 7 }, (_, offset) => {
     const date = new Date(firstDay)
     date.setDate(firstDay.getDate() + offset)
     const key = localDateKey(date)
@@ -78,83 +96,105 @@ function buildHeatmapDays(daily: DailyHistoryEntry[], now: Date): HeatmapDay[] {
 }
 
 export function ActivityHeatmap({ daily, bare = false }: { daily: DailyHistoryEntry[]; bare?: boolean }) {
-  const days = useMemo(() => buildHeatmapDays(daily, new Date()), [daily])
-  const activeDays = days.filter(day => !day.isFuture && day.cost > 0).length
-  const [tip, setTip] = useState<{ day: HeatmapDay; x: number; y: number } | null>(null)
-  const [tipPosition, setTipPosition] = useState<{ left: number; top: number } | null>(null)
-  const tipRef = useRef<HTMLDivElement>(null)
-
-  useLayoutEffect(() => {
-    if (!tip) {
-      setTipPosition(null)
-      return
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const [weeks, setWeeks] = useState(MAX_WEEKS)
+  const days = useMemo(() => buildHeatmapDays(daily, new Date(), weeks), [daily, weeks])
+  const monthMarkers = useMemo(() => {
+    const markers: Array<{ key: string; label: string; week: number }> = []
+    const seen = new Set<string>()
+    for (let index = 0; index < days.length; index++) {
+      const date = dateFromKey(days[index]!.date)
+      if (index !== 0 && date.getDate() !== 1) continue
+      const key = `${date.getFullYear()}-${date.getMonth()}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      markers.push({ key, label: date.toLocaleString(localeTag(), { month: 'short' }), week: Math.floor(index / 7) })
     }
-    const width = tipRef.current?.offsetWidth ?? 180
-    const height = tipRef.current?.offsetHeight ?? 58
-    const gutter = 8
-    const cursorGap = 12
-    let left = tip.x + cursorGap
-    if (left + width > window.innerWidth - gutter) left = tip.x - width - cursorGap
-    left = Math.max(gutter, Math.min(left, window.innerWidth - width - gutter))
-    let top = tip.y - height - cursorGap
-    if (top < gutter) top = tip.y + cursorGap
-    top = Math.max(gutter, Math.min(top, window.innerHeight - height - gutter))
-    setTipPosition({ left, top })
-  }, [tip])
+    // Two labels closer than MIN_LABEL_COLUMNS would collide. Real month starts
+    // are always four or five weeks apart, so this only ever drops the leading
+    // partial month, keeping the label that actually sits over its own weeks.
+    return markers.filter((marker, index) => {
+      const next = markers[index + 1]
+      return !next || next.week - marker.week >= MIN_LABEL_COLUMNS
+    })
+  }, [days])
+  const activeDays = useMemo(
+    () => buildHeatmapDays(daily, new Date(), MAX_WEEKS).filter(day => !day.isFuture && day.cost > 0).length,
+    [daily],
+  )
+  const [tip, setTip] = useState<{ day: HeatmapDay; x: number; y: number } | null>(null)
+
+  // Draw only as many week columns as the slot can hold, right-anchored on the
+  // current week, so the grid never scrolls and never hides its newest days.
+  useLayoutEffect(() => {
+    const slot = scrollRef.current
+    if (!slot) return
+    const fit = (): void => {
+      const width = slot.clientWidth
+      if (width <= 0) return
+      setWeeks(Math.max(1, Math.min(MAX_WEEKS, Math.floor((width + GAP) / (CELL + GAP)))))
+    }
+    fit()
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(fit)
+    observer?.observe(slot)
+    return () => observer?.disconnect()
+  }, [])
 
   const head = (
     <div className={bare ? 'ov-activity-head' : 'ov-panel-head'}>
-      {bare ? <span className="ov-label">Daily activity</span> : <h3>Daily activity</h3>}
-      <span className="r ov-active-days">{activeDays} active days</span>
+      {bare ? <span className="ov-label">{t('shared.heatmap.title')}</span> : <h3>{t('shared.heatmap.title')}</h3>}
+      <span className="r ov-active-days">{t(activeDays === 1 ? 'shared.heatmap.activeDayCount.one' : 'shared.heatmap.activeDayCount.other', { count: activeDays })}</span>
     </div>
   )
   const grid = (
-    <div className="ov-heatmap-scroll">
-      <div className="ov-heatmap" role="grid" aria-label="Daily activity contribution heatmap">
-        <div className="ov-heatmap-labels" aria-hidden="true">
-          {WEEKDAYS.map((weekday, index) => (
-            <span key={weekday}>{index === 1 || index === 3 || index === 5 ? weekday : ''}</span>
-          ))}
-        </div>
-        <div className="ov-heatmap-cells">
-          {days.map(day => (
-            <button
-              type="button"
-              role="gridcell"
-              key={day.date}
-              className={`ov-heat-cell heat-level-${day.level}${day.isFuture ? ' future' : ''}${day.noData ? ' nodata' : ''}`}
-              aria-label={`${formatDate(day.date)}: ${day.noData ? 'no data recorded' : day.isFuture ? 'future day' : `${formatUsd(day.cost)}, ${day.calls} calls`}`}
-              data-date={day.date}
-              data-cost={day.cost}
-              data-active={!day.isFuture && !day.noData && day.cost > 0 ? 'true' : 'false'}
-              onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
-              onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
-              onMouseLeave={() => setTip(null)}
-            />
-          ))}
+    <div className="ov-heatmap-frame">
+      <div className="ov-heatmap-corner" aria-hidden="true" />
+      <div className="ov-heatmap-labels" aria-label={t('shared.heatmap.weekdayLabelsAria')}>
+        {weekdays().map((weekday, index) => (
+          <span key={index}>{index === 1 || index === 3 || index === 5 ? weekday : ''}</span>
+        ))}
+      </div>
+      <div className="ov-heatmap-scroll" ref={scrollRef} role="region" aria-label={t('shared.heatmap.timelineAria')}>
+        <div className="ov-heatmap-track">
+          <div className="ov-heatmap-months" aria-label={t('shared.heatmap.monthLabelsAria')}>
+            {monthMarkers.map(marker => (
+              <span key={marker.key} style={{ gridColumnStart: marker.week + 1 }}>{marker.label}</span>
+            ))}
+          </div>
+          <div className="ov-heatmap-cells" role="grid" aria-label={t('shared.heatmap.gridAria')}>
+            {days.map(day => (
+              <button
+                type="button"
+                role="gridcell"
+                key={day.date}
+                className={`ov-heat-cell heat-level-${day.level}${day.isFuture ? ' future' : ''}${day.noData ? ' nodata' : ''}`}
+                aria-label={`${formatDate(day.date)}: ${day.noData ? t('shared.chart.noDataAria') : day.isFuture ? t('shared.chart.futureDayAria') : `${formatUsd(day.cost)}, ${formatCount(day.calls, 'call')}`}`}
+                data-date={day.date}
+                data-cost={day.cost}
+                data-active={!day.isFuture && !day.noData && day.cost > 0 ? 'true' : 'false'}
+                onMouseEnter={event => setTip({ day, x: event.clientX, y: event.clientY })}
+                onMouseMove={event => setTip({ day, x: event.clientX, y: event.clientY })}
+                onMouseLeave={() => setTip(null)}
+              />
+            ))}
+          </div>
         </div>
       </div>
     </div>
   )
   const tooltip = tip
-    ? createPortal(
-        <div
-          ref={tipRef}
-          className={`chart-tip${tipPosition ? ' on' : ''}`}
-          style={{ position: 'fixed', ...(tipPosition ?? { left: 0, top: 0 }) }}
-          role="tooltip"
-        >
+    ? (
+        <ChartTip x={tip.x} y={tip.y}>
           <div className="chart-tip-d">{formatDate(tip.day.date)}</div>
           {tip.day.noData ? (
-            <div className="chart-tip-s">No data recorded</div>
+            <div className="chart-tip-s">{t('shared.chart.noData')}</div>
           ) : (
             <>
-              <div className="chart-tip-v">{tip.day.isFuture ? 'Future day' : formatUsd(tip.day.cost)}</div>
-              <div className="chart-tip-s">{tip.day.isFuture ? 'No activity yet' : `${tip.day.calls} calls`}</div>
+              <div className="chart-tip-v">{tip.day.isFuture ? t('shared.chart.futureDay') : formatUsd(tip.day.cost)}</div>
+              <div className="chart-tip-s">{tip.day.isFuture ? t('shared.chart.noActivityYet') : formatCount(tip.day.calls, 'call')}</div>
             </>
           )}
-        </div>,
-        document.body,
+        </ChartTip>
       )
     : null
 

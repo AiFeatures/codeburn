@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { buildMenubarPayload, type CombinedUsage, type PeriodData, type ProviderCost } from '../src/menubar-json.js'
+import { buildMenubarPayload, type CombinedUsage, type LocalModelSavings, type PeriodData, type ProviderCost } from '../src/menubar-json.js'
+import { getShortModelName } from '../src/models.js'
 import type { OptimizeResult } from '../src/optimize.js'
 
 function emptyPeriod(label: string): PeriodData {
@@ -19,8 +20,7 @@ function emptyPeriod(label: string): PeriodData {
 }
 
 describe('buildMenubarPayload', () => {
-  it('emits the full schema with current-period metrics and iso timestamp', () => {
-    const period: PeriodData = {
+  it('emits the full schema with current-period metrics and iso timestamp', () => {    const period: PeriodData = {
       label: '7 Days',
       cost: 1248.01,
       calls: 11231,
@@ -44,6 +44,33 @@ describe('buildMenubarPayload', () => {
     expect(payload.current.sessions).toBe(97)
     expect(payload.current.inputTokens).toBe(19100)
     expect(payload.current.outputTokens).toBe(675600)
+  })
+
+  it('carries drill-through session identity (sessionId, provider) into topSessions and project sessionDetails', () => {
+    const period: PeriodData = {
+      ...emptyPeriod('7 Days'),
+      projects: [{
+        id: '/abs/project-a',
+        name: 'project-a',
+        cost: 5,
+        savingsUSD: 0,
+        sessions: 1,
+        sessionDetails: [{
+          cost: 5, savingsUSD: 0, calls: 3, inputTokens: 100, outputTokens: 20,
+          date: '2026-09-10',
+          models: [{ name: 'Sonnet 4.5', cost: 5, savingsUSD: 0 }],
+          sessionId: 'session-a1',
+          provider: 'claude',
+        }],
+      }],
+      topSessions: [{
+        project: 'project-a', cost: 5, savingsUSD: 0, calls: 3, date: '2026-09-10',
+        sessionId: 'session-a1', provider: 'claude',
+      }],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    expect(payload.current.topSessions[0]).toMatchObject({ sessionId: 'session-a1', provider: 'claude', project: 'project-a' })
+    expect(payload.current.topProjects[0]!.sessionDetails[0]).toMatchObject({ sessionId: 'session-a1', provider: 'claude' })
   })
 
   it('passes the pull-requests payload (models, categories, cap remainder) through verbatim', () => {
@@ -142,7 +169,7 @@ describe('buildMenubarPayload', () => {
     expect(payload.current.oneShotRate).toBeNull()
   })
 
-  it('filters out the synthetic model and caps topModels at 20 so multi-model users see all their models', () => {
+  it('filters out the synthetic model and keeps every model row uncapped (#1318)', () => {
     const models = Array.from({ length: 30 }, (_, i) => ({
       name: `Model${i}`, cost: 30 - i, calls: 100,
     }))
@@ -155,8 +182,118 @@ describe('buildMenubarPayload', () => {
     }
     const payload = buildMenubarPayload(period, [], null)
     expect(payload.current.topModels.find(m => m.name === '<synthetic>')).toBeUndefined()
-    expect(payload.current.topModels).toHaveLength(20)
+    // The Overview model table renders this list whole, so a cap would drop
+    // exactly the local/free models at its tail.
+    expect(payload.current.topModels).toHaveLength(30)
     expect(payload.current.topModels[0].name).toBe('Model0')
+    expect(payload.current.topModels[29].name).toBe('Model29')
+  })
+
+  it('resolves raw model ids to display names in topModels and merges rows that collapse', () => {
+    // Day entries key models by the raw wire id (day-aggregator); the menubar
+    // must show friendly names and merge ids that share one (k3 + kimi-k3).
+    const period: PeriodData = {
+      label: 'Today',
+      cost: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      categories: [],
+      models: [
+        { name: 'k3', cost: 2.5, calls: 78 },
+        { name: 'kimi-k3', cost: 0.5, calls: 2 },
+        { name: 'kimi-for-coding', cost: 0.06, calls: 13 },
+        { name: 'k3-agent', cost: 1.2, calls: 40 },
+      ],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    const kimiK3 = payload.current.topModels.find(m => m.name === 'Kimi K3')!
+    expect(kimiK3.cost).toBeCloseTo(2.5 + 0.5 + 1.2)
+    expect(kimiK3.calls).toBe(78 + 2 + 40)
+    const k2 = payload.current.topModels.find(m => m.name === 'Kimi for Coding')!
+    expect(k2.cost).toBeCloseTo(0.06)
+    expect(payload.current.topModels.find(m => m.name === 'k3')).toBeUndefined()
+    expect(payload.current.topModels.find(m => m.name === 'k3-agent')).toBeUndefined()
+  })
+
+  it('merges per-model token counts under the same display-name grouping as cost', () => {
+    const period: PeriodData = {
+      label: 'Today',
+      cost: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      categories: [],
+      models: [
+        { name: 'k3', cost: 2.5, calls: 78, inputTokens: 1000, outputTokens: 200, cacheReadTokens: 3000, cacheWriteTokens: 400 },
+        { name: 'kimi-k3', cost: 0.5, calls: 2, inputTokens: 10, outputTokens: 20, cacheReadTokens: 30, cacheWriteTokens: 40 },
+      ],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    const kimiK3 = payload.current.topModels.find(m => m.name === 'Kimi K3')!
+    expect(kimiK3.inputTokens).toBe(1010)
+    expect(kimiK3.outputTokens).toBe(220)
+    expect(kimiK3.cacheReadTokens).toBe(3030)
+    expect(kimiK3.cacheWriteTokens).toBe(440)
+  })
+
+  it('keeps known-zero per-model counts as zeros instead of dashes or drops', () => {
+    const period: PeriodData = {
+      label: 'Today',
+      cost: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      categories: [],
+      models: [
+        { name: 'k3', cost: 0, calls: 3, inputTokens: 0, outputTokens: 0, cacheReadTokens: 500, cacheWriteTokens: 0 },
+      ],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    const row = payload.current.topModels[0]!
+    expect(row.inputTokens).toBe(0)
+    expect(row.outputTokens).toBe(0)
+    expect(row.cacheReadTokens).toBe(500)
+    expect(row.cacheWriteTokens).toBe(0)
+  })
+
+  it('omits per-model counts for a row any legacy contributor without counts folded into', () => {
+    // A period assembled from older rows that never carried counts must not
+    // grow a plausible-looking partial sum: unknown stays absent.
+    const period: PeriodData = {
+      label: 'Today',
+      cost: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      categories: [],
+      models: [
+        { name: 'k3', cost: 2.5, calls: 78, inputTokens: 1000, outputTokens: 200, cacheReadTokens: 3000, cacheWriteTokens: 400 },
+        { name: 'kimi-k3', cost: 0.5, calls: 2 },
+        { name: 'kimi-for-coding', cost: 0.06, calls: 13, inputTokens: 5, outputTokens: 6, cacheReadTokens: 7, cacheWriteTokens: 8 },
+      ],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    const merged = payload.current.topModels.find(m => m.name === 'Kimi K3')!
+    expect(merged.inputTokens).toBeUndefined()
+    expect(merged.outputTokens).toBeUndefined()
+    expect(merged.cacheReadTokens).toBeUndefined()
+    expect(merged.cacheWriteTokens).toBeUndefined()
+    // A row whose every contributor carried counts keeps them.
+    const intact = payload.current.topModels.find(m => m.name === getShortModelName('kimi-for-coding'))!
+    expect(intact.inputTokens).toBe(5)
+    expect(intact.outputTokens).toBe(6)
+    expect(intact.cacheReadTokens).toBe(7)
+    expect(intact.cacheWriteTokens).toBe(8)
+  })
+
+  it('keeps merged counts unknown regardless of the order contributors arrive in', () => {
+    const period: PeriodData = {
+      label: 'Today',
+      cost: 0, calls: 0, sessions: 0,
+      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+      categories: [],
+      models: [
+        { name: 'kimi-k3', cost: 0.5, calls: 2 },
+        { name: 'k3', cost: 2.5, calls: 78, inputTokens: 1000, outputTokens: 200, cacheReadTokens: 3000, cacheWriteTokens: 400 },
+      ],
+    }
+    const payload = buildMenubarPayload(period, [], null)
+    const merged = payload.current.topModels.find(m => m.name === 'Kimi K3')!
+    expect(merged.inputTokens).toBeUndefined()
+    expect(merged.cacheWriteTokens).toBeUndefined()
   })
 
   it('caps topActivities at 20 so all task categories can surface', () => {
@@ -237,14 +374,104 @@ describe('buildMenubarPayload', () => {
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     // providerDetails carries the internal id (round-trips as --provider) + label.
     expect(payload.current.providerDetails).toEqual([
-      { id: 'grok', label: 'Grok Build', cost: 12.5 },
-      { id: 'cursor-agent', label: 'Cursor Agent', cost: 3.4 },
+      { id: 'grok', label: 'Grok Build', cost: 12.5, calls: 0, hasUsage: true },
+      { id: 'cursor-agent', label: 'Cursor Agent', cost: 3.4, calls: 0, hasUsage: true },
     ])
     // ... while the existing providers map keys stay the lowercased display names.
     expect(payload.current.providers).toEqual({ 'grok build': 12.5, 'cursor agent': 3.4 })
   })
 
-  it('keeps zero-cost providers in the dict so installed-but-unused providers still render as tabs', () => {
+  it('carries per-provider tokens and sessions into providerDetails', () => {
+    const providers: ProviderCost[] = [
+      { name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 },
+      { name: 'codex', displayName: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4 },
+    ]
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 },
+      { id: 'codex', label: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4 },
+    ])
+  })
+
+  it('carries per-provider cache read into providerDetails', () => {
+    const providers: ProviderCost[] = [
+      { name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12, cacheReadTokens: 4_200_000 },
+      { name: 'codex', displayName: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4, cacheReadTokens: 0 },
+    ]
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12, cacheReadTokens: 4_200_000 },
+      { id: 'codex', label: 'Codex', cost: 88.84, calls: 642, hasUsage: true, inputTokens: 3_000_000, outputTokens: 150_000, sessions: 4, cacheReadTokens: 0 },
+    ])
+  })
+
+  it('omits the cache-read key entirely when no day reported it', () => {
+    // Add-only contract: absent means unknown, not zero, so a legacy row must
+    // stay absent rather than being emitted as 0.
+    const payload = buildMenubarPayload(
+      emptyPeriod('Today'),
+      [{ name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 }],
+      null,
+    )
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true, inputTokens: 6_000_000, outputTokens: 250_000, sessions: 12 },
+    ])
+    expect(Object.keys(payload.current.providerDetails[0]!)).not.toContain('cacheReadTokens')
+  })
+
+  it('drops a partial cache-read sum when an active day lacked counts', () => {
+    // A fold that summed some days but missed a legacy active day must not be
+    // labelled complete: the emitter omits the key rather than publish a
+    // partial number.
+    const payload = buildMenubarPayload(
+      emptyPeriod('Today'),
+      [{ name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true, cacheReadTokens: 4_200_000, cacheReadIncomplete: true }],
+      null,
+    )
+    expect(Object.keys(payload.current.providerDetails[0]!)).not.toContain('cacheReadTokens')
+  })
+
+  it('omits the token and session keys entirely when the period has no breakdown', () => {
+    // Add-only contract: a consumer must be able to tell "no breakdown" from
+    // zero, so absent stays absent rather than being emitted as 0.
+    const payload = buildMenubarPayload(
+      emptyPeriod('Today'),
+      [{ name: 'claude', displayName: 'Claude', cost: 190.1, calls: 900, hasUsage: true }],
+      null,
+    )
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 190.1, calls: 900, hasUsage: true },
+    ])
+    expect(Object.keys(payload.current.providerDetails[0]!)).not.toContain('inputTokens')
+  })
+
+  it('preserves zero-cost provider usage counts for menubar provider visibility', () => {
+    const providers = [
+      { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 7 },
+      { name: 'claude', displayName: 'Claude', cost: 0, calls: 0 },
+    ] satisfies Array<ProviderCost & { calls: number }>
+
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'hermes', label: 'Hermes Agent', cost: 0, calls: 7, hasUsage: true },
+      { id: 'claude', label: 'Claude', cost: 0, calls: 0, hasUsage: false },
+    ])
+  })
+
+  it('preserves token-only provider activity even when cost and behavioral calls are zero', () => {
+    const providers = [
+      { name: 'hermes', displayName: 'Hermes Agent', cost: 0, calls: 0, hasUsage: true },
+    ] satisfies Array<ProviderCost & { calls: number; hasUsage: boolean }>
+
+    const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
+
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'hermes', label: 'Hermes Agent', cost: 0, calls: 0, hasUsage: true },
+    ])
+  })
+
+  it('keeps the legacy provider dict additive while providerDetails remains the activity authority', () => {
     const providers: ProviderCost[] = [
       { name: 'claude', displayName: 'Claude', cost: 76.45 },
       { name: 'codex', displayName: 'Codex', cost: 0 },
@@ -252,6 +479,11 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45, codex: 0, cursor: 2.18 })
+    expect(payload.current.providerDetails).toEqual([
+      { id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true },
+      { id: 'codex', label: 'Codex', cost: 0, calls: 0, hasUsage: false },
+      { id: 'cursor', label: 'Cursor', cost: 2.18, calls: 0, hasUsage: true },
+    ])
   })
 
   it('includes up to 365 daily history entries sorted ascending by date', () => {
@@ -324,7 +556,7 @@ describe('buildMenubarPayload', () => {
     ]
     const payload = buildMenubarPayload(emptyPeriod('Today'), providers, null)
     expect(payload.current.providers).toEqual({ claude: 76.45 })
-    expect(payload.current.providerDetails).toEqual([{ id: 'claude', label: 'Claude', cost: 76.45 }])
+    expect(payload.current.providerDetails).toEqual([{ id: 'claude', label: 'Claude', cost: 76.45, calls: 0, hasUsage: true }])
   })
 
   it('omits combined usage by default and accepts the documented combined shape when attached', () => {
@@ -387,5 +619,38 @@ describe('buildMenubarPayload', () => {
         { id: 'claude-config:b', label: 'claude-personal', path: '/tmp/claude-personal' },
       ],
     })
+  })
+
+  it('sets stale:true when the caller reports an incomplete hydration', () => {
+    const payload = buildMenubarPayload(emptyPeriod('Today'), [], null, undefined, undefined, undefined, undefined, undefined, undefined, true)
+    expect(payload.stale).toBe(true)
+  })
+
+  it('omits stale on a normal fresh build', () => {
+    const payload = buildMenubarPayload(emptyPeriod('Today'), [], null)
+    expect(payload.stale).toBeUndefined()
+  })
+
+  it('passes localModelSavings.byModel.outputTokens through as billable output', () => {
+    // usage-aggregator writes billableOutputTokens into this field while the
+    // provider is still known. Exclusive 10+3 → 13; inclusive 10+3 → 10.
+    const localModelSavings: LocalModelSavings = {
+      totalUSD: 2,
+      calls: 2,
+      byModel: [
+        { name: 'Grok 4', calls: 1, actualUSD: 0, savingsUSD: 1, baselineModel: 'gpt-4o', inputTokens: 0, outputTokens: 13 },
+        { name: 'GPT-5.4', calls: 1, actualUSD: 0, savingsUSD: 1, baselineModel: 'gpt-4o', inputTokens: 0, outputTokens: 10 },
+      ],
+      byProvider: [
+        { name: 'grok', calls: 1, savingsUSD: 1 },
+        { name: 'codex', calls: 1, savingsUSD: 1 },
+      ],
+    }
+    const period: PeriodData = { ...emptyPeriod('Today'), outputTokens: 23 }
+    const payload = buildMenubarPayload(period, [], null, undefined, undefined, undefined, { localModelSavings })
+    expect(payload.current.outputTokens).toBe(23)
+    expect(payload.current.localModelSavings.byModel).toEqual(localModelSavings.byModel)
+    expect(payload.current.localModelSavings.byModel[0]!.outputTokens).toBe(13)
+    expect(payload.current.localModelSavings.byModel[1]!.outputTokens).toBe(10)
   })
 })

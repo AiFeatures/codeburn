@@ -4,7 +4,7 @@ import { homedir, platform } from 'os'
 
 import { calculateCost } from '../models.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, type SqliteDatabase } from '../sqlite.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 /// Crush stores per-project SQLite databases discovered through a JSON registry.
 /// We only read both. Schema source: charmbracelet/crush
@@ -54,13 +54,14 @@ async function loadRegistry(path: string): Promise<ProjectEntry[]> {
   } catch {
     return []
   }
-  // Crush writes projects.json as an object keyed by project id. Older builds
-  // (and tokscale's sample fixtures) emit an array. Accept both shapes.
   let entries: unknown[]
   if (Array.isArray(parsed)) {
     entries = parsed
   } else if (parsed && typeof parsed === 'object') {
-    entries = Object.values(parsed)
+    const registry = parsed as Record<string, unknown>
+    // Crush has used a {"projects": [...]} wrapper since the registry began.
+    // Array and keyed-object forms remain for compatibility with existing users.
+    entries = Array.isArray(registry['projects']) ? registry['projects'] : Object.values(registry)
   } else {
     return []
   }
@@ -181,6 +182,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD,
+          ...(cost > 0 ? { costFromBilling: true } : {}),
           tools: [],
           bashCommands: [],
           timestamp: epochSecondsToIso(session.updated_at ?? session.created_at),
@@ -234,6 +236,10 @@ export function createCrushProvider(): Provider {
 
     toolDisplayName(rawTool: string): string {
       return rawTool
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: getRegistryPath(), label: 'registry' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

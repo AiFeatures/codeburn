@@ -4,17 +4,24 @@ import { homedir } from 'os'
 
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 import { formatCost as baseCost, getCurrency } from './currency.js'
-import { findUnpricedModels, getShortModelName } from './models.js'
-import { markEstimated } from './format.js'
+import { findUnpricedModels, modelRowKey, unpricedModelHint } from './models.js'
+import { callBillableOutputTokens, countSessions, sessionBillableOutputTokens, sessionModelBillableOutputTokens } from './session-output.js'
+import { markEstimated, excludedGatewayNote, isEstimatedCost, ESTIMATED_COST_LEGEND } from './format.js'
+import { AGGREGATE_ONLY_PROVIDER } from './parser.js'
+import { maxOf } from './math-utils.js'
+import { formatSessionCount, SESSION_COUNT_HELP, type SessionCountBasis } from './session-count-label.js'
+import { CURSOR_IMPORT_KEY_PREFIX } from './cursor-import.js'
+import { normalizeAbsProjectPathKey } from './parser.js'
 import { dateKey } from './day-aggregator.js'
 import type { DailyEntry } from './daily-cache.js'
 import type { BudgetStatus, BudgetTier } from './budget.js'
+import { folderNameOriginKey, isTemporaryProjectPath, linkedOriginKey, originRepoName, projectOriginKey, TEMPORARY_PROJECTS } from './git-origin.js'
 
 // Display-only helpers. The shared formatters omit thousands separators and
 // abbreviate; here we show full, comma-grouped numbers so the tables read like
 // a precise statement. Aggregation uses raw numbers; these only affect render.
 function formatCost(usd: number): string {
-  return baseCost(usd).replace(/(\d)(?=(\d{3})+(\.|$))/g, '$1,')
+  return baseCost(usd).replace(/(?<!\.\d*)(\d)(?=(\d{3})+(\.|$))/g, '$1,')
 }
 function formatDisplayCost(amount: number): string {
   const { rate } = getCurrency()
@@ -44,12 +51,36 @@ function projectName(p: ProjectSummary): string {
   return p.project.split('-').filter(Boolean).pop() || p.project
 }
 
+/** #1260: aggregate by abs path identity so /a/vault != /b/vault. */
+function projectAggKey(p: ProjectSummary): string {
+  return normalizeAbsProjectPathKey(p.projectPath ?? '') ?? `label:${projectName(p).toLowerCase()}`
+}
+
+function disambiguatedProjectLabel(key: string, sample: ProjectSummary, basenameCounts: Map<string, number>): string {
+  const base = projectName(sample)
+  if ((basenameCounts.get(base) ?? 0) <= 1) return base
+  const path = (sample.projectPath ?? '').trim().replace(/\\/g, '/').replace(/\/+$/, '')
+  if (path && isAbsoluteProjectPath(path)) {
+    const parts = path.split('/').filter(Boolean)
+    if (parts.length >= 2) return parts.slice(-2).join('/')
+    return path
+  }
+  return sample.project || base || key
+}
+
 type Col = { header: string; right?: boolean }
 type OverviewBudget = {
   tier: BudgetTier
   status: BudgetStatus
   inProgress: boolean
 }
+
+// Local Cursor rows are priced from IDE composer bubbles, which never see the
+// context Cursor re-sends on every request, so their dollars are a local
+// estimate that can sit far below the dashboard bill (#1545). Imported events
+// are Cursor's own numbers; covered local rows are already dropped at serve
+// time, so any non-imported Cursor call that survives is an uncovered estimate.
+const CURSOR_LOCAL_PROVIDERS = new Set(['cursor', 'cursor-agent'])
 
 // Visible width, ignoring ANSI color codes, so padding stays aligned.
 function vlen(s: string): number {
@@ -59,7 +90,7 @@ function vlen(s: string): number {
 
 function renderTable(c: ChalkInstance, cols: Col[], rows: string[][]): string {
   const widths = cols.map((col, i) =>
-    Math.max(vlen(col.header), ...rows.map((r) => vlen(r[i] ?? ''))),
+    maxOf(rows.map((r) => vlen(r[i] ?? '')), vlen(col.header)),
   )
   const pad = (s: string, w: number, right?: boolean): string => {
     const fill = ' '.repeat(Math.max(0, w - vlen(s)))
@@ -91,12 +122,19 @@ export type OverviewDurable = {
   savingsUSD: number
   calls: number
   sessions: number
+  sessionCountBasis?: SessionCountBasis
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
   days: DailyEntry[]
   carriedCostUSD: number
+  /// Cost a --project/--exclude filter could not attribute (cached days with no
+  /// per-project split). Optional so callers that never filter can omit it.
+  unattributedCostUSD?: number
+  /// Gateway spend shown as its own labelled `By tool` row but deliberately
+  /// not in `cost`. Optional so callers that never build it can omit it.
+  excludedGateway?: { costUSD: number; calls: number; tokens: number }
 }
 
 export function renderOverview(
@@ -118,26 +156,31 @@ export function renderOverview(
 
   let cost = 0, savings = 0, calls = 0, sessions = 0
   let inTok = 0, outTok = 0, cacheR = 0, cacheW = 0
+  let cursorLocalEstimateUSD = 0
   const byProvider = new Map<string, { cost: number; tokens: number }>()
   const byModel = new Map<string, { cost: number; calls: number; tokens: number; estimatedCost: number }>()
   const byCat = new Map<string, { cost: number; turns: number }>()
   const byTool = new Map<string, number>()
   const byDay = new Map<string, { cost: number; tokens: number; providers: Set<string> }>()
-  const byProject = new Map<string, { cost: number; sessions: number }>()
+  const byProject = new Map<string, { cost: number; sessions: number; sample: ProjectSummary; repo?: string; byFolderName?: boolean }>()
 
+  sessions = countSessions(projects)
   for (const p of projects) {
     cost += p.totalCostUSD
     savings += p.totalSavingsUSD
     calls += p.totalApiCalls
-    sessions += p.sessions.length
-    const pname = projectName(p)
-    const pe = byProject.get(pname) ?? { cost: 0, sessions: 0 }
+    const realOrigin = linkedOriginKey(p.projectPath) ?? projectOriginKey(p.projectPath)
+    const origin = realOrigin ?? folderNameOriginKey(p.projectPath)
+    const temporary = !origin && isTemporaryProjectPath(p.projectPath)
+    const pkey = origin ? `origin:${origin}` : temporary ? TEMPORARY_PROJECTS : projectAggKey(p)
+    const pe = byProject.get(pkey) ?? { cost: 0, sessions: 0, sample: p, ...(origin ? { repo: originRepoName(origin) } : temporary ? { repo: 'Temporary folders' } : {}) }
     pe.cost += p.totalCostUSD
     pe.sessions += p.sessions.length
-    byProject.set(pname, pe)
+    if (origin && !realOrigin) pe.byFolderName = true
+    byProject.set(pkey, pe)
     for (const s of p.sessions) {
       inTok += s.totalInputTokens
-      outTok += s.totalOutputTokens
+      outTok += sessionBillableOutputTokens(s)
       cacheR += s.totalCacheReadTokens
       cacheW += s.totalCacheWriteTokens
       for (const [m, d] of Object.entries(s.modelBreakdown)) {
@@ -145,7 +188,14 @@ export function renderOverview(
         e.cost += d.costUSD
         e.calls += d.calls
         e.estimatedCost += d.estimatedCostUSD ?? 0
-        e.tokens += d.tokens.inputTokens + d.tokens.outputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        e.tokens += d.tokens.inputTokens + d.tokens.cacheReadInputTokens + d.tokens.cacheCreationInputTokens
+        byModel.set(m, e)
+      }
+      // Output must be billed per call while provider identity is still known.
+      // Join on the same key as parser modelBreakdown (getShortModelName), not raw call.model.
+      for (const [m, output] of Object.entries(sessionModelBillableOutputTokens(s))) {
+        const e = byModel.get(m) ?? { cost: 0, calls: 0, tokens: 0, estimatedCost: 0 }
+        e.tokens += output
         byModel.set(m, e)
       }
       for (const [cat, d] of Object.entries(s.categoryBreakdown)) {
@@ -160,11 +210,17 @@ export function renderOverview(
       for (const t of s.turns) {
         const day = dateKey(t.timestamp || t.assistantCalls[0]?.timestamp || '')
         for (const call of t.assistantCalls) {
-          const tk = call.usage.inputTokens + call.usage.outputTokens + call.usage.cacheReadInputTokens + call.usage.cacheCreationInputTokens
+          const usage = call.usage
+          const billableOut = callBillableOutputTokens(call)
+          const tk = (usage?.inputTokens ?? 0) + billableOut + (usage?.cacheReadInputTokens ?? 0) + (usage?.cacheCreationInputTokens ?? 0)
           const pv = byProvider.get(call.provider) ?? { cost: 0, tokens: 0 }
           pv.cost += call.costUSD
           pv.tokens += tk
           byProvider.set(call.provider, pv)
+          if (CURSOR_LOCAL_PROVIDERS.has(call.provider)
+            && !(call.deduplicationKey ?? '').startsWith(CURSOR_IMPORT_KEY_PREFIX)) {
+            cursorLocalEstimateUSD += call.costUSD
+          }
           if (day) {
             const dd = byDay.get(day) ?? { cost: 0, tokens: 0, providers: new Set<string>() }
             dd.cost += call.costUSD
@@ -209,7 +265,10 @@ export function renderOverview(
   const kv = (k: string, v: string): string => '  ' + c.dim(k.padEnd(11)) + v
   out.push(kv('Cost', c.bold(formatCost(cost))))
   out.push(kv('Tokens', formatTokens(totalTokens) + c.dim('   (breakdown below)')))
-  out.push(kv('Calls', formatCount(calls) + c.dim('   sessions ') + formatCount(sessions)))
+  out.push(kv('Calls', formatCount(calls) + c.dim('   ') + formatSessionCount(sessions, durable ? durable.sessionCountBasis : 'identity')))
+  if (durable && durable.sessionCountBasis !== 'identity' && sessions > 0) {
+    out.push(kv('', c.dim(SESSION_COUNT_HELP)))
+  }
   out.push(kv('Cache hit', `${cacheHit.toFixed(1)}%`))
   if (savings > 0) out.push(kv('Savings', formatCost(savings) + c.dim(' (local models)')))
   const unpriced = findUnpricedModels(
@@ -221,7 +280,7 @@ export function renderOverview(
       .join(', ')
     const more = unpriced.length > 3 ? ` +${unpriced.length - 3} more` : ''
     out.push(kv('Unpriced', c.yellow(`${unpriced.length} model${unpriced.length === 1 ? '' : 's'} at $0: `) + shown + more))
-    out.push(kv('', c.dim('Fix: codeburn model-alias "<model>" <known-model>')))
+    out.push(kv('', c.dim(unpricedModelHint())))
   }
   if (opts.budget) {
     const label = opts.budget.tier === 'daily'
@@ -256,15 +315,25 @@ export function renderOverview(
     out.push('')
   }
 
-  // By tool (provider)
+  // By tool (provider). The aggregate-only gateway is never in `byProvider`
+  // (the corpus filter dropped it) and never in `cost`, so the shares below
+  // still sum over the counted tools only; it gets one labelled row of its own
+  // with no share, because a share of a total it is not in is meaningless.
+  const excludedGateway = durable?.excludedGateway
+  const gatewayRow = excludedGateway && excludedGateway.costUSD > 0
+    ? [[`${AGGREGATE_ONLY_PROVIDER} (not in total)`, formatCost(excludedGateway.costUSD), formatTokens(excludedGateway.tokens), '-']]
+    : []
   const providerRows = [...byProvider.entries()]
     .filter(([, v]) => v.cost > 0 || v.tokens > 0)
     .sort((a, b) => b[1].cost - a[1].cost)
-  if (providerRows.length) {
+  if (providerRows.length || gatewayRow.length) {
     out.push(heading('By tool'))
     out.push(renderTable(c,
       [{ header: 'Tool' }, { header: 'Cost', right: true }, { header: 'Tokens', right: true }, { header: 'Share', right: true }],
-      providerRows.map(([name, v]) => [name, formatCost(v.cost), formatTokens(v.tokens), cost > 0 ? `${Math.round((v.cost / cost) * 100)}%` : '0%']),
+      [
+        ...providerRows.map(([name, v]) => [name, formatCost(v.cost), formatTokens(v.tokens), cost > 0 ? `${Math.round((v.cost / cost) * 100)}%` : '0%']),
+        ...gatewayRow,
+      ],
     ))
     out.push('')
   }
@@ -275,10 +344,10 @@ export function renderOverview(
     out.push(heading('Top models'))
     out.push(renderTable(c,
       [{ header: 'Model' }, { header: 'Cost', right: true }, { header: 'Calls', right: true }, { header: 'Tokens', right: true }],
-      modelRows.map(([m, v]) => [getShortModelName(m), markEstimated(formatCost(v.cost), v.estimatedCost > 0), formatCount(v.calls), formatTokens(v.tokens)]),
+      modelRows.map(([m, v]) => [modelRowKey(m), markEstimated(formatCost(v.cost), isEstimatedCost(v.cost, v.estimatedCost, formatCost(v.cost))), formatCount(v.calls), formatTokens(v.tokens)]),
     ))
-    if (modelRows.some(([, v]) => v.estimatedCost > 0)) {
-      out.push('  ' + c.dim('~ estimated cost (priced from estimated tokens)'))
+    if (modelRows.some(([, v]) => isEstimatedCost(v.cost, v.estimatedCost, formatCost(v.cost)))) {
+      out.push('  ' + c.dim(ESTIMATED_COST_LEGEND))
     }
     out.push('')
   }
@@ -294,14 +363,20 @@ export function renderOverview(
     out.push('')
   }
 
-  // Top projects
+  // Top projects (#1260: labels disambiguate when basename collides across abs paths)
   const projRows = [...byProject.entries()].sort((a, b) => b[1].cost - a[1].cost).slice(0, 10)
   if (projRows.length) {
+    const basenameCounts = new Map<string, number>()
+    for (const [, v] of projRows) {
+      const b = projectName(v.sample)
+      basenameCounts.set(b, (basenameCounts.get(b) ?? 0) + 1)
+    }
     out.push(heading('Top projects'))
     out.push(renderTable(c,
       [{ header: 'Project' }, { header: 'Cost', right: true }, { header: 'Sessions', right: true }],
-      projRows.map(([name, v]) => [name, formatCost(v.cost), formatCount(v.sessions)]),
+      projRows.map(([key, v]) => [(v.repo ?? disambiguatedProjectLabel(key, v.sample, basenameCounts)) + (v.byFolderName ? ' *' : ''), formatCost(v.cost), formatCount(v.sessions)]),
     ))
+    if (projRows.some(([, v]) => v.byFolderName)) out.push(c.dim('* includes deleted folders matched by folder name'))
     out.push('')
   }
 
@@ -339,7 +414,7 @@ export function renderOverview(
   }
 
   const topTool = providerRows[0]?.[0]
-  const topModel = modelRows[0] ? getShortModelName(modelRows[0][0]) : ''
+  const topModel = modelRows[0] ? modelRowKey(modelRows[0][0]) : ''
   const mostly = topTool ? `, mostly ${topTool}${topModel ? ` / ${topModel}` : ''}` : ''
   out.push(c.dim('Bottom line: ') + `${opts.label} totals ${formatCost(cost)} across ${formatTokens(totalTokens)} tokens${mostly}.`)
 
@@ -348,6 +423,25 @@ export function renderOverview(
   // cache); it just can't be re-derived from surviving files anymore.
   if (durable && durable.carriedCostUSD > 0) {
     out.push(c.dim(`  includes ${formatCost(durable.carriedCostUSD)} preserved from expired session logs`))
+  }
+
+  // A project filter cannot claim days the cache holds without a project split
+  // (recorded before that split existed), so they sit outside this total. Say how
+  // much rather than let the filtered figure look inexplicably short.
+  if (durable && (durable.unattributedCostUSD ?? 0) > 0) {
+    out.push(c.dim(`  excludes ${formatCost(durable.unattributedCostUSD!)} from days with no per-project history`))
+  }
+
+  const gatewayNote = excludedGatewayNote(durable?.excludedGateway?.costUSD ?? 0)
+  if (gatewayNote) out.push(c.dim(`  ${gatewayNote}`))
+
+  // #1545: say so when Cursor dollars in this period are local estimates
+  // rather than Cursor's bill, instead of letting the figure look exact.
+  if (cursorLocalEstimateUSD > 0) {
+    out.push(c.dim(
+      `  includes ${formatCost(cursorLocalEstimateUSD)} of Cursor priced from local files, not Cursor's bill — ` +
+      'codeburn import cursor <file.csv> replaces it with the dashboard\'s own totals',
+    ))
   }
 
   return out.join('\n') + '\n'

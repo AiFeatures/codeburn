@@ -33,7 +33,11 @@ function emptyDay(date: string, cost = 0, calls = 0): DailyEntry {
     cacheWriteTokens: 0,
     editTurns: 0,
     oneShotTurns: 0,
-    models: {},
+    // A day's model rows have to account for its calls and cost, or loading it
+    // credits the difference to the carried row.
+    models: calls || cost
+      ? { 'Opus 4.7': { calls, cost, savingsUSD: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } }
+      : {},
     categories: {},
     providers: {},
   }
@@ -149,6 +153,58 @@ describe('loadDailyCache', () => {
     expect(JSON.parse(await readFile(legacy, 'utf-8'))).toEqual(saved)
   })
 
+  it('credits a token remainder to the carried row even when cost and calls reconcile', async () => {
+    const saved = {
+      version: 5,
+      lastComputedDate: '2026-05-02',
+      days: [
+        {
+          // cost + calls reconcile with the model rows, but the model tokens
+          // fall 200 input / 100 output short of the day totals.
+          date: '2026-05-02',
+          cost: 10, calls: 5, sessions: 1,
+          inputTokens: 1000, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0,
+          editTurns: 0, oneShotTurns: 0,
+          models: { 'Opus 4.7': { calls: 5, cost: 10, savingsUSD: 0, inputTokens: 800, outputTokens: 400, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+          categories: {}, providers: {},
+        },
+        {
+          // Fully reconciled — must not grow a carried row.
+          date: '2026-05-03',
+          cost: 4, calls: 2, sessions: 1,
+          inputTokens: 600, outputTokens: 300, cacheReadTokens: 0, cacheWriteTokens: 0,
+          editTurns: 0, oneShotTurns: 0,
+          models: { 'Opus 4.7': { calls: 2, cost: 4, savingsUSD: 0, inputTokens: 600, outputTokens: 300, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+          categories: {}, providers: {},
+        },
+      ],
+    }
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.json'), JSON.stringify(saved), 'utf-8')
+
+    const cache = await loadDailyCache()
+    const short = cache.days.find(d => d.date === '2026-05-02')!
+    const reconciled = cache.days.find(d => d.date === '2026-05-03')!
+
+    // The carried row picks up exactly the missing tokens, with no calls/cost.
+    const carried = short.models['Unknown (carried)']!
+    expect(carried).toBeDefined()
+    expect(carried.inputTokens).toBe(200)
+    expect(carried.outputTokens).toBe(100)
+    expect(carried.calls).toBe(0)
+    expect(carried.cost).toBe(0)
+    // Cost and calls are untouched; token sums now reconcile.
+    expect(short.cost).toBe(10)
+    expect(short.calls).toBe(5)
+    const sum = (k: 'inputTokens' | 'outputTokens') => Object.values(short.models).reduce((a, m) => a + m[k], 0)
+    expect(sum('inputTokens')).toBe(short.inputTokens)
+    expect(sum('outputTokens')).toBe(short.outputTokens)
+
+    // A fully reconciled day gets no carried row (idempotent).
+    expect(reconciled.models['Unknown (carried)']).toBeUndefined()
+  })
+
   it('adopts a legacy file whose version matches the current one, once, without deleting it', async () => {
     const saved = {
       version: DAILY_CACHE_VERSION,
@@ -183,6 +239,7 @@ describe('loadDailyCache', () => {
       lastComputedDate: '2026-04-10',
       days: [emptyDay('2026-04-09', 12.5, 40), emptyDay('2026-04-10', 7.25, 28)],
       complete: true,
+      watermarkTrusted: true,
     }
     await saveDailyCache(saved)
     const loaded = await loadDailyCache()
@@ -318,6 +375,7 @@ describe('ensureCacheHydrated', () => {
       lastComputedDate: '2026-06-11',
       days: [emptyDay('2026-06-11', 5, 10)],
       complete: true,
+      watermarkTrusted: true,
     }
     await saveDailyCache(saved)
 
@@ -361,6 +419,200 @@ describe('ensureCacheHydrated', () => {
     expect(parseCalls).toBe(0)
     expect(hydrated.days.map(d => d.date)).toEqual(['2026-06-11'])
     expect(hydrated.lastComputedDate).toBe('2026-06-11')
+  })
+})
+
+// Codex discovery went structural in v16 (#873/#626), admitting rollouts from
+// third-party frontends that v15 rollups never counted. Every historical day is
+// served from this cache (usage-aggregator only recomputes today) and retention
+// is ten years, so without a schema bump an upgrading user keeps the pre-fix
+// numbers forever: the session COUNT moves because discovery reruns, while
+// cost/calls stay frozen — a self-contradicting report that reads as "fixed".
+describe('ensureCacheHydrated: schema version invalidation (#873)', () => {
+  it('re-derives a warm v15 cache instead of serving its pre-fix rollups', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    // A cache exactly as a pre-fix release left it: current schema at the time,
+    // finalized off a complete parse, watermark at yesterday, matching tz.
+    // Nothing but the version bump can invalidate it.
+    const v15 = {
+      version: 15,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+
+    let parseCalls = 0
+    const hydrated = await ensureCacheHydrated(
+      async () => {
+        parseCalls += 1
+        return []
+      },
+      () => [emptyDay('2026-06-11', 18.2, 2)],
+    )
+
+    // The whole point: the window is re-parsed rather than served frozen.
+    expect(parseCalls).toBe(1)
+    // ...and the fresh derivation wins over the stale v15 day.
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.calls).toBe(2)
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
+    // The v15 file is never rewritten or deleted — old binaries still own it.
+    expect(JSON.parse(await readFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), 'utf-8')).version).toBe(15)
+  })
+
+  it('carries a v15 day forward when its sources can no longer re-derive it', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-06-12T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    const v15 = {
+      version: 15,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-06-11',
+      days: [emptyDay('2026-04-02', 7, 3), emptyDay('2026-06-11', 4.55, 1)],
+      complete: true,
+      watermarkTrusted: true,
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v15.json'), JSON.stringify(v15), 'utf-8')
+
+    // The parse can only still see the recent day; April's sources are gone.
+    const hydrated = await ensureCacheHydrated(
+      async () => [],
+      () => [emptyDay('2026-06-11', 18.2, 2)],
+    )
+
+    // NEVER-LOSE (v14) still holds across this bump: the sourceless day keeps
+    // its old accounting rather than being dropped or zeroed.
+    expect(hydrated.days.find(d => d.date === '2026-04-02')?.cost).toBe(7)
+    expect(hydrated.days.find(d => d.date === '2026-06-11')?.cost).toBe(18.2)
+  })
+})
+
+describe('ensureCacheHydrated: Codex usage-record accounting migration', () => {
+  it.each([40, 42])('re-derives shrinking Codex slices from v%i and carries days with missing sources', async sourceVersion => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-27T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    const model = 'GPT-5.5'
+    const codexDay = (date: string, calls: number, inputTokens: number): DailyEntry => {
+      const cost = calls * 0.5
+      const modelStats = {
+        calls,
+        cost,
+        savingsUSD: 0,
+        inputTokens,
+        outputTokens: calls * 100,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      }
+      const providerSlice = {
+        calls,
+        cost,
+        savingsUSD: 0,
+        sessions: 1,
+        inputTokens,
+        outputTokens: calls * 100,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        models: { [model]: modelStats },
+        categories: {},
+      }
+      return {
+        date,
+        cost,
+        savingsUSD: 0,
+        calls,
+        sessions: 1,
+        inputTokens,
+        outputTokens: calls * 100,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        editTurns: 0,
+        oneShotTurns: 0,
+        models: { [model]: modelStats },
+        categories: {},
+        providers: { codex: providerSlice },
+      }
+    }
+
+    const oldCodexDay = codexDay('2026-09-01', 2, 1_000)
+    const sourceGoneDay = codexDay('2026-08-01', 4, 2_000)
+    await writeFile(join(TMP_CACHE_ROOT, `daily-cache.v${sourceVersion}.json`), JSON.stringify({
+      version: sourceVersion,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: '2026-09-01',
+      days: [sourceGoneDay, oldCodexDay],
+      complete: true,
+      watermarkTrusted: true,
+    }), 'utf-8')
+
+    let parseCalls = 0
+    const freshCodexDay = codexDay('2026-09-01', 1, 700)
+    const hydrated = await ensureCacheHydrated(
+      async () => { parseCalls += 1; return [] },
+      () => [freshCodexDay],
+    )
+
+    expect(parseCalls).toBe(1)
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
+    expect(hydrated.days.find(day => day.date === '2026-09-01')?.providers['codex']?.calls).toBe(1)
+    expect(hydrated.days.find(day => day.date === '2026-08-01')).toMatchObject({
+      calls: 4,
+      carried: true,
+      providers: { codex: { calls: 4 } },
+    })
+  })
+})
+
+describe('ensureCacheHydrated: Claude queued prompt categories', () => {
+  it.each([39, 43])('re-derives a settled v%i day when turns are reclassified but calls stay equal', async sourceVersion => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date('2026-09-27T12:00:00.000Z'))
+
+    const { writeFile, mkdir } = await import('fs/promises')
+    await mkdir(TMP_CACHE_ROOT, { recursive: true })
+    const date = '2026-09-01'
+    const category = { turns: 1, cost: 1, savingsUSD: 0, editTurns: 0, oneShotTurns: 0 }
+    const oldDay = emptyDay(date, 1, 1)
+    oldDay.categories = { exploration: category }
+    oldDay.providers = { claude: { calls: 1, cost: 1, savingsUSD: 0, categories: oldDay.categories } }
+    const freshDay = emptyDay(date, 1, 1)
+    freshDay.categories = { feature: category }
+    freshDay.providers = { claude: { calls: 1, cost: 1, savingsUSD: 0, categories: freshDay.categories } }
+
+    await writeFile(join(TMP_CACHE_ROOT, `daily-cache.v${sourceVersion}.json`), JSON.stringify({
+      version: sourceVersion,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: date,
+      days: [oldDay],
+      complete: true,
+      watermarkTrusted: true,
+    }), 'utf-8')
+
+    let parseCalls = 0
+    const hydrated = await ensureCacheHydrated(
+      async () => { parseCalls += 1; return [] },
+      () => [freshDay],
+    )
+
+    expect(parseCalls).toBe(1)
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
+    expect(hydrated.days.find(day => day.date === date)?.providers['claude']?.categories)
+      .toEqual({ feature: category })
   })
 })
 

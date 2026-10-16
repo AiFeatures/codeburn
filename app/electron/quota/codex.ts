@@ -1,7 +1,7 @@
 import os from 'node:os'
 import path from 'node:path'
 
-import { atomicWriteSecureFile, fraction, quotaRequestSignal, readKeychainPassword, readSecureFile, sanitizeError } from './security'
+import { atomicWriteSecureFileSync, fraction, quotaRequestSignal, readKeychainPassword, readSecureFile, readSecureFileSync, sanitizeError } from './security'
 import type { KeychainOutcome } from './security'
 import type { QuotaProvider, QuotaWindow } from './types'
 
@@ -11,7 +11,7 @@ const CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann'
 const EIGHT_DAYS = 8 * 24 * 60 * 60_000
 // The CodeBurn menubar caches its ChatGPT-mode Codex OAuth here as a
 // `CredentialRecord` JSON blob (accessToken/refreshToken/idToken/accountId/…),
-// account "default". Same brand, same machine, already consented — preferred
+// account "default". Same brand, same machine, already consented and preferred
 // over any OpenAI-owned storage.
 const MENUBAR_KEYCHAIN_SERVICE = 'org.agentseal.codeburn.menubar.codex.oauth.v1'
 
@@ -26,7 +26,9 @@ export type CodexDeps = {
   authPath: string
   openaiAuthPath: string
   readFile: typeof readSecureFile
-  writeFile: typeof atomicWriteSecureFile
+  // Synchronous by contract, not by convenience: see `persistRotated`.
+  readFileSync: typeof readSecureFileSync
+  writeFileSync: typeof atomicWriteSecureFileSync
   keychain: (service: string) => Promise<KeychainOutcome>
   now: () => number
 }
@@ -36,7 +38,8 @@ const defaults: CodexDeps = {
   authPath: path.join(os.homedir(), '.codex', 'auth.json'),
   openaiAuthPath: path.join(os.homedir(), 'Library', 'Application Support', 'com.openai.codex', 'auth.json'),
   readFile: readSecureFile,
-  writeFile: atomicWriteSecureFile,
+  readFileSync: readSecureFileSync,
+  writeFileSync: atomicWriteSecureFileSync,
   keychain: service => readKeychainPassword(service, ['default', null]),
   now: Date.now,
 }
@@ -104,7 +107,7 @@ async function discoverSource(deps: CodexDeps, allowKeychain: boolean): Promise<
   if (fileAuth) return { name: 'authFile', auth: fileAuth, writable: true, reread: () => readAuth(deps) }
   // (c) com.openai.codex App Support, only if it holds a plaintext auth JSON
   // with a usable token. Tokens encrypted via "Codex Safe Storage" have no
-  // plaintext access_token here, so they fall through — we never decrypt.
+  // plaintext access_token here, so they fall through, and we never decrypt.
   const openaiAuth = await readAuth(deps, deps.openaiAuthPath).catch(() => null)
   if (openaiAuth?.tokens?.access_token) {
     return { name: 'openaiAppSupport', auth: openaiAuth, writable: false, reread: () => readAuth(deps, deps.openaiAuthPath).catch(() => null) }
@@ -133,10 +136,27 @@ function windowOf(value: unknown, override?: string): QuotaWindow | null {
   return { label: override ?? labelForSeconds(row.limit_window_seconds), percent, resetsAt: reset }
 }
 
+// chatgpt.com mixes encodings inside one payload. `Number('')` is 0, not NaN,
+// so blank is rejected or an absent `used` decodes as a confident zero.
+function num(value: unknown): number | null {
+  if (typeof value === 'string' && !value.trim()) return null
+  const parsed = typeof value === 'number' ? value : typeof value === 'string' ? Number(value.trim()) : NaN
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+// Credit-based-pricing tiers arrive composite (`enterprise_cbp_usage_based`).
+function normalizePlanType(value: string): string {
+  return value
+    .replace(/[_-]usage[_-]based$/, '')
+    .replace(/^self[_-]serve[_-]/, '')
+    .replace(/[_-]cbp$/, '')
+    .replace(/[_-]cbp[_-]/g, '_')
+}
+
 function planLabel(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) return null
   const raw = value.trim()
-  const lower = raw.toLowerCase()
+  const lower = normalizePlanType(raw.toLowerCase())
   const known: Record<string, string> = {
     guest: 'Guest', free: 'Free', go: 'Go', plus: 'Plus', pro: 'Pro',
     prolite: 'Pro Lite', pro_lite: 'Pro Lite', 'pro-lite': 'Pro Lite',
@@ -144,6 +164,44 @@ function planLabel(value: unknown): string | null {
     education: 'Education', quorum: 'Quorum', k12: 'K-12', enterprise: 'Enterprise', edu: 'Edu',
   }
   return known[lower] ?? lower.replace(/(^|[_-])\w/g, match => match.replace(/[_-]/, ' ').toUpperCase())
+}
+
+// The admin-set monthly allowance, the only limit a credit-metered workspace
+// has. `spend_control` is the live position, the others forward-compat. `any`
+// because this walks six optional-chained hops, all validated by `num()`.
+function spendControlWindow(data: Record<string, any>): QuotaWindow | null {
+  // `find`/`num` per alias, not `??`: a non-null garbage value would stop `??`
+  // and mask a valid alias further down. Object-shaped garbage still wins the
+  // position, matching Swift, which likewise commits to the first that decodes.
+  const row = [
+    data.spend_control?.individual_limit,
+    data.spend_control?.individualLimit,
+    data.individual_limit,
+    data.individualLimit,
+    data.rate_limit?.individual_limit,
+    data.rate_limit?.individualLimit,
+  ].find(candidate => candidate && typeof candidate === 'object')
+  if (!row) return null
+  const limit = num(row.limit)
+  if (limit === null || limit <= 0) return null
+  const remainingPercent = num(row.remaining_percent) ?? num(row.remainingPercent)
+  const used = num(row.used)
+  const rawPercent = num(row.used_percent) ?? num(row.usedPercent)
+    ?? (remainingPercent === null ? null : 100 - remainingPercent)
+    ?? (used === null ? null : (used / limit) * 100)
+  if (rawPercent === null) return null
+  const percent = Math.min(1, Math.max(0, rawPercent / 100))
+  const resetRaw = num(row.reset_at) ?? num(row.resets_at) ?? num(row.resetsAt)
+  // Past 8.64e15 ms `toISOString()` throws RangeError.
+  const resetsAt = resetRaw !== null && resetRaw > 0 && resetRaw * 1000 <= 8.64e15
+    ? new Date(resetRaw * 1000).toISOString()
+    : null
+  // Unclamped percent, so a 120% draw still reports 12,000 of 10,000.
+  const spent = used ?? limit * Math.max(0, rawPercent) / 100
+  const round = (n: number) => Math.round(n).toLocaleString('en-US')
+  const reached = data.spend_control?.reached === true
+  const label = `Monthly usage limit · ${round(spent)} / ${round(limit)} credits`
+  return { label: reached ? `${label} · limit reached` : label, percent, resetsAt }
 }
 
 export function decodeCodexUsage(body: unknown): QuotaProvider {
@@ -165,37 +223,150 @@ export function decodeCodexUsage(body: unknown): QuotaProvider {
       }
     }
   }
-  const rawBalance = data.credits?.balance
-  const balance = typeof rawBalance === 'number' ? rawBalance : typeof rawBalance === 'string' ? Number(rawBalance) : NaN
+  const credits = spendControlWindow(data)
+  if (credits) details.push(credits)
+  const balance = num(data.credits?.balance)
+  // Credit-settled accounts denominate in credits, so no currency symbol.
+  const hasCredits = data.credits?.has_credits === true
+  const footerLines: string[] = []
+  if (balance !== null && balance > 0) {
+    footerLines.push(`Credits remaining · ${hasCredits ? Math.round(balance).toLocaleString('en-US') : balance.toLocaleString('en-US', { style: 'currency', currency: 'USD' })}`)
+  }
+  // Uncapped on purpose, so a bar-less card does not read as a failed fetch.
+  if (!credits && data.credits?.unlimited === true) footerLines.push('Credits · Unlimited')
   return {
-    provider: 'codex', connection: 'connected', primary, details,
+    provider: 'codex', connection: 'connected', primary: primary ?? credits, details,
     planLabel: planLabel(data.plan_type),
-    footerLines: Number.isFinite(balance) && balance > 0 ? [`Credits remaining · $${balance.toFixed(2)}`] : [],
+    footerLines,
   }
 }
 
-async function refresh(auth: AuthDoc, deps: CodexDeps, signal?: AbortSignal): Promise<AuthDoc | null> {
+function str(value: unknown): string | null {
+  return typeof value === 'string' && value ? value : null
+}
+
+/** The `sub` claim of a JWT id_token, or null when it is absent or does not
+ * decode. Defensive at every step: a malformed id_token is evidence of nothing,
+ * so it must never itself read as a login mismatch. */
+function idTokenSubject(token: unknown): string | null {
+  if (typeof token !== 'string') return null
+  const payload = token.split('.')[1]
+  if (!payload) return null
+  try {
+    const claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as { sub?: unknown }
+    return typeof claims.sub === 'string' && claims.sub ? claims.sub : null
+  } catch {
+    return null
+  }
+}
+
+/** Whether two documents belong to the same Codex login. A field counts as a
+ * mismatch only when it is a non-empty string on both sides and the two values
+ * differ: a document that merely omits account_id, refresh_token or id_token is
+ * not proof of a different login, and treating it as one would drop a rotated
+ * refresh token and sign the user out. Taken to its limit that means a document
+ * carrying NONE of the three reads as the same login and is written over. That
+ * is the deliberate side to err on: the alternative discards a live credential
+ * every time the file on disk cannot identify itself. */
+function sameLogin(held: AuthDoc, latest: AuthDoc): boolean {
+  const differs = (a: unknown, b: unknown): boolean =>
+    typeof a === 'string' && a !== '' && typeof b === 'string' && b !== '' && a !== b
+  if (differs(held.tokens?.account_id, latest.tokens?.account_id)) return false
+  if (differs(held.tokens?.refresh_token, latest.tokens?.refresh_token)) return false
+  return !differs(idTokenSubject(held.tokens?.id_token), idTokenSubject(latest.tokens?.id_token))
+}
+
+/** The document the rotated tokens are merged into: whatever the Codex CLI has
+ * on disk right now, so a login it wrote since our own read is not clobbered.
+ * `null` means writing would be wrong: the login this rotation belongs to is
+ * gone (file removed, or no longer ChatGPT mode), or the file now holds a
+ * different login (the user ran `codex login` and switched accounts, or another
+ * process rotated the credential while our grant was in flight) and merging our
+ * tokens in would splice one account's account_id onto another's refresh token.
+ * An unreadable or unparseable file is NOT one of those cases: it falls back to
+ * the document we already hold, because a lineage check may only fire on a file
+ * that reads cleanly, and dropping a rotated refresh token signs the user out. */
+function mergeBase(auth: AuthDoc, deps: CodexDeps): AuthDoc | null {
+  let raw: string | null
+  try {
+    raw = deps.readFileSync(deps.authPath)
+  } catch {
+    return auth
+  }
+  if (raw === null) return null
+  let latest: unknown
+  try {
+    latest = JSON.parse(raw)
+  } catch {
+    return auth
+  }
+  if (!latest || typeof latest !== 'object') return auth
+  const doc = latest as AuthDoc
+  if (doc.auth_mode !== 'chatgpt') return null
+  // Serializing refreshes across processes with a file lock would also stop the
+  // wasted double grant, but the lineage check is what closes the corrupt-write
+  // hole on its own, so the lock is left out as more than the minimum here.
+  return sameLogin(auth, doc) ? doc : null
+}
+
+type RotatedTokens = { access: string | null; refresh: string | null; id: string | null }
+
+/**
+ * Merges the rotated tokens into auth.json and writes them, synchronously and
+ * atomically. Synchronous from the moment the token response is parsed to the
+ * moment the file is renamed into place: the grant has already invalidated the
+ * refresh token on disk, so an abort, a per-provider timeout or the `quota`
+ * command's `process.exit` landing in an await here would leave the user with
+ * nothing but a dead token, which reads as being signed out of Codex.
+ */
+function persistRotated(auth: AuthDoc, rotated: RotatedTokens, deps: CodexDeps): AuthDoc | null {
+  const base = mergeBase(auth, deps)
+  if (!base) {
+    console.error(`Codex refreshed its login but the credential at ${deps.authPath} no longer holds the ChatGPT login this rotation belongs to, so the new token was discarded. Run \`codex login\` if Codex signs you out.`)
+    return null
+  }
+  const merged: AuthDoc = {
+    ...base,
+    tokens: {
+      ...base.tokens,
+      ...(rotated.access ? { access_token: rotated.access } : {}),
+      ...(rotated.refresh ? { refresh_token: rotated.refresh } : {}),
+      ...(rotated.id ? { id_token: rotated.id } : {}),
+    },
+    last_refresh: new Date(deps.now()).toISOString(),
+  }
+  try {
+    deps.writeFileSync(deps.authPath, `${JSON.stringify(merged, null, 2)}\n`)
+  } catch (error) {
+    // Never silent: the token still on disk is the one the grant just killed,
+    // so the user has to be told why Codex will ask them to sign in again.
+    console.error(`Codex refresh token rotated but could not be saved to ${deps.authPath}: ${sanitizeError(error)}. Run \`codex login\` if Codex signs you out.`)
+    return null
+  }
+  return merged
+}
+
+async function refresh(auth: AuthDoc, deps: CodexDeps): Promise<AuthDoc | null> {
   const refreshToken = auth.tokens?.refresh_token
   if (!refreshToken) return null
+  // Deliberately not the caller's abort signal, only this request's own
+  // timeout: the grant retires the refresh token on disk the moment the
+  // endpoint accepts it, so a per-provider timeout firing while the response
+  // is still arriving would cancel a rotation we can no longer undo. A slow
+  // grant costs the caller nothing, since its own race has already given up.
   const response = await deps.fetch(TOKEN_ENDPOINT, {
-    method: 'POST', signal: quotaRequestSignal(signal),
+    method: 'POST', signal: quotaRequestSignal(),
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ client_id: CLIENT_ID, grant_type: 'refresh_token', refresh_token: refreshToken, scope: 'openid profile email' }),
   })
   if (!response.ok) return null
   const next = await response.json() as Record<string, unknown>
-  if (typeof next.access_token !== 'string' || !next.access_token) return null
-  const latest = await readAuth(deps)
-  if (!latest || latest.auth_mode !== 'chatgpt') return null
-  latest.tokens = {
-    ...latest.tokens,
-    access_token: next.access_token,
-    ...(typeof next.refresh_token === 'string' ? { refresh_token: next.refresh_token } : {}),
-    ...(typeof next.id_token === 'string' ? { id_token: next.id_token } : {}),
-  }
-  latest.last_refresh = new Date(deps.now()).toISOString()
-  await deps.writeFile(deps.authPath, `${JSON.stringify(latest, null, 2)}\n`)
-  return latest
+  const rotated: RotatedTokens = { access: str(next.access_token), refresh: str(next.refresh_token), id: str(next.id_token) }
+  // A rotated refresh token is persisted even when the access token is missing
+  // or malformed: the grant has already retired the one on disk either way.
+  if (!rotated.access && !rotated.refresh) return null
+  const merged = persistRotated(auth, rotated, deps)
+  return merged?.tokens?.access_token ? merged : null
 }
 
 async function usage(auth: AuthDoc, deps: CodexDeps, signal?: AbortSignal): Promise<Response | null> {
@@ -223,7 +394,7 @@ export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: A
     if (source.writable) {
       const refreshedAt = typeof auth.last_refresh === 'string' ? Date.parse(auth.last_refresh) : NaN
       if (!Number.isFinite(refreshedAt) || deps.now() - refreshedAt > EIGHT_DAYS) {
-        const next = await refresh(auth, deps, options.signal)
+        const next = await refresh(auth, deps)
         if (next) auth = next
       }
     }
@@ -234,7 +405,7 @@ export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: A
       if (reread?.tokens?.access_token && reread.tokens.access_token !== auth.tokens?.access_token) {
         auth = reread
       } else if (source.writable) {
-        const next = await refresh(reread ?? auth, deps, options.signal)
+        const next = await refresh(reread ?? auth, deps)
         if (!next) return { quota: empty('transientFailure') }
         auth = next
       } else {
@@ -251,7 +422,7 @@ export async function fetchCodexQuota(options: Partial<CodexDeps> & { signal?: A
       if (!Number.isFinite(seconds) && raw) seconds = (Date.parse(raw) - deps.now()) / 1000
       return { quota: empty('transientFailure'), retryAfterSeconds: Math.max(Number.isFinite(seconds) ? Math.ceil(seconds) : 300, 60) }
     }
-    if (!response.ok) return { quota: empty(response.status >= 400 && response.status < 500 ? 'terminalFailure' : 'transientFailure') }
+    if (!response.ok) return { quota: { ...empty(response.status >= 400 && response.status < 500 ? 'terminalFailure' : 'transientFailure'), ...(response.status === 401 || response.status === 403 ? { connectable: true } : {}) } }
     return { quota: decodeCodexUsage(await response.json()) }
   } catch (error) {
     console.warn(`Codex quota unavailable: ${sanitizeError(error)}`)

@@ -1,6 +1,7 @@
 import { homedir } from 'os'
 
 import { EDIT_TOOLS } from './classifier.js'
+import { userStartedProjects } from './session-population.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
 // User-side mirror of compare-stats.ts scanSelfCorrections (which scans the
@@ -20,7 +21,12 @@ export const USER_CORRECTION_PATTERNS: RegExp[] = [
   /\byou (?:missed|forgot|misunderstood|broke)\b/i,
   /\brevert (?:that|it|this|your|the last|the change)\b/i,
   /\bundo (?:that|it|this|your|the last|the change)\b/i,
-  /\bwrong (?:file|approach|place|method|function|answer|way|direction)\b/i,
+  // "answer" is deliberately absent from the noun list: injected skill/system
+  // prose lands in the user-message slot and reads as ordinary writing where
+  // "the wrong answer" is an idiom ("a well-composed page is never the wrong
+  // answer" counted 4 phantom corrections on real data). The other nouns are
+  // concrete work artifacts that prose rarely uses with "wrong".
+  /\bwrong (?:file|approach|place|method|function|way|direction)\b/i,
   /\bstill (?:wrong|broken|failing|not working)\b/i,
 ]
 
@@ -39,7 +45,7 @@ export type UserCorrectionStats = {
 export function scanUserCorrections(projects: ProjectSummary[]): UserCorrectionStats {
   let corrections = 0
   let userTurns = 0
-  for (const project of projects) {
+  for (const project of userStartedProjects(projects)) {
     for (const session of project.sessions) {
       // A correction is a FOLLOW-UP by definition: the session's opening
       // prompt cannot be correcting this assistant, however correction-shaped
@@ -90,7 +96,7 @@ export function sessionTimeToFirstEditMs(session: ProjectSummary['sessions'][num
 
 export function medianTimeToFirstEditMs(projects: ProjectSummary[]): number | null {
   const samples: number[] = []
-  for (const project of projects) {
+  for (const project of userStartedProjects(projects)) {
     for (const session of project.sessions) {
       const ms = sessionTimeToFirstEditMs(session)
       if (ms !== null) samples.push(ms)
@@ -135,7 +141,7 @@ export function aggregateFileChurn(projects: ProjectSummary[], limit = 15): Rewo
   type Acc = { path: string; sessions: Set<string>; edits: number }
   const byPath = new Map<string, Acc>()
 
-  for (const project of projects) {
+  for (const project of userStartedProjects(projects)) {
     for (const session of project.sessions) {
       for (const turn of session.turns) {
         for (const call of turn.assistantCalls) {
@@ -186,7 +192,7 @@ export const MIN_ONE_SHOT_EDIT_TURNS = 5
 /// model-efficiency and the report's category one-shot figures.
 export function worstOneShotCategory(projects: ProjectSummary[], minEditTurns = MIN_ONE_SHOT_EDIT_TURNS): CategoryOneShot | null {
   const acc = new Map<string, { editTurns: number; oneShotTurns: number }>()
-  for (const project of projects) {
+  for (const project of userStartedProjects(projects)) {
     for (const session of project.sessions) {
       for (const [cat, d] of Object.entries(session.categoryBreakdown)) {
         const e = acc.get(cat) ?? { editTurns: 0, oneShotTurns: 0 }
