@@ -1,4 +1,5 @@
-import { getModelCosts, type ModelCosts } from './models.js'
+import { behavioralCallWeight } from './behavioral-weight.js'
+import { billableOutputTokens, cacheWriteCostPerToken, fallbackRawModelDisplayName, getModelCosts, getShortModelName, pricingModelAt, sanitizeModelForDisplay, tieredCostsFor, type ModelCosts } from './models.js'
 import { getProvider } from './providers/index.js'
 import { formatCost, formatTokens } from './format.js'
 import { renderTable, type TableColumn } from './text-table.js'
@@ -56,6 +57,12 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
     attributedCostUSD: number
     cacheReadDisplayed: number
     raw: AuditRow['raw']
+    /** Per-call recomputed components, each priced with THAT call's tier swap —
+     *  a (provider, model) bucket's summed tokens must never cross the
+     *  per-call 272k threshold on their own (review: a $4,979 phantom gap). */
+    recomputed: { input: number, output: number, cacheWrite: number, cacheRead: number, webSearch: number }
+    /** Resolved rates for the bucket's model, fetched once per bucket. */
+    rates: ModelCosts | null
   }
   const buckets = new Map<string, Bucket>()
 
@@ -74,6 +81,8 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
               calls: 0,
               attributedCostUSD: 0,
               cacheReadDisplayed: 0,
+              recomputed: { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, webSearch: 0 },
+              rates: null,
               raw: {
                 inputTokens: 0,
                 outputTokens: 0,
@@ -84,6 +93,7 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
                 webSearchRequests: 0,
               },
             }
+            bucket.rates = getModelCosts(bucket.model)
             buckets.set(key, bucket)
           }
           const u = call.usage
@@ -96,9 +106,32 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
           bucket.raw.webSearchRequests += u.webSearchRequests
           // Per-call max (then summed) mirrors how the reports collapse the two
           // cache-read vocabularies, so the audit's displayed total matches.
-          bucket.cacheReadDisplayed += Math.max(u.cacheReadInputTokens, u.cachedInputTokens)
+          const cacheReadForCall = Math.max(u.cacheReadInputTokens, u.cachedInputTokens)
+          bucket.cacheReadDisplayed += cacheReadForCall
           bucket.attributedCostUSD += call.costUSD
-          bucket.calls += 1
+          // Recompute per call through the same tier swap calculateCost applies
+          // (prompt tokens = input + cache read + cache write of THIS call), so a
+          // long-context request shows the rates that priced it while a bucket
+          // of small calls never crosses the threshold on the sum. Fast-mode
+          // and the 1-hour cache-write rate remain visible gaps on purpose.
+          // A dated alias (codex-auto-review) prices each call by its own date;
+          // the row's `rates` show the forward default.
+          const pricingModel = pricingModelAt(bucket.model, call.timestamp)
+          const rates = pricingModel === bucket.model ? bucket.rates : getModelCosts(pricingModel)
+          if (rates) {
+            const promptTokens = u.inputTokens + cacheReadForCall + u.cacheCreationInputTokens
+            const tiered = tieredCostsFor(pricingModel, rates, promptTokens, bucket.provider)
+            const outputForCall = billableOutputTokens(bucket.provider, u.outputTokens, u.reasoningTokens)
+            bucket.recomputed.input += u.inputTokens * tiered.inputCostPerToken
+            bucket.recomputed.output += outputForCall * tiered.outputCostPerToken
+            bucket.recomputed.cacheWrite += u.cacheCreationInputTokens * cacheWriteCostPerToken(pricingModel, tiered)
+            bucket.recomputed.cacheRead += cacheReadForCall * tiered.cacheReadCostPerToken
+            // Web search never participates in a tier; keep it on the base row.
+            bucket.recomputed.webSearch += u.webSearchRequests * rates.webSearchCostPerRequest
+          }
+          // Supplementary accounting calls keep their tokens and cost above but are not
+          // distinct requests, so they add no call weight (see behavioral-weight.ts).
+          bucket.calls += behavioralCallWeight(call)
         }
       }
     }
@@ -111,7 +144,9 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
     const p = await getProvider(name)
     const entry = {
       displayName: p?.displayName ?? name,
-      formatModel: p ? (m: string) => p.modelDisplayName(m) : (m: string) => m,
+      formatModel: p
+        ? (m: string) => sanitizeModelForDisplay(fallbackRawModelDisplayName(p.modelDisplayName(m), m))
+        : (m: string) => sanitizeModelForDisplay(getShortModelName(m)),
     }
     providerCache.set(name, entry)
     return entry
@@ -120,22 +155,24 @@ export async function aggregateAudit(projects: ProjectSummary[]): Promise<AuditR
   const rows: AuditRow[] = []
   for (const bucket of buckets.values()) {
     const meta = await resolveProvider(bucket.provider)
+    // Buckets are keyed by (provider, model), so this provider test covers every call in one.
+    // Copilot reasoning tokens are already INSIDE outputTokens (same rule as cachedCallToApiCall
+    // in parser.ts), so folding them in would display phantom output for its store rows/rollups.
     const displayed = {
       inputTokens: bucket.raw.inputTokens,
-      outputTokens: bucket.raw.outputTokens + bucket.raw.reasoningTokens,
+      outputTokens: billableOutputTokens(bucket.provider, bucket.raw.outputTokens, bucket.raw.reasoningTokens),
       cacheWriteTokens: bucket.raw.cacheCreationInputTokens,
       cacheReadTokens: bucket.cacheReadDisplayed,
     }
-    const rates = getModelCosts(bucket.model)
     const cost = {
-      input: rates ? displayed.inputTokens * rates.inputCostPerToken : 0,
-      output: rates ? displayed.outputTokens * rates.outputCostPerToken : 0,
-      cacheWrite: rates ? displayed.cacheWriteTokens * rates.cacheWriteCostPerToken : 0,
-      cacheRead: rates ? displayed.cacheReadTokens * rates.cacheReadCostPerToken : 0,
-      webSearch: rates ? bucket.raw.webSearchRequests * rates.webSearchCostPerRequest : 0,
-      recomputedTotalUSD: 0,
+      input: bucket.recomputed.input,
+      output: bucket.recomputed.output,
+      cacheWrite: bucket.recomputed.cacheWrite,
+      cacheRead: bucket.recomputed.cacheRead,
+      webSearch: bucket.recomputed.webSearch,
+      recomputedTotalUSD: bucket.recomputed.input + bucket.recomputed.output + bucket.recomputed.cacheWrite + bucket.recomputed.cacheRead + bucket.recomputed.webSearch,
     }
-    cost.recomputedTotalUSD = cost.input + cost.output + cost.cacheWrite + cost.cacheRead + cost.webSearch
+    const rates = bucket.rates
     rows.push({
       provider: bucket.provider,
       providerDisplayName: meta.displayName,
@@ -207,7 +244,7 @@ export function renderAuditTable(rows: AuditRow[]): string {
   const legend = [
     '',
     'Columns are the raw token fields each provider records. codeburn then normalizes for pricing:',
-    '  - Reason folds into Output (priced output = output + reasoning)',
+    '  - Reason folds into Output (priced output = output + reasoning), except copilot, whose reasoning is already inside its output',
     '  - Cache rd = max(Anthropic cacheReadInput, OpenAI cached), since providers fill one or both',
     '  - Cache wr is priced at 1.25x the input rate, Cache rd at 0.1x, when a model omits explicit cache rates',
     'Use --format json for per-component cost, the rates applied, and both raw cache-read fields.',

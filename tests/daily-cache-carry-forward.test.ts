@@ -449,6 +449,47 @@ describe('adoption union across older cache files', () => {
     expect(JSON.parse(await readFile(join(TMP_CACHE_ROOT, 'daily-cache.json.v9.bak'), 'utf-8'))).toEqual(JSON.parse(JSON.stringify(v9bak)))
   })
 
+  it('adopts the timezone of the top file and drops only other-zone files below it', async () => {
+    const foreignTz = currentTzKey() === 'UTC' ? 'America/Los_Angeles' : 'UTC'
+    const olderLocal = {
+      version: 27, tzKey: currentTzKey(), complete: true, lastComputedDate: '2026-07-28',
+      days: [day('2026-07-27', { claude: slice(307.02, 900) }), day('2026-07-20', { claude: slice(5, 2) })],
+    }
+    const newestForeign = {
+      version: 28, tzKey: foreignTz, complete: true, lastComputedDate: '2026-07-28',
+      days: [day('2026-07-27', { claude: slice(625.71, 1500) }), day('2026-07-28', { codex: slice(40, 30) })],
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v27.json'), JSON.stringify(olderLocal), 'utf-8')
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v28.json'), JSON.stringify(newestForeign), 'utf-8')
+    const cache = await loadDailyCache()
+    expect(cache.days.map(d => d.date)).toEqual(['2026-07-27', '2026-07-28'])
+    expect(cache.days[0]).toMatchObject({ cost: 625.71, calls: 1500 })
+    // Tagged with the zone it was bucketed in, so hydration re-buckets it.
+    expect(cache.tzKey).toBe(foreignTz)
+  })
+
+  it('adopts a foreign-timezone history whole and tagged when it is all there is', async () => {
+    const foreignTz = currentTzKey() === 'UTC' ? 'America/Los_Angeles' : 'UTC'
+    const onlyFile = {
+      version: 28, tzKey: foreignTz, complete: true, lastComputedDate: '2026-07-28',
+      days: [day('2026-07-27', { claude: slice(625.71, 1500) })],
+    }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v28.json'), JSON.stringify(onlyFile), 'utf-8')
+    const cache = await loadDailyCache()
+    expect(cache.days[0]).toMatchObject({ date: '2026-07-27', cost: 625.71 })
+    // Tagged with the zone it was bucketed in, so hydration re-buckets it.
+    expect(cache.tzKey).toBe(foreignTz)
+  })
+
+  it('a file finalized by a complete parse outranks a newer interrupted one', async () => {
+    const complete = { version: 27, complete: true, days: [day('2026-07-27', { claude: slice(300, 900) })] }
+    const interrupted = { version: 28, complete: false, days: [day('2026-07-27', { claude: slice(20, 40) })] }
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v27.json'), JSON.stringify(complete), 'utf-8')
+    await writeFile(join(TMP_CACHE_ROOT, 'daily-cache.v28.json'), JSON.stringify(interrupted), 'utf-8')
+    const cache = await loadDailyCache()
+    expect(cache.days[0]).toMatchObject({ cost: 300, calls: 900 })
+  })
+
   it('skips malformed candidates without failing the adoption', async () => {
     const good = {
       version: 12,
@@ -601,7 +642,10 @@ describe('adoption union across older cache files', () => {
         models: { 'opus-4-8': { calls: 3, cost: 20, savingsUSD: 0, inputTokens: 1000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } },
         categories: { coding: { turns: 3, cost: 20, savingsUSD: 0, editTurns: 1, oneShotTurns: 1 } },
       }),
-    }, { carried: true })
+    }, {
+      carried: true,
+      models: { 'opus-4-8': { calls: 3, cost: 20, savingsUSD: 0, inputTokens: 1000, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+    })
     const cache: DailyCache = {
       version: DAILY_CACHE_VERSION,
       savingsConfigHash: '',
@@ -609,6 +653,7 @@ describe('adoption union across older cache files', () => {
       lastComputedDate: daysAgoStr(1),
       days: [rich],
       complete: true,
+      watermarkTrusted: true,
     }
     await saveDailyCache(cache)
     const loaded = await loadDailyCache()
@@ -633,7 +678,11 @@ describe('adoption union across older cache files', () => {
 
     const loaded = await loadDailyCache()
 
-    expect(loaded.days[0]!.models).toEqual({})
+    // The junk map is dropped; the day's own calls and cost are then left with
+    // nothing to attribute them to, so they land on the carried row.
+    expect(loaded.days[0]!.models).toEqual({
+      'Unknown (carried)': { calls: 2, cost: 5, savingsUSD: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    })
     expect(loaded.days[0]!.categories).toEqual({})
   })
 
@@ -709,5 +758,260 @@ describe('adoption union across older cache files', () => {
 
     expect(loaded.lastComputedDate).toBeNull()
     expect(hydrated.complete).toBe(true)
+  })
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #946 validation round 5, item 2: the migration carried the copilot slice
+// verbatim instead of re-deriving it.
+//
+// The v21 accounting stops counting copilot's supplementary accounting calls
+// as api calls, so a settled store-era day re-derives with FEWER calls than
+// the pre-store cache holds - the exact shape `isPartialSurvival` reads as
+// "the sources aged out". The guard pinned every such slice to its pre-store
+// value: `overview` served 2,980,804 tokens for 2026-08-06 where the fresh
+// derivation is 74,811,412 (call count 21,608 vs 16,326 on 2026-08-12), while
+// `export`/`models`/`audit` - which never read this cache - served the
+// corrected figures off the same machine.
+//
+// Numbers below are kelchm's isolated machine-A day (2026-08-07): the v17
+// slice deep-equalled the migrated v21 one field-for-field, and a virgin-cache
+// run of the same build derived the store-backed slice instead.
+// The last daily-cache version written before the #1450 route contract, which
+// is what these two cases seed. Pinned, not DAILY_CACHE_VERSION - 1: a later
+// bump must not silently move the boundary they are asserting.
+const PRE_ROUTE_CONTRACT_VERSION = 32
+
+describe('#946: a migration re-derives copilot instead of carrying it', () => {
+  const settled = daysAgoStr(33)
+  const PRE_STORE = slice(0.630267, 37, { sessions: 6, cacheWriteTokens: 125987 })
+  const STORE_BACKED = slice(0.692094, 27, { sessions: 6, cacheWriteTokens: 150716 })
+
+  /// Seeds an older-version daily cache (what a 0.9.20 install leaves behind)
+  /// so `loadDailyCache` takes the adoption path.
+  /// Pinned, not derived from DAILY_CACHE_VERSION: this fixture is the
+  /// pre-copilot-contract era, which is a fixed point in history.
+  /// `DAILY_CACHE_VERSION - 5` drifted across the copilot boundary (26) on the
+  /// next bump and silently stopped seeding the entitlement these tests check.
+  const PRE_COPILOT_CONTRACT_VERSION = 25
+  const seedOlderCache = async (days: DailyEntry[]) => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_COPILOT_CONTRACT_VERSION}.json`),
+      JSON.stringify({
+        version: PRE_COPILOT_CONTRACT_VERSION,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days,
+        complete: true,
+        watermarkTrusted: true,
+      }),
+      'utf-8',
+    )
+  }
+
+  it('re-derives the copilot slice when the store still has the sources', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
+    const got = out.days.find(d => d.date === settled)!
+    expect(got.providers['copilot']).toMatchObject({ cost: 0.692094, calls: 27, cacheWriteTokens: 150716 })
+    expect(got.cost).toBeCloseTo(0.692094, 6)
+    expect(got.calls).toBe(27)
+    // Spent by this re-derivation, so the guard is back on for every later run.
+    expect(out.pendingRederive).toBeUndefined()
+  })
+
+  it('re-derives a Hermes slice after the cost-provenance contract changes', async () => {
+    const corrupt = slice(4603, 6764, { sessions: 6764 })
+    const corrected = slice(0.438, 6, { sessions: 6 })
+    await seedOlderCache([day(settled, { hermes: corrupt })])
+
+    const out = await ensureCacheHydrated(
+      noSessions,
+      () => [day(settled, { hermes: corrected })],
+      'cfg-A',
+    )
+
+    expect(out.days.find(d => d.date === settled)!.providers['hermes'])
+      .toMatchObject({ cost: 0.438, calls: 6, sessions: 6 })
+    expect(out.pendingRederive).toBeUndefined()
+  })
+
+  it('re-opens Copilot re-derivation once its contract moves past the cache (v56)', async () => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_ROUTE_CONTRACT_VERSION}.json`),
+      JSON.stringify({
+        version: PRE_ROUTE_CONTRACT_VERSION,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days: [day(settled, { copilot: PRE_STORE, hermes: slice(4603, 6764) })],
+        complete: true,
+        watermarkTrusted: true,
+      }),
+      'utf-8',
+    )
+
+    const loaded = await loadDailyCache()
+    // From v32, Copilot (v56), Codex, Hermes, Devin, Cursor Agent (v58) and Antigravity (v59) are owed
+    // re-derivation; dsh's v32 contract is already satisfied.
+    expect(loaded.pendingRederive).toEqual(['copilot', 'codex', 'hermes', 'devin', 'cursor-agent', 'antigravity', 'grok', 'cursor'])
+  })
+
+  it('preserves an older cache pending repair while adding a newer provider repair', async () => {
+    await writeFile(
+      join(TMP_CACHE_ROOT, `daily-cache.v${PRE_ROUTE_CONTRACT_VERSION}.json`),
+      JSON.stringify({
+        version: PRE_ROUTE_CONTRACT_VERSION,
+        savingsConfigHash: 'cfg-A',
+        tzKey: currentTzKey(),
+        lastComputedDate: daysAgoStr(1),
+        days: [day(settled, { copilot: PRE_STORE, hermes: slice(4603, 6764) })],
+        complete: true,
+        watermarkTrusted: true,
+        pendingRederive: ['copilot'],
+      }),
+      'utf-8',
+    )
+
+    const loaded = await loadDailyCache()
+    expect(loaded.pendingRederive).toEqual(['copilot', 'codex', 'hermes', 'devin', 'cursor-agent', 'antigravity', 'grok', 'cursor'])
+  })
+
+  it('still carries the slice whole when the sources are gone (never-lose, #1033)', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    // The re-derive finds nothing at all for that day: the store and the
+    // journals are both past their retention.
+    const out = await ensureCacheHydrated(noSessions, () => [], 'cfg-A')
+    const got = out.days.find(d => d.date === settled)!
+    expect(got.providers['copilot']).toMatchObject({ cost: 0.630267, calls: 37, cacheWriteTokens: 125987 })
+    expect(got.carried).toBe(true)
+  })
+
+  it('does not lend the exemption to any other provider', async () => {
+    await seedOlderCache([day(settled, { claude: slice(1685.17, 12530, { sessions: 214 }) })])
+    const truncated = [day(settled, { claude: slice(385.44, 560, { sessions: 0 }) })]
+    const out = await ensureCacheHydrated(noSessions, () => truncated, 'cfg-A')
+    expect(out.days.find(d => d.date === settled)!.providers['claude'])
+      .toMatchObject({ cost: 1685.17, calls: 12530 })
+  })
+
+  it('is one-shot: a LATER copilot shrink on a settled day is guarded again', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
+    // Second run, savings config changed so the whole window re-derives again -
+    // this time the copilot sources have partly aged out.
+    const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: slice(0.1, 3) })], 'cfg-B')
+    expect(out.days.find(d => d.date === settled)!.providers['copilot'])
+      .toMatchObject({ cost: 0.692094, calls: 27 })
+  })
+
+  it('a PARTIAL parse does not spend the entitlement', async () => {
+    await seedOlderCache([day(settled, { copilot: PRE_STORE })])
+    const partial = await ensureCacheHydrated(noSessions, () => [], 'cfg-A', () => false)
+    expect(partial.pendingRederive).toEqual(['copilot', 'codex', 'hermes', 'dsh', 'devin', 'cursor-agent', 'antigravity', 'grok', 'cursor'])
+    // The next COMPLETE run still gets to re-derive.
+    const out = await ensureCacheHydrated(noSessions, () => [day(settled, { copilot: STORE_BACKED })], 'cfg-A')
+    expect(out.days.find(d => d.date === settled)!.providers['copilot'])
+      .toMatchObject({ cost: 0.692094, calls: 27 })
+  })
+})
+
+describe('partial survival: a truncated fresh slice cannot delete a settled baseline', () => {
+  // The real 0.9.20 -> next upgrade loss: transcripts age out per FILE, so a
+  // mostly-forgotten day still gets a handful of turns from surviving later
+  // files. The fresh slice is non-empty but truncated, and before this guard it
+  // replaced the baseline outright ($1,685.17 / 12,530 calls -> $385.44 / 560).
+  const settled = daysAgoStr(33)
+
+  it('keeps the baseline slice when the fresh derivation lost calls on a settled day', () => {
+    const fresh = day(settled, { claude: slice(385.44, 560, { sessions: 0, inputTokens: 10 }) })
+    const baseline = day(settled, { claude: slice(1685.17, 12530, { sessions: 214, inputTokens: 500 }) })
+    const merged = mergeDayEntries([fresh], [baseline], true, undefined, true)
+    const m = merged[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 1685.17, calls: 12530, sessions: 214 })
+    // Day totals track the swap - they must equal the kept slice, not the sum.
+    expect(m.cost).toBeCloseTo(1685.17, 5)
+    expect(m.calls).toBe(12530)
+    expect(m.sessions).toBe(214)
+    expect(m.inputTokens).toBe(500)
+    expect(m.carried).toBe(true)
+  })
+
+  it('a truncated slice cannot take other providers down with it', () => {
+    const fresh = day(settled, { claude: slice(10, 5), codex: slice(7, 3) })
+    const baseline = day(settled, { claude: slice(100, 50) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 100, calls: 50 })
+    expect(m.providers['codex']).toMatchObject({ cost: 7, calls: 3 })
+    expect(m.cost).toBeCloseTo(107, 5)
+    expect(m.calls).toBe(53)
+  })
+
+  it('the fresh slice wins on equal calls at a different cost (the Grok re-pricing)', () => {
+    const fresh = day(settled, { grok: slice(11.89, 21, { sessions: 21, outputTokens: 900 }) })
+    const baseline = day(settled, { grok: slice(3.29, 21, { sessions: 21, outputTokens: 200 }) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['grok']).toMatchObject({ cost: 11.89, calls: 21, outputTokens: 900 })
+    expect(m.cost).toBeCloseTo(11.89, 5)
+    expect(m.carried).toBeUndefined()
+  })
+
+  it('a fresh slice with FEWER sessions but equal calls still wins (sessions drift on healthy days)', () => {
+    const fresh = day(settled, { claude: slice(1021.11, 3295, { sessions: 71 }) })
+    const baseline = day(settled, { claude: slice(1021.11, 3295, { sessions: 72 }) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['claude']!.sessions).toBe(71)
+  })
+
+  it('recent days stay authoritative: a shrink inside the settle window is honored', () => {
+    const recent = daysAgoStr(2)
+    const fresh = day(recent, { claude: slice(20, 4) })
+    const baseline = day(recent, { claude: slice(90, 40) })
+    const m = mergeDayEntries([fresh], [baseline], true, undefined, true)[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 20, calls: 4 })
+    expect(m.cost).toBe(20)
+  })
+
+  it('the adoption union is unguarded: the newer schema still wins per (date, provider)', () => {
+    const newer = day(settled, { claude: slice(50, 5) })
+    const older = day(settled, { claude: slice(100, 10) })
+    const m = mergeDayEntries([newer], [older], true)[0]!
+    expect(m.providers['claude']).toMatchObject({ cost: 50, calls: 5 })
+  })
+
+  it('end-to-end: a version-bump re-derive whose transcripts aged out keeps the full day', async () => {
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: 'cfg-A',
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days: [day(settled, { claude: slice(1685.17, 12530, { sessions: 214 }) })],
+      complete: false, // what a version bump / adoption leaves behind
+    }
+    await saveDailyCache(cache)
+    const truncated = [day(settled, { claude: slice(385.44, 560, { sessions: 0 }) })]
+    const out = await ensureCacheHydrated(noSessions, () => truncated, 'cfg-A')
+    const kept = out.days.find(d => d.date === settled)!
+    expect(kept.providers['claude']).toMatchObject({ cost: 1685.17, calls: 12530 })
+    expect(kept.cost).toBeCloseTo(1685.17, 5)
+    // A --period all payload sums the kept slices, not the truncated ones.
+    const period = buildPeriodDataFromDays(out.days, 'all')
+    expect(period.cost).toBeCloseTo(1685.17, 5)
+    expect(period.calls).toBe(12530)
+  })
+
+  it('a fully sourceless day is still carried whole (v14 behavior, unchanged)', async () => {
+    const cache: DailyCache = {
+      version: DAILY_CACHE_VERSION,
+      savingsConfigHash: 'cfg-A',
+      tzKey: currentTzKey(),
+      lastComputedDate: daysAgoStr(1),
+      days: [day(settled, { claude: slice(230.06, 400) })],
+      complete: false,
+    }
+    await saveDailyCache(cache)
+    const out = await ensureCacheHydrated(noSessions, () => [], 'cfg-A')
+    expect(out.days[0]).toMatchObject({ date: settled, cost: 230.06, calls: 400, carried: true })
   })
 })

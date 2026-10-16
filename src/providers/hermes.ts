@@ -1,17 +1,35 @@
 import { readdir, stat } from 'fs/promises'
+import { existsSync, readFileSync, statSync } from 'fs'
 import { basename, dirname, join } from 'path'
 import { homedir } from 'os'
 
-import { calculateCost, getShortModelName } from '../models.js'
+import { readGitOriginUrl } from '../git-origin.js'
+import { calculateCost, getShortModelName, routeFromProviderField, type BillingMode } from '../models.js'
+import { isUserHomeRoot } from '../path-privacy.js'
 import { isSqliteAvailable, getSqliteLoadError, openDatabase, isSqliteBusyError, type SqliteDatabase } from '../sqlite.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 import type { ToolCall } from '../types.js'
+import {
+  getHermesCursor,
+  hermesBaselineKey,
+  hermesLedgerNow,
+  hermesObservationKey,
+  listHermesCursorSessionIds,
+  loadHermesSessionLedger,
+  recordHermesSnapshot,
+  zeroHermesTokens,
+  isHermesLedgerPublicationError,
+  type HermesCostBasis,
+  type HermesObservation,
+  type HermesTokenTotals,
+} from '../hermes-session-ledger.js'
 
 type HermesSessionRow = {
   id: string
   source: string | null
   model: string | null
   cwd: string | null
+  git_repo_root: string | null
   billing_provider: string | null
   input_tokens: number | null
   output_tokens: number | null
@@ -20,6 +38,8 @@ type HermesSessionRow = {
   reasoning_tokens: number | null
   estimated_cost_usd: number | null
   actual_cost_usd: number | null
+  cost_status: string | null
+  cost_source: string | null
   api_call_count: number | null
   tool_call_count: number | null
   started_at: number | null
@@ -84,7 +104,111 @@ const toolNameMap: Record<string, string> = {
 }
 
 function getHermesHome(override?: string): string {
-  return override ?? process.env['HERMES_HOME'] ?? join(homedir(), '.hermes')
+  if (override !== undefined) return override
+
+  const configuredHome = process.env['HERMES_HOME']?.trim()
+  if (configuredHome) return configuredHome
+
+  if (process.platform === 'win32') {
+    const localAppData = process.env['LOCALAPPDATA']?.trim()
+    return join(localAppData || join(homedir(), 'AppData', 'Local'), 'hermes')
+  }
+
+  return join(homedir(), '.hermes')
+}
+
+function displayProjectForProfile(profile: string): string {
+  return profile === 'default' ? 'hermes' : sanitizeProject(profile)
+}
+
+function stripCodeRegions(text: string): string {
+  const out: string[] = []
+  let fence: { marker: string; length: number } | null = null
+  for (const line of text.split('\n')) {
+    const trimmed = line.replace(/\s+$/, '')
+    const open = trimmed.match(/^(\s*)([`~]{3,})(.*)$/)
+    if (!fence) {
+      if (open && !open[3].includes(open[2][0]!)) {
+        fence = { marker: open[2][0]!, length: open[2].length }
+        out.push(' ')
+        continue
+      }
+      if (/^[ \t]{4,}\S/.test(line)) {
+        out.push(' ')
+        continue
+      }
+      out.push(line.replace(/`[^`]*`/g, ' '))
+      continue
+    }
+    const close = trimmed.match(/^(\s*)([`~]{3,})\s*$/)
+    if (close && close[2][0] === fence.marker && close[2].length >= fence.length) {
+      fence = null
+    }
+    out.push(' ')
+  }
+  return out.join('\n')
+}
+
+function githubOwnerRepoFromUrl(url: string): { owner: string; repo: string } | null {
+  const gh = url.match(/github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?$/i)
+  if (!gh) return null
+  return { owner: gh[1].toLowerCase(), repo: gh[2].replace(/\.git$/i, '').toLowerCase() }
+}
+
+// Memoized per repo root: every session in the same repo would otherwise
+// re-read .git/config. Process-lifetime only, so a remote URL change needs a
+// restart (a resident `serve` child included).
+const originIdentityByRoot = new Map<string, { owner: string; repo: string } | null>()
+
+function githubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
+  const memo = originIdentityByRoot.get(repoRoot)
+  if (memo !== undefined) return memo
+  const identity = readGithubOwnerRepoFromRoot(repoRoot)
+  originIdentityByRoot.set(repoRoot, identity)
+  return identity
+}
+
+function readGithubOwnerRepoFromRoot(repoRoot: string): { owner: string; repo: string } | null {
+  const url = readGitOriginUrl(repoRoot)
+  return url ? githubOwnerRepoFromUrl(url) : null
+}
+
+function extractGithubPullUrls(
+  texts: Array<string | null | undefined>,
+  identity: { owner: string; repo: string } | null,
+): string[] {
+  if (!identity) return []
+  const found = new Set<string>()
+  const re = /https:\/\/github\.com\/[^/\s"'<>]+\/[^/\s"'<>]+\/pull\/\d+/gi
+  for (const text of texts) {
+    if (!text) continue
+    const searchable = stripCodeRegions(text)
+    for (const match of searchable.matchAll(re)) {
+      try {
+        const url = new URL(match[0])
+        if (url.protocol !== 'https:') continue
+        const pathMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/\d+$/)
+        if (!pathMatch) continue
+        if (pathMatch[1].toLowerCase() !== identity.owner) continue
+        if (pathMatch[2].toLowerCase() !== identity.repo) continue
+        found.add(`${url.origin}${url.pathname}`)
+      } catch {
+        // skip malformed
+      }
+    }
+  }
+  return [...found].sort()
+}
+
+function statSyncSafe(path: string): 'file' | 'dir' | null {
+  try {
+    const st = statSync(path)
+    if (st.isFile()) return 'file'
+    if (st.isDirectory()) return 'dir'
+    return null
+  } catch {
+    return null
+  }
 }
 
 function sanitizeProject(raw: string): string {
@@ -248,12 +372,165 @@ function collectTools(messages: HermesMessageRow[]): { tools: string[]; toolSequ
   }
 }
 
+function isRealWorkspace(cwd: string | null | undefined): cwd is string {
+  if (!cwd?.trim()) return false
+  const trimmed = cwd.trim()
+  // A state.db is only ever read from this machine's own Hermes home
+  // (`HERMES_HOME` or `~/.hermes`), so the shapes it can hold are the host's.
+  // A Windows host also takes a POSIX-rooted path, which its own tooling
+  // produces (WSL, MSYS); a POSIX host takes only a POSIX-rooted path, so a
+  // literal `C:\...` string stays the non-workspace it has always been there.
+  // Slash-UNC (//server/share) stays out: it is not a local workspace.
+  const isAbsolute = process.platform === 'win32'
+    ? /^[a-zA-Z]:[\\/]/.test(trimmed) || /^\\\\[^\\/]+\\/.test(trimmed)
+      || (trimmed.startsWith('/') && !trimmed.startsWith('//'))
+    : trimmed.startsWith('/') && !trimmed.startsWith('//')
+  if (!isAbsolute) return false
+  const normalized = trimmed.replace(/\\/g, '/').replace(/\/+$/, '')
+  if (normalized === '/' || normalized === homedir() || normalized === homedir().replace(/\\/g, '/') || isUserHomeRoot(normalized)) return false
+  if (/\.app\/Contents\//.test(normalized)) return false
+  return true
+}
+
+function resolveHermesWorkspace(
+  row: HermesSessionRow,
+  messages: HermesMessageRow[],
+): { project: string; projectPath?: string; workingDirectory?: string; provider: 'hermes' } {
+  const provider = 'hermes' as const
+  const repo = row.git_repo_root?.trim()
+  if (isRealWorkspace(repo)) {
+    return { project: sanitizeProject(basename(repo)), projectPath: repo, workingDirectory: repo, provider }
+  }
+  const cwd = row.cwd?.trim()
+  if (isRealWorkspace(cwd)) {
+    return { project: sanitizeProject(cwd), projectPath: cwd, workingDirectory: cwd, provider }
+  }
+  const inferred = inferProject(messages, '')
+  if (isRealWorkspace(inferred.projectPath)) {
+    // Prompt-derived paths remain local display/grouping labels only.
+    return { project: inferred.project, provider }
+  }
+  return { project: provider, provider }
+}
+
+function tokenSum(tokens: HermesTokenTotals): number {
+  return tokens.inputTokens + tokens.outputTokens + tokens.cacheReadTokens + tokens.cacheWriteTokens + tokens.reasoningTokens
+}
+
+function resolveHermesCost(
+  row: HermesSessionRow | undefined,
+  model: string,
+  tokens: HermesTokenTotals,
+): { costUSD: number; costIsEstimated: boolean; costBasis: HermesCostBasis } {
+  const calculatedCost = calculateCost(
+    model,
+    tokens.inputTokens,
+    tokens.outputTokens + tokens.reasoningTokens,
+    tokens.cacheWriteTokens,
+    tokens.cacheReadTokens,
+    0,
+  )
+  // actual is a recorded invoice amount; explicit $0 still counts as recorded.
+  if (row && row.actual_cost_usd != null) {
+    return { costUSD: row.actual_cost_usd, costIsEstimated: false, costBasis: 'actual' }
+  }
+  const costStatus = row?.cost_status?.trim().toLowerCase()
+  const costSource = row?.cost_source?.trim().toLowerCase()
+  // Included subscription usage is real activity but not metered API spend.
+  // Its recorded zero must win over API-equivalent token pricing.
+  if (costStatus === 'included') {
+    return { costUSD: 0, costIsEstimated: false, costBasis: 'included' }
+  }
+  // An explicit Hermes estimate is authoritative even when it is zero (for
+  // example, a provider's free tier). Preserve that provenance in the UI.
+  if (costStatus === 'estimated' && row?.estimated_cost_usd != null) {
+    return { costUSD: row.estimated_cost_usd, costIsEstimated: true, costBasis: 'estimated' }
+  }
+  // Only rows predating BOTH provenance fields use the legacy positive-estimate
+  // fallback. A provenance-aware `unknown` row can retain a partial estimate
+  // from earlier priced calls; treating that as the session total undercounts.
+  if (!costStatus && !costSource && row && row.estimated_cost_usd != null && row.estimated_cost_usd > 0) {
+    return { costUSD: row.estimated_cost_usd, costIsEstimated: true, costBasis: 'estimated' }
+  }
+  return { costUSD: calculatedCost, costIsEstimated: true, costBasis: 'calculated' }
+}
+
+/// Who billed a call, read off the basis Hermes resolved its cost to.
+/// `included` is usage a subscription already paid for; an `actual` amount is
+/// a recorded invoice line, so it is metered — an explicit $0 (a free-tier
+/// OpenRouter model) is still recorded. An estimate names no account, so it
+/// yields no mode rather than a guess.
+function billingFromCostBasis(basis: HermesCostBasis): BillingMode | undefined {
+  if (basis === 'included') return 'subscription'
+  if (basis === 'actual') return 'metered'
+  return undefined
+}
+
+function observationToCall(
+  observation: HermesObservation,
+  args: {
+    profile: string
+    sessionId: string
+    model: string
+    tools: string[]
+    bashCommands: string[]
+    toolSequence: ToolCall[][]
+    userMessage: string
+    project: string
+    projectPath?: string
+    workingDirectory?: string
+    prLinks?: string[]
+    costIsEstimated: boolean
+    /// Route id from the session's `billing_provider` column, when it names a
+    /// non-direct door (see routeFromProviderField). Undefined for direct or
+    /// unknown, and for the vanished-DB cursor path, whose row is gone.
+    route?: string
+  },
+): ParsedProviderCall {
+  const later = observation.index > 0
+  const billing = billingFromCostBasis(observation.costBasis)
+  return {
+    provider: 'hermes',
+    model: args.model,
+    inputTokens: observation.inputTokens,
+    outputTokens: observation.outputTokens,
+    cacheCreationInputTokens: observation.cacheWriteTokens,
+    cacheReadInputTokens: observation.cacheReadTokens,
+    cachedInputTokens: observation.cacheReadTokens,
+    reasoningTokens: observation.reasoningTokens,
+    webSearchRequests: 0,
+    costUSD: observation.costUSD,
+    // Later observations keep the stored basis. Included and actual are
+    // recorded facts; estimated and calculated remain estimates.
+    costIsEstimated: later
+      ? observation.costBasis === 'calculated' || observation.costBasis === 'estimated'
+      : args.costIsEstimated,
+    tools: later ? [] : args.tools,
+    bashCommands: later ? [] : args.bashCommands,
+    timestamp: observation.timestamp,
+    speed: 'standard',
+    deduplicationKey: later
+      ? hermesObservationKey(args.profile, args.sessionId, observation.index)
+      : hermesBaselineKey(args.profile, args.sessionId),
+    turnId: later ? `${args.sessionId}:obs:${observation.index}` : `${args.sessionId}:session`,
+    toolSequence: later || args.toolSequence.length === 0 ? undefined : args.toolSequence,
+    userMessage: later ? '' : args.userMessage,
+    sessionId: args.sessionId,
+    project: args.project,
+    projectPath: args.projectPath,
+    workingDirectory: args.workingDirectory,
+    ...(later || !args.prLinks?.length ? {} : { prLinks: args.prLinks }),
+    ...(later ? { supplementaryAccounting: true } : {}),
+    ...(args.route ? { route: args.route } : {}),
+    ...(billing ? { billing } : {}),
+  }
+}
+
 function inferProject(messages: HermesMessageRow[], fallback: string): { project: string; projectPath?: string } {
   const cwdPattern = /^Current working directory:\s*([a-zA-Z]:\\[^\r\n`"]+|\/[^\r\n`"\\]+)/m
   for (const msg of messages) {
     if (msg.role !== 'user' && msg.role !== 'system') continue
-    const text = msg.content ?? ''
-    const match = cwdPattern.exec(text)
+    const match = cwdPattern.exec(msg.content ?? '')
     if (match?.[1]) {
       const projectPath = match[1].trim()
       return { project: sanitizeProject(projectPath), projectPath }
@@ -266,7 +543,10 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
   let db: SqliteDatabase
   try {
     db = openDatabase(dbPath)
-  } catch {
+  } catch (err) {
+    // A busy/locked open is not an empty DB: escalate so discovery is marked
+    // failed rather than sealing an empty period (mirrors the query catch below).
+    if (isSqliteBusyError(err)) throw err
     return []
   }
 
@@ -289,11 +569,25 @@ async function discoverFromDb(dbPath: string, profile: string): Promise<SessionS
        LIMIT 10000`,
     )
 
-    return rows.map(row => ({
+    const sources = rows.map(row => ({
       path: encodeSourcePath(dbPath, row.id),
-      project: sanitizeProject(profile),
-      provider: 'hermes',
+      project: displayProjectForProfile(profile),
+      provider: 'hermes' as const,
     }))
+    // After the >0 filter, reconcile every already-ledgered identity against
+    // this state.db so an all-zero (or missing) row still reaches the cursor.
+    // Without this, 150→0 is invisible and the later 40 is treated as a shrink.
+    const discoveredIds = new Set(rows.map(row => row.id))
+    const ledger = loadHermesSessionLedger()
+    for (const sessionId of listHermesCursorSessionIds(ledger, profile)) {
+      if (discoveredIds.has(sessionId)) continue
+      sources.push({
+        path: encodeSourcePath(dbPath, sessionId),
+        project: displayProjectForProfile(profile),
+        provider: 'hermes',
+      })
+    }
+    return sources
   } catch (err) {
     if (isSqliteBusyError(err)) throw err
     process.stderr.write(`codeburn: error querying Hermes database: ${err instanceof Error ? err.message : err}\n`)
@@ -319,11 +613,15 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
       try {
         db = openDatabase(decoded.dbPath)
       } catch (err) {
+        // A busy/locked open must reach the caller, not read as an empty session.
+        if (isSqliteBusyError(err)) throw err
         process.stderr.write(`codeburn: cannot open Hermes database: ${err instanceof Error ? err.message : err}\n`)
         return
       }
 
-      let result: ParsedProviderCall | undefined
+      let result: {
+        calls: ParsedProviderCall[]
+      } | undefined
       try {
         if (!validateSchema(db)) return
         const columns = getSessionColumns(db)
@@ -332,6 +630,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
                   ${nullableColumn(columns, 'source')},
                   ${nullableColumn(columns, 'model')},
                   ${nullableColumn(columns, 'cwd')},
+                  ${nullableColumn(columns, 'git_repo_root')},
                   ${nullableColumn(columns, 'billing_provider')},
                   ${numberColumn(columns, 'input_tokens')},
                   ${numberColumn(columns, 'output_tokens')},
@@ -340,6 +639,8 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
                   ${numberColumn(columns, 'reasoning_tokens')},
                   ${nullableColumn(columns, 'estimated_cost_usd')},
                   ${nullableColumn(columns, 'actual_cost_usd')},
+                  ${nullableColumn(columns, 'cost_status')},
+                  ${nullableColumn(columns, 'cost_source')},
                   ${numberColumn(columns, 'api_call_count')},
                   ${numberColumn(columns, 'tool_call_count')},
                   ${nullableColumn(columns, 'started_at')},
@@ -350,7 +651,39 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
           [decoded.sessionId],
         )
         const row = rows[0]
-        if (!row) return
+        const ledger = loadHermesSessionLedger()
+        const existingCursor = getHermesCursor(ledger, profile, decoded.sessionId)
+        if (!row) {
+          if (!existingCursor) return
+          const baselineKey = hermesBaselineKey(profile, decoded.sessionId)
+          if (seenKeys.has(baselineKey)) return
+          seenKeys.add(baselineKey)
+          const cursor = await recordHermesSnapshot({
+            profile,
+            sessionId: decoded.sessionId,
+            startedAt: existingCursor.observations[0]?.timestamp || hermesLedgerNow().toISOString(),
+            observedAt: hermesLedgerNow().toISOString(),
+            tokens: zeroHermesTokens(),
+            costUSD: 0,
+            costBasis: 'calculated',
+          })
+          for (const observation of cursor.observations) {
+            if (observation.index > 0) seenKeys.add(hermesObservationKey(profile, decoded.sessionId, observation.index))
+          }
+          result = {
+            calls: cursor.observations.map(observation => observationToCall(observation, {
+              profile,
+              sessionId: decoded.sessionId,
+              model: 'unknown',
+              tools: [],
+              bashCommands: [],
+              toolSequence: [],
+              userMessage: '',
+              project: displayProjectForProfile(profile),
+              costIsEstimated: false,
+            })),
+          }
+        } else {
 
         const messageColumns = getMessageColumns(db)
         const orderColumns = ['timestamp', 'id'].filter(name => messageColumns.has(name))
@@ -373,77 +706,83 @@ function createParser(source: SessionSource, seenKeys: Set<string>, hermesHome: 
         const cacheReadTokens = row.cache_read_tokens ?? 0
         const cacheWriteTokens = row.cache_write_tokens ?? 0
         const reasoningTokens = row.reasoning_tokens ?? 0
-        if (inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens + reasoningTokens === 0) return
+        const tokens: HermesTokenTotals = {
+          inputTokens,
+          outputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          reasoningTokens,
+        }
+        if (tokenSum(tokens) === 0 && !existingCursor) return
 
         const model = row.model ?? 'unknown'
         const { tools, toolSequence, bashCommands } = collectTools(messages)
-        // Hermes records the session's working directory in sessions.cwd.
-        // Prefer it; fall back to scraping a "Current working directory:" line
-        // from the transcript (older builds), then to the profile name.
-        const cwd = row.cwd?.trim()
-        const projectInfo = cwd
-          ? { project: sanitizeProject(cwd), projectPath: cwd }
-          : inferProject(messages, sanitizeProject(profile))
+        const workspace = resolveHermesWorkspace(row, messages)
         const timestamp = parseTimestamp(row.started_at)
-        const dedupKey = `hermes:${profile}:${row.id}`
-        if (seenKeys.has(dedupKey)) return
-        seenKeys.add(dedupKey)
+        const baselineKey = hermesBaselineKey(profile, row.id)
+        if (seenKeys.has(baselineKey)) return
+        seenKeys.add(baselineKey)
 
-        // Hermes bills reasoning tokens at the output rate (same as Gemini).
-        // The LiteLLM model table is used as a fallback when Hermes has not
-        // stored an actual or estimated cost for the session.
-        const calculatedCost = calculateCost(
-          model,
-          inputTokens,
-          outputTokens + reasoningTokens,
-          cacheWriteTokens,
-          cacheReadTokens,
-          0,
-        )
-        const recordedCost =
-          (row.actual_cost_usd ?? 0) > 0 ? row.actual_cost_usd!
-          : (row.estimated_cost_usd ?? 0) > 0 ? row.estimated_cost_usd!
+        const identity = workspace.projectPath
+          ? githubOwnerRepoFromRoot(workspace.projectPath)
           : null
-        // When Hermes stored no cost (e.g. subscription-billed sessions), the
-        // figure is our LiteLLM-priced estimate from the session token totals.
-        const costUSD = recordedCost ?? calculatedCost
-        const costIsEstimated = recordedCost === null
+        const prLinks = extractGithubPullUrls(
+          messages
+            .filter(msg => msg.role === 'assistant' || msg.role === 'user')
+            .map(msg => msg.content),
+          identity,
+        )
 
-        result = {
-          provider: 'hermes',
-          model,
-          inputTokens,
-          outputTokens,
-          cacheCreationInputTokens: cacheWriteTokens,
-          cacheReadInputTokens: cacheReadTokens,
-          cachedInputTokens: cacheReadTokens,
-          reasoningTokens,
-          webSearchRequests: 0,
-          costUSD,
-          costIsEstimated,
-          tools,
-          bashCommands,
-          timestamp,
-          speed: 'standard',
-          deduplicationKey: dedupKey,
-          turnId: `${row.id}:session`,
-          toolSequence: toolSequence.length > 0 ? toolSequence : undefined,
-          userMessage: firstUserMessage(messages),
+        const cost = resolveHermesCost(row, model, tokens)
+        // Decided rule: a session's cost delta lands on the day it is OBSERVED
+        // (`observedAt`), not the day the session started. A mid-session price
+        // change therefore shows up on the observation day, and a sealed day is
+        // never rewritten to reprice it.
+        const cursor = await recordHermesSnapshot({
+          profile,
           sessionId: row.id,
-          project: projectInfo.project,
-          projectPath: projectInfo.projectPath,
+          startedAt: timestamp || hermesLedgerNow().toISOString(),
+          observedAt: hermesLedgerNow().toISOString(),
+          tokens,
+          costUSD: cost.costUSD,
+          costBasis: cost.costBasis,
+        })
+        for (const observation of cursor.observations) {
+          if (observation.index > 0) seenKeys.add(hermesObservationKey(profile, row.id, observation.index))
+        }
+        result = {
+          calls: cursor.observations.map(observation => observationToCall(observation, {
+            profile,
+            sessionId: row.id,
+            model,
+            tools,
+            bashCommands,
+            toolSequence,
+            userMessage: firstUserMessage(messages),
+            project: workspace.project,
+            projectPath: workspace.projectPath,
+            workingDirectory: workspace.workingDirectory,
+            prLinks,
+            costIsEstimated: cost.costIsEstimated,
+            route: routeFromProviderField(row.billing_provider)?.id,
+          })),
+        }
         }
       } catch (err) {
-        // A transient lock on the live state.db must propagate so the caller
-        // retries, not get swallowed into an empty (negatively cached) result.
-        if (isSqliteBusyError(err)) throw err
-        process.stderr.write(`codeburn: error querying Hermes database: ${err instanceof Error ? err.message : err}\n`)
+        // A transient lock on the live state.db, or a ledger publication
+        // failure, must propagate so the caller retries — not get swallowed
+        // into an empty (negatively cached) result.
+        if (isSqliteBusyError(err) || isHermesLedgerPublicationError(err)) throw err
+        const detail = err instanceof Error ? err.message : err
+        process.stderr.write(`codeburn: error querying Hermes database: ${detail}\n`)
         return
       } finally {
         db.close()
       }
 
-      if (result) yield result
+      if (result) {
+        for (const call of result.calls) yield call
+      }
     },
   }
 }
@@ -460,6 +799,10 @@ export function createHermesProvider(hermesHomeOverride?: string): Provider {
 
     toolDisplayName(rawTool: string): string {
       return mapToolName(rawTool)
+    },
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: hermesHome, label: 'home' }]
     },
 
     async discoverSessions(): Promise<SessionSource[]> {

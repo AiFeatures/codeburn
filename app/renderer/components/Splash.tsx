@@ -6,8 +6,9 @@ import { ProviderLogo } from './ProviderLogo'
 import { motionClass, motionEnabled, reducedMotion } from '../lib/motion'
 import { codeburn } from '../lib/ipc'
 import type { ScanProgressEvent } from '../lib/types'
-import { version } from '../../package.json'
+import { displayVersion } from '../lib/platform'
 import loaderVideo from '../assets/splash-loader.webm'
+import { t } from '../i18n'
 
 const MIN_ON_SCREEN_MS = 600
 const CROSSFADE_MS = 250
@@ -51,6 +52,10 @@ function reduceProgress(state: Progress, event: ScanProgressEvent): Progress {
       for (const p of state.order) status[p] = 'done'
       return { ...state, status }
     }
+    // 'keepalive' and anything a newer CLI adds: proof of life, no state change.
+    // A pinned/dev CLI can be newer than this app, so never fall off the switch.
+    default:
+      return state
   }
 }
 
@@ -69,7 +74,9 @@ function SplashStatus({ progress }: { progress: Progress }) {
   const counter = active === 'claude' && progress.claudeTotal > 0
     ? ` · ${progress.claudeDone.toLocaleString('en-US')}/${progress.claudeTotal.toLocaleString('en-US')}`
     : ''
-  const line = active ? `Indexing ${providerLabel(active)}${counter}` : 'Indexing your usage history…'
+  const line = active
+    ? t('onboarding.splash.indexingProvider', { provider: providerLabel(active), counter })
+    : t('onboarding.splash.indexingGeneric')
   return (
     <div className="splash-status">
       <div className="splash-status-line">{line}</div>
@@ -82,7 +89,7 @@ function SplashStatus({ progress }: { progress: Progress }) {
           ))}
         </div>
       )}
-      <div className="splash-status-note">One-time scan · future launches are instant</div>
+      <div className="splash-status-note">{t('onboarding.splash.oneTimeScanNote')}</div>
     </div>
   )
 }
@@ -110,12 +117,28 @@ export function Splash({ hasData, hasError }: { hasData: boolean; hasError: bool
   const [reveal, setReveal] = useState(false)
   const shownAt = useRef(Date.now())
   const done = useRef(false)
+  const videoRef = useRef<HTMLVideoElement>(null)
 
   // Subscribe once to cold-start progress. `codeburn` is undefined outside the
   // Electron preload (e.g. unit tests); guard so the splash still renders.
   useEffect(() => {
     if (!codeburn || typeof codeburn.onProgress !== 'function') return
     return codeburn.onProgress(event => setProgress(prev => reduceProgress(prev, event)))
+  }, [])
+
+  // The brand video plays once (no loop) and then holds no decoder. While the
+  // window is hidden, pause it so a minimized/occluded launch does not stack
+  // media decode on the cold hydration CPU spike; resume on show unless it has
+  // already ended.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    const sync = () => {
+      if (document.visibilityState === 'hidden') video.pause()
+      else if (!video.ended) void video.play().catch(() => {})
+    }
+    document.addEventListener('visibilitychange', sync)
+    return () => document.removeEventListener('visibilitychange', sync)
   }, [])
 
   // Only a genuine cold hydration reveals the indexing detail. Warm launches
@@ -156,14 +179,14 @@ export function Splash({ hasData, hasError }: { hasData: boolean; hasError: bool
       {motionEnabled() ? (
         // The animated burn as VP9-with-alpha, floating directly on the splash
         // gradient while the first scan runs. Static mark under reduced motion.
-        <video className="splash-video" src={loaderVideo} width={232} height={232} autoPlay muted loop playsInline />
+        <video ref={videoRef} className="splash-video" src={loaderVideo} width={232} height={232} autoPlay muted playsInline />
       ) : (
         <div className="splash-mark">
           <FlameMark size={76} />
         </div>
       )}
       <div className="splash-word">CodeBurn</div>
-      <div className="splash-version">v{version}</div>
+      <div className="splash-version">v{displayVersion()}</div>
       {showDetail && <SplashStatus progress={progress} />}
     </div>,
     document.body,

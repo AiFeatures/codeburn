@@ -19,17 +19,45 @@ async function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
 // Shape matches CodeburnBridge (app/renderer/lib/types.ts); typing is enforced
 // renderer-side where `window.codeburn` is declared as CodeburnBridge.
 const bridge = {
-  getQuota: (force?: boolean) => invoke('codeburn:getQuota', force),
-  getOverview: (period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean) => invoke('codeburn:getOverview', period, provider, range, configSource, background),
-  getPlans: (period: string) => invoke('codeburn:getPlans', period),
+  // The Electron app's own UI language tag (app.getLocale()), for the renderer's
+  // 'system' locale choice. Seeded into the environment by main before the
+  // window loads, so it is sync-safe at preload time.
+  appLocale: process.env.__CODEBURN_APP_LOCALE__ ?? '',
+  getLanguage: () => invoke('codeburn:getLanguage'),
+  setLanguage: (language: string | null) => invoke('codeburn:setLanguage', language),
+  getCursorSync: () => invoke('codeburn:getCursorSync'),
+  setCursorSync: (enabled: boolean) => invoke('codeburn:setCursorSync', enabled),
+  getQuota: (force?: boolean, disabled?: string[]) => invoke('codeburn:getQuota', force, disabled),
+  getOverview: (period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => invoke('codeburn:getOverview', period, provider, range, configSource, background, scope),
+  getTimeline: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getTimeline', period, provider, range),
+  getPlans: (period: string, background?: boolean) => invoke('codeburn:getPlans', period, background),
   getActReport: () => invoke('codeburn:getActReport'),
-  getModels: (period: string, provider: string, byTask: boolean, range?: DateRange) => invoke('codeburn:getModels', period, provider, byTask, range),
-  getSessions: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getSessions', period, provider, range),
-  getCompareModels: (period: string, provider: string) => invoke('codeburn:getCompareModels', period, provider),
+  getModels: (period: string, provider: string, byTask: boolean, range?: DateRange, background?: boolean) => invoke('codeburn:getModels', period, provider, byTask, range, background),
+  getSessions: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSessions', period, provider, range, background),
+  getSessionsContributions: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSessionsContributions', period, provider, range, background),
+  getSessionWhy: (id: string) => invoke('codeburn:getSessionWhy', id),
+  getCompareModels: (period: string, provider: string, background?: boolean) => invoke('codeburn:getCompareModels', period, provider, background),
   getCompare: (period: string, provider: string, modelA: string, modelB: string) => invoke('codeburn:getCompare', period, provider, modelA, modelB),
-  getYield: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getYield', period, provider, range),
-  getSpendFlow: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getSpendFlow', period, provider, range),
-  getOptimizeReport: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getOptimizeReport', period, provider, range),
+  getPeriodCompare: (rangeA: DateRange, rangeB: DateRange, provider: string, background?: boolean) => invoke('codeburn:getPeriodCompare', rangeA, rangeB, provider, background),
+  getPeriodCompareSessions: (rangeA: DateRange, rangeB: DateRange, provider: string, dimension: string, key: string) => invoke('codeburn:getPeriodCompareSessions', rangeA, rangeB, provider, dimension, key),
+  getCompareCohortModels: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getCompareCohortModels', period, provider, range, background),
+  getCompareCohort: (period: string, provider: string, modelA: string, modelB: string, range?: DateRange, projects?: string[], category?: string, background?: boolean) =>
+    invoke('codeburn:getCompareCohort', period, provider, modelA, modelB, range, projects, category, background),
+  getYield: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getYield', period, provider, range, background),
+  getSpendFlow: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getSpendFlow', period, provider, range, background),
+  getBranchSpend: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getBranchSpend', period, provider, range, background),
+  getOptimizeReport: (period: string, provider: string, range?: DateRange, background?: boolean) => invoke('codeburn:getOptimizeReport', period, provider, range, background),
+  // The once-a-day optimize scan, cached on disk per query scope. `maxAgeMs` 0
+  // forces a recompute (Optimize page, manual refresh).
+  getOptimizeSnapshot: (period: string, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number) =>
+    invoke('codeburn:getOptimizeSnapshot', period, provider, range, configSource, scope, maxAgeMs),
+  // Power source for the battery-aware live cadence: one read plus a push.
+  powerStatus: () => invoke('codeburn:powerStatus'),
+  onPowerStatus: (cb: (onBattery: boolean) => void) => {
+    const listener = (_e: unknown, onBattery: boolean) => cb(onBattery)
+    ipcRenderer.on('codeburn:power', listener)
+    return () => { ipcRenderer.removeListener('codeburn:power', listener) }
+  },
   getDevices: (period: string) => invoke('codeburn:getDevices', period),
   getDevicesScan: () => invoke('codeburn:getDevicesScan'),
   getShareStatus: () => invoke('codeburn:getShareStatus'),
@@ -38,6 +66,10 @@ const bridge = {
   getProxyPaths: () => invoke('codeburn:getProxyPaths'),
   getAudit: (period: string, provider: string, range?: DateRange) => invoke('codeburn:getAudit', period, provider, range),
   getPriceOverrides: () => invoke('codeburn:getPriceOverrides'),
+  getProjectFilter: () => invoke('codeburn:getProjectFilter'),
+  setProjectFilter: (filter: { project: string[]; exclude: string[] }) => invoke('codeburn:setProjectFilter', filter),
+  getUnfilteredProjects: () => invoke('codeburn:getUnfilteredProjects'),
+  setTransientProject: (projectPath: string | null) => invoke('codeburn:setTransientProject', projectPath),
   setPriceOverride: (model: string, rates: PriceRates) => invoke('codeburn:setPriceOverride', model, rates),
   removePriceOverride: (model: string) => invoke('codeburn:removePriceOverride', model),
   setCurrency: (code: string) => invoke('codeburn:setCurrency', code),
@@ -68,6 +100,53 @@ const bridge = {
     ipcRenderer.on('codeburn:update', listener)
     return () => { ipcRenderer.removeListener('codeburn:update', listener) }
   },
+  downloadUpdate: () => invoke('codeburn:downloadUpdate'),
+  installUpdate: () => invoke('codeburn:installUpdate'),
+  // The menubar app and global CLI following the desktop's version: a read, a push, and a run.
+  getCompanionUpdate: () => invoke('codeburn:companionUpdateStatus'),
+  onCompanionUpdate: (cb: (status: unknown) => void) => {
+    const listener = (_e: unknown, status: unknown) => cb(status)
+    ipcRenderer.on('codeburn:companionUpdate', listener)
+    return () => { ipcRenderer.removeListener('codeburn:companionUpdate', listener) }
+  },
+  updateCompanions: () => invoke('codeburn:updateCompanions'),
+  // The bundled tray app and its Capacity Dock (Windows). Every setter answers with the
+  // whole status, so the sidebar renders what took rather than what it asked for.
+  companionStatus: () => invoke('codeburn:companionStatus'),
+  // The Plugins card's discrete actions, mirroring the macOS card.
+  companionInstall: () => invoke('codeburn:companionInstall'),
+  companionOpen: () => invoke('codeburn:companionOpen'),
+  companionQuit: () => invoke('codeburn:companionQuit'),
+  companionUninstall: () => invoke('codeburn:companionUninstall'),
+  companionSetDock: (enabled: boolean) => invoke('codeburn:companionSetDock', enabled),
+  // The tray app's own settings, in the two files it reads them from.
+  trayPrefs: () => invoke('codeburn:trayPrefs'),
+  setTrayAppPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayAppPref', patch),
+  setTrayDockPref: (patch: Record<string, unknown>) => invoke('codeburn:setTrayDockPref', patch),
+  setLaunchAtLogin: (enabled: boolean) => invoke('codeburn:setLaunchAtLogin', enabled),
+  // The macOS menubar app's card on the Plugins page.
+  macMenubarStatus: () => invoke('codeburn:macMenubarStatus'),
+  macMenubarInstall: () => invoke('codeburn:macMenubarInstall'),
+  macMenubarOpen: () => invoke('codeburn:macMenubarOpen'),
+  macMenubarSetDock: (enabled: boolean) => invoke('codeburn:macMenubarSetDock', enabled),
+  macMenubarSettings: () => invoke('codeburn:macMenubarSettings'),
+  macMenubarQuit: () => invoke('codeburn:macMenubarQuit'),
+  macMenubarUninstall: () => invoke('codeburn:macMenubarUninstall'),
+  onMacMenubarProgress: (cb: (phase: string) => void) => {
+    const listener = (_e: unknown, phase: string) => cb(phase)
+    ipcRenderer.on('codeburn:macMenubarProgress', listener)
+    return () => { ipcRenderer.removeListener('codeburn:macMenubarProgress', listener) }
+  },
+  // Plugin management
+  pluginList: () => invoke('codeburn:pluginList'),
+  pluginInfo: (name: string) => invoke('codeburn:pluginInfo', name),
+  pluginAdd: (source: string) => invoke('codeburn:pluginAdd', source),
+  pluginRemove: (name: string) => invoke('codeburn:pluginRemove', name),
+  pluginVerify: (name: string) => invoke('codeburn:pluginVerify', name),
+  // Sync auto
+  syncAutoStatus: () => invoke('codeburn:syncAutoStatus'),
+  syncAutoEnable: (cadence: string, attribution: boolean, accept: boolean) => invoke('codeburn:syncAutoEnable', cadence, attribution, accept),
+  syncAutoDisable: () => invoke('codeburn:syncAutoDisable'),
   platform: process.platform,
   arch: process.arch,
 }

@@ -1,25 +1,32 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { App, overviewMemoKey, topCategoryByModel, usageSnapshotProps } from './App'
+import { App, overviewMemoKey, refreshedLabel, selectedReportMemoKeys, topCategoryByModel, usageSnapshotProps } from './App'
 import { sanitizeProps } from '../electron/telemetry'
 import { __resetPolledMemo, hasPolledMemo, primePolledMemo } from './hooks/usePolled'
+import { reportMemoKey } from './lib/reportMemoKey'
 import { setActiveCurrency } from './lib/format'
-import type { DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SpendFlow } from './lib/types'
+import { readOverviewHeadline, writeOverviewHeadline } from './lib/overviewSnapshot'
+import type { BranchSpendReport, DateRange, MenubarPayload, ModelReportRow, OptimizeJsonReport, SessionRow, SpendFlow } from './lib/types'
+import { INITIAL_VISIBLE } from './sections/Sessions'
 
 const stored = new Map<string, string>()
 vi.stubGlobal('localStorage', {
   getItem: (key: string) => stored.get(key) ?? null,
   setItem: (key: string, value: string) => stored.set(key, value),
   removeItem: (key: string) => stored.delete(key),
+  key: (index: number) => [...stored.keys()][index] ?? null,
+  get length() { return stored.size },
   clear: () => stored.clear(),
 })
 
 const mocks = vi.hoisted(() => ({
-  getOverview: vi.fn<(period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean) => Promise<MenubarPayload>>(),
-  getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<SpendFlow>>(),
-  getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<OptimizeJsonReport>>(),
+  getOverview: vi.fn<(period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string) => Promise<MenubarPayload>>(),
+  getSpendFlow: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<SpendFlow>>(),
+  getBranchSpend: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<BranchSpendReport>>(),
+  getTimeline: vi.fn<(period: string, provider: string, range?: DateRange) => Promise<MenubarPayload>>(),
+  getOptimizeReport: vi.fn<(period: string, provider: string, range?: DateRange, background?: boolean) => Promise<OptimizeJsonReport>>(),
   getModels: vi.fn(),
   getSessions: vi.fn(),
   getCompareModels: vi.fn(),
@@ -33,9 +40,13 @@ const mocks = vi.hoisted(() => ({
   getIdentity: vi.fn(),
   cliStatus: vi.fn(),
   getPriceOverrides: vi.fn(),
+  getProjectFilter: vi.fn<() => Promise<{ project: string[]; exclude: string[] }>>(),
+  getUnfilteredProjects: vi.fn(),
+  setTransientProject: vi.fn<(projectPath: string | null) => Promise<void>>(),
   getAliases: vi.fn(),
   setCurrency: vi.fn(),
   resetCurrency: vi.fn(),
+  telemetryTrack: vi.fn<(name: string, props?: Record<string, unknown>) => Promise<boolean>>(),
 }))
 
 vi.mock('./lib/ipc', async orig => {
@@ -50,6 +61,16 @@ function dateKey(d: Date): string {
 function setVisibility(state: 'visible' | 'hidden') {
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => state })
   Object.defineProperty(document, 'hidden', { configurable: true, get: () => state === 'hidden' })
+}
+
+// The shortcut code (lib/platform.ts) reads `window.codeburn.platform` at call
+// time; stub it per test and always restore so no test leaks platform state.
+function setPlatform(platform: string): void {
+  ;(window as unknown as { codeburn?: { platform?: string } }).codeburn = { platform }
+}
+
+function clearPlatform(): void {
+  delete (window as unknown as { codeburn?: { platform?: string } }).codeburn
 }
 
 function overviewPayload(): MenubarPayload {
@@ -120,17 +141,31 @@ function withConfigs(payload: MenubarPayload): MenubarPayload {
 function installDefaultMocks() {
   for (const mock of Object.values(mocks)) mock.mockReset()
   mocks.getOverview.mockResolvedValue(overviewPayload())
+  mocks.getTimeline.mockResolvedValue(overviewPayload())
   mocks.getSpendFlow.mockResolvedValue({ period: { label: 'Last 30 days', start: '', end: '' }, models: [], projects: [], links: [] })
+  mocks.getBranchSpend.mockResolvedValue({
+    period: { label: '', start: '', end: '' },
+    projects: [],
+    totals: { branchKnownCost: 0, branchUnknownCost: 0, noBranchDataCost: 0, noBranchDataSessions: 0, noBranchDataProviders: [], distinctSessions: 0 },
+  })
   mocks.getOptimizeReport.mockResolvedValue({
     period: { label: 'Last 30 days', start: null, end: null },
     summary: {
       healthScore: 100, healthGrade: 'A', findingCount: 0, periodCostUSD: 0,
       sessions: 0, calls: 0, potentialSavingsTokens: 0, potentialSavingsCostUSD: 0,
-      potentialSavingsPercent: 0, costRateUSD: 0,
+      potentialSavingsPercent: 0, costRateUSD: 0, measuredSavingsUSD: 0,
+      byClass: {
+        fix: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+        nudge: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+        keep: { tokensSaved: 0, savingsUSD: 0, count: 0 },
+      },
     },
     findings: [],
   })
   mocks.getModels.mockResolvedValue([])
+  mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: [] })
+  mocks.getUnfilteredProjects.mockResolvedValue({ projects: [{ name: 'site', path: '/w/site', cost: 3, sessions: 2 }] })
+  mocks.setTransientProject.mockResolvedValue(undefined)
   mocks.getSessions.mockResolvedValue([])
   mocks.getCompareModels.mockResolvedValue([])
   mocks.getQuota.mockResolvedValue([
@@ -171,6 +206,7 @@ function installDefaultMocks() {
   mocks.getAliases.mockResolvedValue([])
   mocks.setCurrency.mockResolvedValue({ ok: true, stdout: '', stderr: '' })
   mocks.resetCurrency.mockResolvedValue({ ok: true, stdout: '', stderr: '' })
+  mocks.telemetryTrack.mockResolvedValue(true)
 }
 
 describe('App shortcuts', () => {
@@ -181,6 +217,158 @@ describe('App shortcuts', () => {
     // the app-wide default ('today'); tests that exercise the default set it.
     localStorage.setItem('codeburn.defaultPeriod', '30days')
     document.documentElement.removeAttribute('data-theme')
+    setPlatform('darwin')
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    clearPlatform()
+    vi.useRealTimers()
+  })
+
+  it('keeps sections gated (and the splash up) while a cold hydration times out', async () => {
+    // The repro: the overview timed out cold, `ready` latched anyway, and every
+    // section then spawned its own 45s read behind the still-running parse.
+    mocks.getOverview.mockRejectedValue({ kind: 'timeout', message: 'no output for 45000ms', cold: true })
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalled())
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(screen.queryByText("Couldn't read data")).not.toBeInTheDocument()
+  })
+
+  it('paints the last exact headline immediately while authoritative details load', async () => {
+    const key = overviewMemoKey('all', '30days', null, null)
+    writeOverviewHeadline(key, overviewPayload(), Date.now() - 1_000)
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+
+    expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+    expect(screen.getAllByText('$12.34').length).toBeGreaterThan(0)
+    expect(screen.getByText('12 calls · sessions updating')).toBeInTheDocument()
+    expect(screen.getByText('Updating detailed drill-downs…')).toBeInTheDocument()
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+  })
+
+  it('labels a stale source snapshot honestly instead of claiming 29226/29226 files are still indexing', async () => {
+    const payload = overviewPayload()
+    payload.stale = true
+    payload.hydration = { complete: false, indexedFiles: 29_226, totalFiles: 29_226 }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    expect(await screen.findByText('Some sources could not be refreshed. Showing indexed data; recent activity may be missing.')).toBeInTheDocument()
+    expect(screen.queryByText(/29226\/29226/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/totals below cover what is indexed so far/)).not.toBeInTheDocument()
+  })
+
+  it('shows file progress only for a genuinely partial progressive index', async () => {
+    const payload = overviewPayload()
+    payload.hydration = { complete: false, indexedFiles: 24, totalFiles: 100 }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    expect(await screen.findByText('Indexing history · 24/100 files · You can keep using CodeBurn; totals update as indexing completes.')).toBeInTheDocument()
+  })
+
+  it('never persists the previous period headline under a newly selected period', async () => {
+    const thirtyDays = overviewPayload()
+    thirtyDays.current = { ...thirtyDays.current, label: 'Last 30 Days', cost: 30 }
+    const pendingWeek = new Promise<MenubarPayload>(() => {})
+    mocks.getOverview.mockImplementation((period: string) =>
+      period === 'week' ? pendingWeek : Promise.resolve(thirtyDays))
+
+    render(<App />)
+    expect(await screen.findByText('$30.00')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all'))
+
+    // The selected key has not resolved yet. A 30-day result must never be
+    // written beneath it and then shown as the seven-day headline on a later
+    // switch or app launch.
+    expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
+  })
+
+  it('shows the loading state for a period the sweep never warmed, not the old numbers', async () => {
+    const thirtyDays = overviewPayload()
+    thirtyDays.current = { ...thirtyDays.current, label: 'Last 30 Days', cost: 30 }
+    const pendingWeek = new Promise<MenubarPayload>(() => {})
+    mocks.getOverview.mockImplementation((period: string) =>
+      period === 'week' ? pendingWeek : Promise.resolve(thirtyDays))
+
+    render(<App />)
+    expect(await screen.findByText('$30.00')).toBeInTheDocument()
+
+    // The sweep only warms the selected period, so 7D is cold: the on-demand
+    // fetch runs and the panel waits on it rather than showing 30D's figure.
+    fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all'))
+    await waitFor(() => expect(screen.queryByText('$30.00')).toBeNull())
+    expect(document.querySelector('.skel')).not.toBeNull()
+  })
+
+  it('rolls Today and Month cache identities at their local calendar boundaries', () => {
+    const aug28 = new Date(2026, 7, 28, 23, 59)
+    const aug29 = new Date(2026, 7, 29, 0, 1)
+    const sep1 = new Date(2026, 8, 1, 0, 1)
+
+    expect(overviewMemoKey('all', 'today', null, null, 'local', aug28))
+      .not.toBe(overviewMemoKey('all', 'today', null, null, 'local', aug29))
+    expect(overviewMemoKey('all', 'month', null, null, 'local', aug28))
+      .toBe(overviewMemoKey('all', 'month', null, null, 'local', aug29))
+    expect(overviewMemoKey('all', 'month', null, null, 'local', aug29))
+      .not.toBe(overviewMemoKey('all', 'month', null, null, 'local', sep1))
+  })
+
+  it('maps the footer to the selected report instead of reusing Overview freshness', () => {
+    expect(selectedReportMemoKeys('sessions', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['sessions|week|claude|-||'])
+    expect(selectedReportMemoKeys('spend', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['overview-key', 'spendflow|week|claude|-||'])
+    expect(selectedReportMemoKeys('optimize', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['overview-key', 'optimize|week|claude|-||', 'yield|week|claude|-||'])
+    expect(selectedReportMemoKeys('models', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['models|week|claude|-|false|'])
+    expect(selectedReportMemoKeys('compare', 'week', 'claude', null, 'overview-key'))
+      .toEqual(['comparemodels|week|claude|-||'])
+    expect(selectedReportMemoKeys('plans', 'week', 'claude', null, 'overview-key', new Set(['kimi', 'codex'])))
+      .toEqual(['quota|codex,kimi', 'plans|week|all|-||'])
+  })
+
+  it('uses readable hour and day units for restored report freshness', () => {
+    expect(refreshedLabel(0, false, 2 * 60 * 60 * 1000)).toBe('refreshed 2h ago')
+    expect(refreshedLabel(0, false, 3 * 24 * 60 * 60 * 1000)).toBe('refreshed 3d ago')
+  })
+
+  it('releases the sections when the overview fails for a real reason', async () => {
+    mocks.getOverview.mockRejectedValue({ kind: 'nonzero', message: 'permission denied' })
+    render(<App />)
+    await waitFor(() => expect(mocks.getActReport).toHaveBeenCalled())
+  })
+
+  it('does not fan out secondary analysis after the bounded overview timeout', async () => {
+    // A real installed heavy-corpus run reached the 600s no-output boundary.
+    // Marking that timeout as generally ready mounted Overview's act/yield polls;
+    // a user Refresh then ran another status parse beside yield, multiplying the
+    // retry's memory pressure instead of helping it recover.
+    mocks.getOverview
+      .mockRejectedValueOnce({ kind: 'timeout', message: 'no output for 600000ms' })
+      .mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+
+    expect(await screen.findByText("Couldn't read data")).toBeInTheDocument()
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(mocks.getYield).not.toHaveBeenCalled()
+
+    fireEvent.keyDown(document, { key: 'r', metaKey: true })
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledTimes(2))
+    expect(mocks.getActReport).not.toHaveBeenCalled()
+    expect(mocks.getYield).not.toHaveBeenCalled()
   })
 
   it('applies the persisted theme on app boot before Settings mounts', async () => {
@@ -202,6 +390,25 @@ describe('App shortcuts', () => {
     await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all'))
   })
 
+  it('falls back to 7 days when the boot payload shows today has no sessions', async () => {
+    localStorage.removeItem('codeburn.defaultPeriod')
+    const empty = overviewPayload()
+    mocks.getOverview.mockResolvedValue({ ...empty, current: { ...empty.current, sessions: 0 } })
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all'))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('week', 'all'))
+  })
+
+  it('leaves a persisted default period alone when today has no sessions', async () => {
+    localStorage.setItem('codeburn.defaultPeriod', 'today')
+    const empty = overviewPayload()
+    mocks.getOverview.mockResolvedValue({ ...empty, current: { ...empty.current, sessions: 0 } })
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'all'))
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.getOverview).not.toHaveBeenCalledWith('week', 'all')
+  })
+
   it('switches sections with command-number shortcuts', async () => {
     render(<App />)
 
@@ -211,44 +418,57 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
   })
 
-  it('keeps command navigation, settings, and refresh shortcuts active without stale hints', async () => {
+  it.each([
+    ['darwin', { metaKey: true }, '⌘'],
+    ['win32', { ctrlKey: true }, 'Ctrl+'],
+  ] as const)('keeps %s navigation, settings, and refresh shortcuts active without stale hints', async (platform, chord, mod) => {
+    setPlatform(platform)
     render(<App />)
 
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
-    expect(screen.getByText('⌘1-8')).toBeInTheDocument()
-    expect(screen.getAllByText('⌘,').length).toBeGreaterThan(0)
-    expect(screen.getByText('⌘R')).toBeInTheDocument()
+    expect(screen.getByText(`${mod}1-9`)).toBeInTheDocument()
+    expect(screen.getAllByText(`${mod},`).length).toBeGreaterThan(0)
+    expect(screen.getByText(`${mod}R`)).toBeInTheDocument()
     expect(screen.queryByText('Command')).not.toBeInTheDocument()
     expect(screen.queryByText('Export view')).not.toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    fireEvent.keyDown(document, { key: '2', ...chord })
     expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '3', metaKey: true })
-    expect(await screen.findByText(/PR links are captured as sessions are parsed/)).toBeInTheDocument()
+    fireEvent.keyDown(document, { key: '3', ...chord })
+    expect(await screen.findByText(/No sessions in Last 30 days mentioned a pull request URL/)).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '4', metaKey: true })
+    fireEvent.keyDown(document, { key: '4', ...chord })
     expect(await screen.findByText('Cost flow · model → project')).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '5', metaKey: true })
+    fireEvent.keyDown(document, { key: '5', ...chord })
     expect(await screen.findByText('No waste findings in this range yet.')).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '6', metaKey: true })
+    fireEvent.keyDown(document, { key: '6', ...chord })
     expect(await screen.findByText('No model usage in this range yet.')).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '7', metaKey: true })
+    fireEvent.keyDown(document, { key: '7', ...chord })
     expect(await screen.findByText('Need at least two models with usage in this range to compare.')).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: '8', metaKey: true })
+    fireEvent.keyDown(document, { key: '8', ...chord })
     expect(await screen.findByText('Not connected. Log in with the Claude CLI.')).toBeInTheDocument()
 
-    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.keyDown(document, { key: ',', ...chord })
     expect((await screen.findAllByText('Settings')).length).toBeGreaterThan(0)
     expect(screen.queryByText('Back')).not.toBeInTheDocument()
 
     const overviewCalls = mocks.getOverview.mock.calls.length
-    fireEvent.keyDown(document, { key: 'r', metaKey: true })
+    fireEvent.keyDown(document, { key: 'r', ...chord })
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
+  })
+
+  it('ignores Ctrl+2 on mac', async () => {
+    render(<App />)
+
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', ctrlKey: true })
+    expect(screen.queryByText('No sessions in this range yet.')).not.toBeInTheDocument()
   })
 
   it('re-polls visible section data when period or provider changes', async () => {
@@ -273,6 +493,110 @@ describe('App shortcuts', () => {
     })
   })
 
+  it('drives combined-scope overview fetches and persists the Scope setting', async () => {
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all'))
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(await screen.findByLabelText('Scope'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Combined' }))
+
+    // Combined scope forces provider='all' and passes --scope combined (6th arg).
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+    expect(localStorage.getItem('codeburn.scope')).toBe('combined')
+  })
+
+  it('boots in combined scope from the persisted Scope setting', async () => {
+    localStorage.setItem('codeburn.scope', 'combined')
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+  })
+
+  it('never boots a filtered session into combined scope, and collapses the stored setting', async () => {
+    localStorage.setItem('codeburn.scope', 'combined')
+    localStorage.setItem('codeburn.projectFiltered', '1')
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    render(<App />)
+    // Local from the first poll: a combined total would carry the hidden project.
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all'))
+    expect(mocks.getOverview).not.toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined')
+    await waitFor(() => expect(localStorage.getItem('codeburn.scope')).toBe('local'))
+  })
+
+  // app-filter.json is read by the main process on every fetch, so a hand edit
+  // lands there at once. A renderer that only re-read on its own saves kept
+  // Combined on screen over argv that had already dropped `--scope combined`.
+  it('collapses combined scope when the filter appears outside the app', async () => {
+    localStorage.setItem('codeburn.scope', 'combined')
+    localStorage.setItem('codeburn.projectFiltered', '0')
+    mocks.getProjectFilter.mockResolvedValueOnce({ project: [], exclude: [] })
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    mocks.getOverview.mockResolvedValue(overviewPayload())
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+    await waitFor(() => expect(localStorage.getItem('codeburn.scope')).toBe('local'))
+    await waitFor(() => expect(localStorage.getItem('codeburn.projectFiltered')).toBe('1'))
+  })
+
+  // reportMemoKey carries no filter component, so an entry memoised under the
+  // other scope repaints until the next fetch lands. Clear on the change only:
+  // clearing on every poll would throw away the instant-switch memo wholesale.
+  it('clears the instant-switch memo once when the filter changes outside the app', async () => {
+    localStorage.setItem('codeburn.projectFiltered', '0')
+    mocks.getProjectFilter.mockResolvedValue({ project: [], exclude: ['my-company'] })
+    mocks.getOverview.mockResolvedValue(overviewPayload())
+    primePolledMemo('sentinel-filter-key', { stale: true })
+
+    render(<App />)
+
+    await waitFor(() => expect(localStorage.getItem('codeburn.projectFiltered')).toBe('1'))
+    await waitFor(() => expect(hasPolledMemo('sentinel-filter-key')).toBe(false))
+
+    // The filter now matches what is persisted: further polls must leave it alone.
+    primePolledMemo('sentinel-filter-key', { stale: true })
+    const calls = mocks.getOverview.mock.calls.length
+    fireEvent.keyDown(document, { key: 'r', metaKey: true })
+    await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(calls))
+    expect(hasPolledMemo('sentinel-filter-key')).toBe(true)
+  })
+
+  it('scopes to a top bar project in memory only, keeping the saved Combined choice', async () => {
+    localStorage.setItem('codeburn.scope', 'combined')
+    render(<App />)
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+    expect(mocks.setTransientProject).toHaveBeenCalledWith(null)
+    primePolledMemo('sentinel-project-key', { stale: true })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Project' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'w/site' }))
+    await waitFor(() => expect(mocks.setTransientProject).toHaveBeenLastCalledWith('/w/site'))
+    // Local, since a project pick is this device's data; the saved choice stays.
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenLastCalledWith('30days', 'all'))
+    expect(localStorage.getItem('codeburn.scope')).toBe('combined')
+    expect(hasPolledMemo('sentinel-project-key')).toBe(false)
+    expect(screen.getByText(/· w\/site$/)).toBeInTheDocument()
+    expect([...stored.keys()].some(key => key.startsWith('codeburn.reportSnapshot.v1.'))).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Project' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'All projects' }))
+    await waitFor(() => expect(mocks.setTransientProject).toHaveBeenLastCalledWith(null))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenLastCalledWith('30days', 'all', undefined, undefined, undefined, 'combined'))
+  })
+
+  it('says so when the main process refuses a project pick', async () => {
+    render(<App />)
+    await waitFor(() => expect(mocks.setTransientProject).toHaveBeenCalledWith(null))
+    mocks.setTransientProject.mockRejectedValueOnce({ kind: 'bad-args', message: 'invalid project path' })
+    fireEvent.click(screen.getByRole('button', { name: 'Project' }))
+    fireEvent.click(await screen.findByRole('option', { name: 'w/site' }))
+    expect(await screen.findByText('invalid project path')).toBeInTheDocument()
+  })
+
+  it('records the filter for the next boot when the pane is empty', async () => {
+    render(<App />)
+    await waitFor(() => expect(localStorage.getItem('codeburn.projectFiltered')).toBe('0'))
+  })
+
   it('builds the provider picker from providerDetails so display-name providers round-trip their internal id', async () => {
     // grok's display name is "Grok Build"; the picker must show the label but
     // send the internal id `grok` as --provider (which assertProvider accepts).
@@ -293,9 +617,31 @@ describe('App shortcuts', () => {
     await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'grok'))
   })
 
-  it('lists a detected provider with no spend this period and sorts it last', async () => {
-    // Hermes has usage only outside the current period: the CLI still emits it
-    // as a detected provider (cost 0), so the picker must show it, at the bottom.
+  it('lists a provider that is installed but idle this period, greyed and last', async () => {
+    const payload = overviewPayload()
+    payload.current.providers = { claude: 10, hermes: 0, cursor: 0 }
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 10, hasUsage: true },
+      { id: 'hermes', label: 'Hermes', cost: 0, hasUsage: false },
+      { id: 'cursor', label: 'Cursor', cost: 0, hasUsage: true },
+    ]
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('All providers'))
+    expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Cursor' })).toBeInTheDocument()
+    const idle = screen.getByRole('option', { name: 'Hermes' })
+    expect(idle).toHaveClass('muted')
+    const labels = screen.getAllByRole('option').map(option => option.textContent)
+    expect(labels.indexOf('Hermes')).toBe(labels.length - 1)
+  })
+
+  it('keeps zero-cost providers in the picker when the CLI omits hasUsage', async () => {
+    // Every released CLI omits the field. Falling back to cost > 0 there hid
+    // subscription-backed providers whose period spend is $0.
     const payload = overviewPayload()
     payload.current.providers = { claude: 10, hermes: 0 }
     payload.current.providerDetails = [
@@ -308,14 +654,36 @@ describe('App shortcuts', () => {
     expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
 
     fireEvent.click(screen.getByText('All providers'))
-    const claudeOption = await screen.findByRole('option', { name: 'Claude' })
-    const hermesOption = screen.getByRole('option', { name: 'Hermes' })
-    const options = screen.getAllByRole('option')
-    // Zero-cost Hermes appears, and sorts after the provider that has spend.
-    expect(options.indexOf(hermesOption)).toBeGreaterThan(options.indexOf(claudeOption))
+    expect(await screen.findByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Hermes' })).toBeInTheDocument()
+  })
 
-    fireEvent.click(hermesOption)
-    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'hermes'))
+  it('does not carry another period provider catalog into a scoped period view', async () => {
+    const payload = overviewPayload()
+    payload.current.providerDetails = [
+      { id: 'claude', label: 'Claude', cost: 10, hasUsage: true },
+      { id: 'hermes', label: 'Hermes', cost: 5, hasUsage: true },
+    ]
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Providers'))
+    fireEvent.click(await screen.findByRole('option', { name: 'Claude' }))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'claude'))
+
+    fireEvent.click(screen.getByText('Today'))
+    await waitFor(() => expect(mocks.getOverview).toHaveBeenCalledWith('today', 'claude'))
+
+    fireEvent.click(screen.getByLabelText('Providers'))
+    expect(screen.getByRole('option', { name: 'Claude' })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: 'Hermes' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /^Sessions/ }))
+    const sessionFilters = await screen.findByRole('group', { name: 'Filter sessions by provider' })
+    expect(within(sessionFilters).getByRole('button', { name: 'Claude' })).toBeInTheDocument()
+    expect(within(sessionFilters).queryByRole('button', { name: 'Hermes' })).not.toBeInTheDocument()
   })
 
   it('hides the Claude config picker when the payload carries no claudeConfigs', async () => {
@@ -390,6 +758,9 @@ describe('App shortcuts', () => {
   })
 
   it('applies a calendar range to overview and visible section polls', async () => {
+    // Mid-month: the picker shows this month only, so "two days back" must be in it.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 8, 17, 12, 0, 0))
     render(<App />)
 
     fireEvent.keyDown(document, { key: '4', metaKey: true })
@@ -412,6 +783,30 @@ describe('App shortcuts', () => {
     })
     expect(screen.getByRole('button', { name: /–/ })).toBeInTheDocument()
     expect(screen.getByText('30D')).not.toHaveClass('on')
+  })
+
+  it('names a selected custom range on the Pull requests empty note', async () => {
+    // Mid-month: the picker shows this month only, so "two days back" must be in it.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date(2026, 8, 17, 12, 0, 0))
+    render(<App />)
+    fireEvent.keyDown(document, { key: '3', metaKey: true })
+    expect(await screen.findByText(/No sessions in Last 30 days mentioned a pull request URL/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Choose date range' }))
+    const to = new Date()
+    const from = new Date(to.getFullYear(), to.getMonth(), to.getDate() - 2)
+    const fromLabel = from.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+    const toLabel = to.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })
+    fireEvent.mouseDown(screen.getByRole('button', { name: fromLabel }))
+    fireEvent.mouseEnter(screen.getByRole('button', { name: toLabel }))
+    fireEvent.mouseUp(screen.getByRole('button', { name: toLabel }))
+
+    const left = from.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+    const right = to.toLocaleDateString('en-US', { month: from.getMonth() === to.getMonth() ? undefined : 'short', day: 'numeric' })
+    expect(await screen.findByText(new RegExp(`No sessions in ${left} [–-] ${right} mentioned a pull request URL`))).toBeInTheDocument()
+    expect(screen.getByText('30D')).not.toHaveClass('on')
+    expect(screen.queryByText(/No sessions in Last 30 days/)).toBeNull()
   })
 
   it('shows no daily budget banner when none is configured', async () => {
@@ -462,7 +857,50 @@ describe('App shortcuts', () => {
   })
 })
 
-describe('provider prefetch storm', () => {
+describe('win32 shortcut chords', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+    document.documentElement.removeAttribute('data-theme')
+    setPlatform('win32')
+  })
+
+  afterEach(() => {
+    clearPlatform()
+    vi.useRealTimers()
+  })
+
+  it('navigates with Ctrl+2 and refreshes with Ctrl+R', async () => {
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', ctrlKey: true })
+    expect(await screen.findByText('No sessions in this range yet.')).toBeInTheDocument()
+
+    const overviewCalls = mocks.getOverview.mock.calls.length
+    fireEvent.keyDown(document, { key: 'r', ctrlKey: true })
+    await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
+  })
+
+  it('ignores Meta+2 on win32', async () => {
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    expect(screen.queryByText('No sessions in this range yet.')).not.toBeInTheDocument()
+  })
+
+  it('ignores Ctrl+Alt+2 (the AltGr shape) on win32', async () => {
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', ctrlKey: true, altKey: true })
+    expect(screen.queryByText('No sessions in this range yet.')).not.toBeInTheDocument()
+  })
+})
+
+describe('overview idle warming', () => {
   const PROVIDERS = [
     'claude', 'codex', 'gemini', 'grok', 'copilot', 'droid',
     'hermes', 'zcode', 'cursor', 'kiro', 'codewhale', 'openrouter',
@@ -478,6 +916,7 @@ describe('provider prefetch storm', () => {
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset()
     mocks.getOverview.mockResolvedValue(manyProviderPayload())
+    mocks.setTransientProject.mockResolvedValue(undefined)
     mocks.getActReport.mockResolvedValue({ totals: { realizedCostUSD: 0, measuredActions: 0 } })
     mocks.getYield.mockResolvedValue({
       period: { label: 'Last 30 days', start: '', end: '' },
@@ -500,47 +939,208 @@ describe('provider prefetch storm', () => {
     __resetPolledMemo()
   })
 
-  // With MEMO_MAX too small (< providers + base keys) the base overview key
-  // LRU-evicts between polls, blanking the overview and re-arming the prefetch
-  // every 30s cycle: 12 redundant full-history parses forever. This asserts the
-  // fix — each provider is prefetched EXACTLY ONCE total across three cycles.
-  it('prefetches each detected provider exactly once across 3 poll cycles', async () => {
+  it('warms only the selected period, never the other horizons', async () => {
     vi.useFakeTimers()
     try {
+      setVisibility('visible')
+      render(<App />)
+      // Boot is pinned to 30D in beforeEach. The sweep warms that period's
+      // reports and the other providers' 30D headlines — and nothing for the
+      // five horizons the user has not asked for.
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
+
+      const backgroundSpawns = mocks.getOverview.mock.calls.filter(call => call[4] === true)
+      expect(backgroundSpawns.every(call => call[0] === '30days')).toBe(true)
+      expect(backgroundSpawns[0]?.slice(0, 2)).toEqual(['30days', 'claude'])
+      for (const mock of [mocks.getSessions, mocks.getSpendFlow, mocks.getModels, mocks.getCompareModels, mocks.getOptimizeReport, mocks.getYield, mocks.getPlans]) {
+        expect(mock.mock.calls.every(call => call[0] === '30days')).toBe(true)
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('warms the selected period first-click reports', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('visible')
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+
+      expect(mocks.getSessions.mock.calls.some(call => call[0] === '30days' && call[3] === true)).toBe(true)
+      expect(mocks.getSpendFlow.mock.calls.some(call => call[0] === '30days' && call[3] === true)).toBe(true)
+      expect(mocks.getModels.mock.calls.some(call => call[0] === '30days' && call[4] === true)).toBe(true)
+      expect(mocks.getCompareModels.mock.calls.some(call => call[0] === '30days' && call[2] === true)).toBe(true)
+      expect(mocks.getOptimizeReport.mock.calls.some(call => call[0] === '30days' && call[3] === true)).toBe(true)
+      expect(mocks.getPlans.mock.calls.some(call => call[0] === '30days' && call[1] === true)).toBe(true)
+      // Yield is polled by the visible Overview itself, so the sweep finds it
+      // already in the memo and skips it — warm either way.
+      expect(hasPolledMemo(reportMemoKey('yield', '30days', 'all'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not warm while the window is hidden, and resumes on return', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('hidden')
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
+      // Nothing speculative while nobody is looking: no background overview and
+      // no report warm at all.
+      expect(mocks.getOverview.mock.calls.filter(call => call[4] === true)).toEqual([])
+      expect(mocks.getSessions.mock.calls.filter(call => call[3] === true)).toEqual([])
+
+      // `visibilitychange` is what wakes the hold — while hidden it waits on the
+      // event, never on a timer that would spin the renderer every couple of
+      // seconds for a window nobody is looking at. The short delay after the
+      // event is the busy-hold yielding to the visibility catch-up poll.
+      setVisibility('visible')
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(mocks.getSessions.mock.calls.some(call => call[0] === '30days' && call[3] === true)).toBe(true)
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
+      expect(mocks.getOverview.mock.calls.some(call => call[4] === true)).toBe(true)
+    } finally {
+      setVisibility('visible')
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a warm that outlives a poll cycle, and never re-issues it', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('visible')
+      // A fresh payload object per poll, as a real CLI sends: the provider
+      // entries the picker derives from it are new objects every cadence tick.
+      mocks.getOverview.mockImplementation(async () => manyProviderPayload())
+      let resolveSessions!: (rows: unknown) => void
+      let sessionWarms = 0
+      mocks.getSessions.mockImplementation((_period: string, _provider: string, _range, background) => {
+        if (background !== true) return Promise.resolve([])
+        sessionWarms++
+        return new Promise(resolve => { resolveSessions = resolve })
+      })
+
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(10_000) })
+      expect(sessionWarms).toBe(1)
+
+      // Two full 30s poll cycles go by with the warm still in flight. The sweep
+      // must not be torn down and restarted underneath it.
+      await act(async () => { await vi.advanceTimersByTimeAsync(90_000) })
+      expect(sessionWarms).toBe(1)
+
+      await act(async () => { resolveSessions([]); await Promise.resolve() })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      // Landed once, under its own key, and never asked for again.
+      expect(sessionWarms).toBe(1)
+      expect(hasPolledMemo(reportMemoKey('sessions', '30days', 'all'))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('skips a report the user visited while the sweep was parked', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('hidden')
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(mocks.getSpendFlow.mock.calls.filter(call => call[3] === true)).toEqual([])
+
+      // The hold is unbounded, so the memo has to be re-tested on the way out:
+      // a section visited meanwhile is already warm and must not be re-parsed.
+      primePolledMemo(reportMemoKey('spendflow', '30days', 'all'), { period: { label: '', start: '', end: '' }, models: [], projects: [], links: [] })
+      setVisibility('visible')
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
+      expect(mocks.getSessions.mock.calls.some(call => call[3] === true)).toBe(true)
+      expect(mocks.getSpendFlow.mock.calls.filter(call => call[3] === true)).toEqual([])
+    } finally {
+      setVisibility('visible')
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not mark a partially hydrated provider warm, and retries it later', async () => {
+    vi.useFakeTimers()
+    try {
+      setVisibility('visible')
+      let claudeWarms = 0
+      mocks.getOverview.mockImplementation(async (period: string, provider: string, _range, _config, background) => {
+        const payload = manyProviderPayload()
+        if (provider === 'claude' && background === true) {
+          claudeWarms++
+          // A cold corpus can answer before the parse is complete; that is not an
+          // answer worth remembering as warm.
+          if (claudeWarms === 1) return { ...payload, hydration: { complete: false } } as MenubarPayload
+        }
+        return payload
+      })
+
+      render(<App />)
+      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(claudeWarms).toBe(1)
+      expect(hasPolledMemo(overviewMemoKey('claude', '30days', null, null))).toBe(false)
+
+      // Leaving 30D and coming back re-arms the sweep: the key was never marked,
+      // so it is warmed again rather than left cold for the session.
+      fireEvent.click(screen.getByRole('tab', { name: '7D' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
+      fireEvent.click(screen.getByRole('tab', { name: '30D' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+      expect(claudeWarms).toBeGreaterThan(1)
+      expect(hasPolledMemo(overviewMemoKey('claude', '30days', null, null))).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('prefetches each provider variant once across 3 poll cycles', async () => {
+    vi.useFakeTimers()
+    try {
+      // Give the serial idle queue a clean runway. Once it is warm, the long
+      // cadence soak below proves completed provider keys are not respawned.
+      localStorage.setItem('codeburn.refreshInterval', '10m')
       render(<App />)
       // Let the mount overview resolve so `ready` flips and the prefetch arms.
       await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      // Three full 30s poll cycles plus the prefetch start delay and staggered
-      // per-provider warms (12 × 400ms). A re-arming storm would re-spawn some
-      // providers on cycles 2 and 3; the once-per-key guard must prevent it.
-      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3 + 12_000) })
+      fireEvent.click(screen.getByRole('button', { name: 'Providers' }))
+      expect(screen.getByRole('option', { name: 'Codewhale' })).toBeInTheDocument()
+      expect(screen.getByRole('option', { name: 'Openrouter' })).toBeInTheDocument()
+      fireEvent.keyDown(document, { key: 'Escape' })
+      // The all-destination queue intentionally leaves a five-second cooling
+      // window between heavy report reads. Let that queue finish before the first
+      // cadence tick, then soak three ten-minute polling cycles.
+      await act(async () => { await vi.advanceTimersByTimeAsync(300_000) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30 * 60_000) })
 
-      for (const id of PROVIDERS) {
-        const spawns = mocks.getOverview.mock.calls.filter(
-          // Prefetch warms carry the background-priority flag (5th arg).
-          c => c[0] === '30days' && c[1] === id && c[2] === undefined && c[3] === undefined && c[4] === true,
-        )
-        expect(spawns.length, `prefetch spawns for ${id}`).toBe(1)
-      }
+      const warmedProviders = mocks.getOverview.mock.calls
+        // Prefetch warms carry the background-priority flag (5th arg).
+        .filter(c => c[0] === '30days' && c[1] !== 'all' && c[2] === undefined && c[3] === undefined && c[4] === true)
+        .map(c => c[1])
+      expect(warmedProviders).toEqual(PROVIDERS)
 
       // Sanity: the active 'all' view was polled every cycle (not prefetch-gated).
       const allPolls = mocks.getOverview.mock.calls.filter(c => c[1] === 'all')
       expect(allPolls.length).toBeGreaterThanOrEqual(3)
 
-      // The memo must be sized to hold every warmed provider so none LRU-evict
-      // between polls — the eviction that (in the real app) blanked the base
-      // overview key and re-armed the prefetch. Under the old fixed cap of 8,
-      // 7 of these 12 keys would have been evicted by soak's end.
-      for (const id of PROVIDERS) {
-        expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null)), `warm key ${id}`).toBe(true)
-      }
+      for (const id of PROVIDERS) expect(hasPolledMemo(overviewMemoKey(id, '30days', null, null))).toBe(true)
     } finally {
       vi.useRealTimers()
     }
   })
 })
 
-describe('energy: hidden-window polling', () => {
+describe('freshness: hidden-window polling', () => {
   beforeEach(() => {
     installDefaultMocks()
     localStorage.clear()
@@ -548,36 +1148,51 @@ describe('energy: hidden-window polling', () => {
     __resetPolledMemo()
   })
 
-  // The whole app's data flows through usePolled, which is the ONLY driver of CLI
-  // spawns (each codeburn.getX → IPC → spawnCli). This measures that a hidden
-  // window issues ZERO new interval spawns, and that visibility resumes them —
-  // the unit-level stand-in for the packaged visible-vs-hidden sample.
-  it('issues zero new interval spawns while hidden and resumes when visible', async () => {
+  // A hidden/minimized window has no viewer to keep fresh; polling it was the
+  // app's dominant idle drain, so the interval stops while hidden and catches up
+  // on return.
+  it('stops interval refreshes while hidden and catches up on return', async () => {
     vi.useFakeTimers()
     try {
       setVisibility('visible')
       render(<App />)
-      // Boot + three visible 30s cadences: the overview section's yield poll (a
-      // pure usePolled interval, never prefetched) fires each cadence.
-      await act(async () => { await vi.advanceTimersByTimeAsync(3_000) })
-      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 3) })
-      const visibleYield = mocks.getYield.mock.calls.length
-      expect(visibleYield).toBeGreaterThan(1) // polling while visible
+      // Boot and let the one-time provider prefetch warm queue fully drain, so
+      // the only remaining source of yield calls is the visible usePolled
+      // interval. Then measure its steady per-cadence rate as the baseline.
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 8) })
+      // The overview headline is the LIVE tier; yield is a slow tier and must
+      // not move on a live tick.
+      const beforeCadence = mocks.getOverview.mock.calls.length
+      const beforeYield = mocks.getYield.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      const perCadence = mocks.getOverview.mock.calls.length - beforeCadence
+      expect(perCadence).toBeGreaterThan(0) // polling while visible
+      expect(mocks.getYield.mock.calls.length).toBe(beforeYield)
 
-      // Hidden for five cadences: not a single new spawn on any poller.
+      // Hidden: the interval stops, so no CLI re-parse fires while unwatched.
       setVisibility('hidden')
+      await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
       const atHideYield = mocks.getYield.mock.calls.length
       const atHideOverview = mocks.getOverview.mock.calls.length
-      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 5) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000 * 12) })
       expect(mocks.getYield.mock.calls.length).toBe(atHideYield)
       expect(mocks.getOverview.mock.calls.length).toBe(atHideOverview)
 
-      // Back to visible: the stale-by-a-cadence polls catch up immediately.
+      // Back to visible after well over one cadence hidden: an immediate catch-up
+      // refresh fires so the returning view is never stale. The slow yield tier
+      // came due while hidden, so it catches up exactly ONCE, not once per
+      // missed slow interval.
       setVisibility('visible')
       await act(async () => { document.dispatchEvent(new Event('visibilitychange')) })
       await act(async () => { await vi.advanceTimersByTimeAsync(0) })
-      expect(mocks.getYield.mock.calls.length).toBeGreaterThan(atHideYield)
+      expect(mocks.getYield.mock.calls.length).toBe(atHideYield + 1)
       expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(atHideOverview)
+
+      // The resumed timer is single: one cadence adds exactly the baseline count,
+      // proving the hide/show cycle did not stack a second interval.
+      const afterCatchup = mocks.getOverview.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000) })
+      expect(mocks.getOverview.mock.calls.length - afterCatchup).toBe(perCadence)
     } finally {
       setVisibility('visible')
       vi.useRealTimers()
@@ -599,6 +1214,12 @@ describe('currency correctness', () => {
     // independent of the app-wide default ('today').
     localStorage.setItem('codeburn.defaultPeriod', '30days')
     __resetPolledMemo()
+    setPlatform('darwin')
+  })
+
+  afterEach(() => {
+    clearPlatform()
+    vi.useRealTimers()
   })
 
   it('never regresses the applied currency to a memo-served (stale) payload during a switch', async () => {
@@ -609,7 +1230,12 @@ describe('currency correctness', () => {
     const eur = { ...overviewPayload(), currency: EUR }
     mocks.getOverview.mockImplementation((_period: string, provider: string) =>
       provider === 'claude' ? new Promise<MenubarPayload>(() => {}) : Promise.resolve(usd))
+    // Stamp the entry older than the memo's freshness window so the switch
+    // revalidates behind it (a still-fresh entry is served without a refetch).
+    const staleAt = Date.now() - 60_000
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(staleAt)
     primePolledMemo(overviewMemoKey('claude', '30days', null, null), eur)
+    nowSpy.mockRestore()
 
     render(<App />)
     // Boot on the USD ('all') view.
@@ -632,6 +1258,7 @@ describe('currency correctness', () => {
     // A warmed entry (as the prefetcher would leave one) that must be purged so a
     // later switch can't repaint a payload computed under the old currency.
     primePolledMemo('sentinel-warmed-key', { stale: true })
+    writeOverviewHeadline(overviewMemoKey('all', 'week', null, null), overviewPayload())
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(true)
 
     fireEvent.keyDown(document, { key: ',', metaKey: true })
@@ -642,6 +1269,102 @@ describe('currency correctness', () => {
     // Memo purged and the active view force-refreshed so the new currency lands fast.
     await waitFor(() => expect(mocks.getOverview.mock.calls.length).toBeGreaterThan(overviewCalls))
     expect(hasPolledMemo('sentinel-warmed-key')).toBe(false)
+    expect(readOverviewHeadline(overviewMemoKey('all', 'week', null, null))).toBeNull()
+  })
+
+  it('does not resurrect the live cached headline after a settings invalidation', async () => {
+    const eur = { ...overviewPayload(), currency: EUR }
+    const key = overviewMemoKey('all', '30days', null, null)
+    writeOverviewHeadline(key, eur)
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(() => {}))
+
+    render(<App />)
+    expect(await screen.findByLabelText('Cached usage summary')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset to USD' }))
+    await waitFor(() => expect(mocks.resetCurrency).toHaveBeenCalled())
+    fireEvent.keyDown(document, { key: '1', metaKey: true })
+
+    expect(screen.queryByLabelText('Cached usage summary')).not.toBeInTheDocument()
+    expect(readOverviewHeadline(key)).toBeNull()
+  })
+
+  it('rejects an old in-flight background warm after a settings invalidation', async () => {
+    vi.useFakeTimers()
+    let resolveOldWarm!: (payload: MenubarPayload) => void
+    const oldWarm = new Promise<MenubarPayload>(resolve => { resolveOldWarm = resolve })
+    const usd = { ...overviewPayload(), currency: USD }
+    mocks.getOverview.mockImplementation((_period: string, provider: string, _range, _config, background) => {
+      if (provider === 'claude' && background === true) return oldWarm
+      return Promise.resolve(usd)
+    })
+
+    render(<App />)
+    await act(async () => { await Promise.resolve() })
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
+    expect(mocks.getOverview).toHaveBeenCalledWith('30days', 'claude', undefined, undefined, true)
+
+    fireEvent.keyDown(document, { key: ',', metaKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Reset to USD' }))
+    await act(async () => { await Promise.resolve() })
+    expect(mocks.resetCurrency).toHaveBeenCalled()
+
+    await act(async () => {
+      resolveOldWarm(usd)
+      await Promise.resolve()
+    })
+
+    const claudeKey = overviewMemoKey('claude', '30days', null, null)
+    expect(hasPolledMemo(claudeKey)).toBe(false)
+    expect(readOverviewHeadline(claudeKey)).toBeNull()
+  })
+})
+
+describe('usage_snapshot dispatch', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+  })
+
+  it('forwards the CLI-computed snapshot verbatim, with no by-model join', async () => {
+    const payload = overviewPayload()
+    // Opaque to the renderer: whatever the CLI put here is what goes out.
+    payload.telemetrySnapshot = { schema: 2, period: 'Last 30 days', costBucket: '10-50', models: [] }
+    mocks.getOverview.mockResolvedValue(payload)
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', payload.telemetrySnapshot))
+    expect(mocks.getModels).not.toHaveBeenCalled()
+  })
+
+  it('falls back to the renderer builder when an older CLI omits the field', async () => {
+    const payload = overviewPayload()
+    payload.current.topModels = [{ name: 'claude-opus-4-8', cost: 30, savingsUSD: 0, savingsBaselineModel: '', calls: 400 }]
+    mocks.getOverview.mockResolvedValue(payload)
+    mocks.getModels.mockResolvedValue([])
+
+    render(<App />)
+
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', expect.objectContaining({
+      period: 'Last 30 days',
+      costBucket: '10-50',
+    })))
+    expect(mocks.getModels).toHaveBeenCalled()
+  })
+
+  it('sends nothing when the snapshot field is explicitly null and the payload is empty', async () => {
+    const payload = overviewPayload()
+    payload.telemetrySnapshot = null
+    mocks.getOverview.mockResolvedValue(payload)
+    mocks.getModels.mockResolvedValue([])
+
+    render(<App />)
+
+    // A null snapshot is an older/failed CLI, not a reason to skip the event.
+    await waitFor(() => expect(mocks.telemetryTrack).toHaveBeenCalledWith('usage_snapshot', expect.objectContaining({ period: 'Last 30 days' })))
   })
 })
 
@@ -671,7 +1394,7 @@ describe('usage_snapshot telemetry props', () => {
     // A path-like project name that MUST NEVER reach telemetry: the snapshot never
     // reads topProjects, and this guards against a future field accidentally doing so.
     p.current.topProjects = [{
-      name: '/Users/torukmakto/secret-client/private-repo',
+      name: '/Users/x/secret-client/private-repo',
       cost: 42, savingsUSD: 0, sessions: 1, avgCostPerSession: 42, sessionDetails: [],
     }]
     return p
@@ -714,7 +1437,8 @@ describe('usage_snapshot telemetry props', () => {
     return {
       provider: 'claude', providerDisplayName: 'Claude', category: null,
       inputTokens: 0, outputTokens: 0, cacheWriteTokens: 0, cacheReadTokens: 0, totalTokens: 0,
-      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null, ...over,
+      costUSD: 0, savingsUSD: 0, savingsBaselineModel: '', calls: 0, credits: null,
+      rawModels: [over.model], ...over,
     }
   }
 
@@ -764,5 +1488,101 @@ describe('usage_snapshot telemetry props', () => {
       { name: 'coding', oneShotRate: 0.61 },
       { name: 'debugging', oneShotRate: -1 },
     ])
+  })
+})
+
+describe('sessions pagination', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+    setPlatform('darwin')
+  })
+
+  afterEach(() => {
+    clearPlatform()
+    vi.useRealTimers()
+  })
+
+  function sessionRows(count: number): SessionRow[] {
+    return Array.from({ length: count }, (_, index) => ({
+      sessionId: `session-${index}`,
+      project: `project-${index}`,
+      provider: 'claude',
+      models: ['Opus 4.8'],
+      cost: count - index,
+      savingsUSD: 0,
+      calls: 1,
+      turns: 1,
+      inputTokens: 1_000,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      startedAt: '2026-09-10T10:00:00.000Z',
+      endedAt: '2026-09-10T10:01:00.000Z',
+      durationMs: 60_000,
+    }))
+  }
+
+  // 30s timeout: the list renders 120+ rows three times inside a full App
+  // render, and the suite runs its files in parallel.
+  it('returns a revealed sessions list to the first page when the sort changes', { timeout: 30_000 }, async () => {
+    mocks.getSessions.mockResolvedValue(sessionRows(INITIAL_VISIBLE + 5))
+    render(<App />)
+    expect(await screen.findByText('Most expensive sessions')).toBeInTheDocument()
+
+    fireEvent.keyDown(document, { key: '2', metaKey: true })
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show 5 more · 5 remaining' }))
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE + 5} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+
+    // A new sort is a new ordering of the whole list: it starts at the first
+    // page again instead of holding the depth reached under the old one.
+    const toolbar = document.querySelector('.sessions-toolbar') as HTMLElement
+    fireEvent.click(within(toolbar).getByRole('tab', { name: 'Recent' }))
+    expect(await screen.findByText(`Showing ${INITIAL_VISIBLE} of ${INITIAL_VISIBLE + 5}`)).toBeInTheDocument()
+  })
+})
+
+describe('refresh indicators', () => {
+  beforeEach(() => {
+    installDefaultMocks()
+    localStorage.clear()
+    localStorage.setItem('codeburn.defaultPeriod', '30days')
+    setPlatform('darwin')
+    __resetPolledMemo()
+  })
+
+  afterEach(() => {
+    clearPlatform()
+  })
+
+  it('lights the top hairline only while a fetch is in flight, and always reserves its 2px', async () => {
+    let settle: (payload: MenubarPayload) => void = () => {}
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(resolve => { settle = resolve }))
+
+    const { container } = render(<App />)
+
+    await waitFor(() => expect(container.querySelector('.switch-line.on')).not.toBeNull())
+
+    await act(async () => { settle(overviewPayload()); await Promise.resolve() })
+
+    await waitFor(() => expect(container.querySelector('.switch-line.on')).toBeNull())
+    expect(container.querySelector('.switch-line')).not.toBeNull()
+  })
+
+  it('spins the footer refresh mark only while a fetch is in flight', async () => {
+    let settle: (payload: MenubarPayload) => void = () => {}
+    mocks.getOverview.mockReturnValue(new Promise<MenubarPayload>(resolve => { settle = resolve }))
+
+    const { container } = render(<App />)
+
+    await waitFor(() => expect(container.querySelector('.refresh-mark.spinning')).not.toBeNull())
+
+    await act(async () => { settle(overviewPayload()); await Promise.resolve() })
+
+    await waitFor(() => expect(container.querySelector('.refresh-mark.spinning')).toBeNull())
+    expect(container.querySelector('.refresh-mark')).not.toBeNull()
   })
 })

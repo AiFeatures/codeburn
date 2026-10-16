@@ -1,36 +1,62 @@
 import { Fragment, useState } from 'react'
 
+import { BranchBreakdown } from '../components/BranchBreakdown'
 import { CliErrorPanel, CliErrorText } from '../components/CliErrorPanel'
 import { EmptyNote } from '../components/EmptyState'
 import { ListRow } from '../components/ListRow'
 import { Panel } from '../components/Panel'
+import { Punchcard } from '../components/Punchcard'
 import { Sankey } from '../components/Sankey'
 import { SectionSkeleton } from '../components/Skeleton'
 import { StackedBars } from '../components/StackedBars'
 import { StaleBanner } from '../components/StaleBanner'
 import { type Polled, usePolled } from '../hooks/usePolled'
-import { formatUsd } from '../lib/format'
+import { formatCount, formatUsd, shortenProjectPath } from '../lib/format'
 import { codeburn } from '../lib/ipc'
 import { contiguousDailyWindow, dataStartKey, localDateKey } from '../lib/period'
+import { reportMemoKey } from '../lib/reportMemoKey'
+import { projectFilters } from '../lib/investigation'
+import { formatSessionCount, sessionCountHelp } from '../lib/session-count-label'
 import type { CliError, DateRange, MenubarPayload, Period, SpendFlow } from '../lib/types'
+import { localeTag, t } from '../i18n'
+
+import type { InvestigateRequest } from './Overview'
 
 type Project = MenubarPayload['current']['topProjects'][number]
+
+function projectRowKey(project: Project, index: number): string {
+  return project.id || `legacy:${index}:${project.name}`
+}
 
 /** Date-only CLI strings ("2026-07-11") formatted at local noon so the calendar day never rolls across time zones. */
 function formatProjectDay(date: string): string {
   const d = new Date(`${date}T12:00:00`)
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString(localeTag(), { month: 'short', day: 'numeric' })
 }
 
 const SPEND_CHART_DAYS = 15
 
 function providerLabel(provider: string): string {
-  if (provider === 'all') return 'All models'
+  if (provider === 'all') return t('spend.provider.allModels')
   return provider
     .split(/[-\s]+/)
     .filter(Boolean)
     .map(part => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ')
+}
+
+function SpendPunchcard({ period, provider, range }: { period: Period; provider: string; range: DateRange | null }) {
+  const payload = usePolled<MenubarPayload>(
+    () => range ? codeburn.getTimeline(period, provider, range) : codeburn.getTimeline(period, provider),
+    [period, provider, range?.from, range?.to],
+  )
+  const timeline = payload.data?.history.timeline
+  if (!timeline) return null
+  return (
+    <Panel title={t('spend.punchcard.title')} right={t('spend.punchcard.right')}>
+      <Punchcard timeline={timeline} />
+    </Panel>
+  )
 }
 
 export function Spend({ period, provider, range = null }: { period: Period; provider: string; range?: DateRange | null }) {
@@ -48,6 +74,7 @@ export function SpendContent({
   overview,
   refreshToken = 0,
   ready = true,
+  onInvestigate,
 }: {
   period: Period
   provider: string
@@ -55,38 +82,43 @@ export function SpendContent({
   overview: Polled<MenubarPayload>
   refreshToken?: number
   ready?: boolean
+  onInvestigate?: (request: InvestigateRequest) => void
 }) {
   // Gate on app-level readiness so boot hydrates the cache once (default true
   // keeps standalone renders/tests polling normally).
   const flow = usePolled<SpendFlow>(
     () => range ? codeburn.getSpendFlow(period, provider, range) : codeburn.getSpendFlow(period, provider),
     [period, provider, range?.from, range?.to, refreshToken],
-    { enabled: ready, memoKey: `spendflow|${period}|${provider}|${range?.from ?? ''}-${range?.to ?? ''}` },
+    { enabled: ready, memoKey: reportMemoKey('spendflow', period, provider, range) },
   )
 
   if (!overview.data) {
-    if (overview.error) return <CliErrorPanel error={overview.error} subject="spend" />
-    return <SectionSkeleton label="Scanning spend…" rows={3} chart />
+    if (overview.error) return <CliErrorPanel error={overview.error} subject={t('common.subject.spend')} />
+    return <SectionSkeleton label={t('spend.loading.scanning')} rows={3} chart />
   }
 
   const animateKey = `${period}|${provider}|${range?.from ?? ''}|${range?.to ?? ''}`
-  return <SpendPage data={overview.data} flow={flow} provider={provider} range={range} staleError={overview.error} animateKey={animateKey} />
+  return <SpendPage data={overview.data} flow={flow} period={period} provider={provider} range={range} staleError={overview.error} animateKey={animateKey} onInvestigate={onInvestigate} />
 }
 
 function SpendPage({
   data,
   flow,
+  period,
   provider,
   range,
   staleError,
   animateKey,
+  onInvestigate,
 }: {
   data: MenubarPayload
   flow: ReturnType<typeof usePolled<SpendFlow>>
+  period: Period
   provider: string
   range: DateRange | null
   staleError: CliError | null
   animateKey: string
+  onInvestigate?: (request: InvestigateRequest) => void
 }) {
   // `history.daily` is SPARSE (active days only), so zero-fill a contiguous
   // calendar window client-side; date keys are localDateKey / the CLI dateKey,
@@ -104,46 +136,46 @@ function SpendPage({
   const projects = data.current.topProjects
   const breakdowns = [
     {
-      title: 'Activity',
+      title: t('spend.breakdown.activity'),
       rows: [
         ...data.current.topActivities.map(row => ({
           key: `activity-${row.name}`,
           title: row.name,
-          sub: `${row.turns.toLocaleString('en-US')} turns`,
+          sub: formatCount(row.turns, 'turn'),
           value: formatUsd(row.cost),
         })),
         ...data.current.skills.map(row => ({
           key: `skill-${row.name}`,
           title: row.name,
-          sub: `${row.turns.toLocaleString('en-US')} turns · skill`,
+          sub: t('spend.breakdown.skillSuffix', { turns: formatCount(row.turns, 'turn') }),
           value: formatUsd(row.cost),
         })),
       ],
     },
     {
-      title: 'Tools',
+      title: t('spend.breakdown.tools'),
       rows: data.current.tools.map(row => ({
         key: row.name,
         title: row.name,
-        sub: `${row.calls.toLocaleString('en-US')} calls`,
+        sub: formatCount(row.calls, 'call'),
         value: undefined,
       })),
     },
     {
-      title: 'MCP',
+      title: t('spend.breakdown.mcp'),
       rows: data.current.mcpServers.map(row => ({
         key: row.name,
         title: row.name,
-        sub: `${row.calls.toLocaleString('en-US')} calls`,
+        sub: formatCount(row.calls, 'call'),
         value: undefined,
       })),
     },
     {
-      title: 'Subagents',
+      title: t('spend.breakdown.subagents'),
       rows: data.current.subagents.map(row => ({
         key: row.name,
         title: row.name,
-        sub: `${row.calls.toLocaleString('en-US')} calls`,
+        sub: formatCount(row.calls, 'call'),
         value: formatUsd(row.cost),
       })),
     },
@@ -153,64 +185,93 @@ function SpendPage({
     <>
       {staleError && <StaleBanner error={staleError} />}
       <div className="spend-top-row">
-        <Panel title="Daily spend by model" className="spend-chart-panel">
-          {chartHasSpend ? <StackedBars daily={chartDaily} fallbackLabel={providerLabel(provider)} animateKey={animateKey} dataStart={dataStart} /> : <EmptyNote>No model spend in this range yet.</EmptyNote>}
+        <Panel title={t('spend.chart.title')} className="spend-chart-panel">
+          {chartHasSpend ? <StackedBars daily={chartDaily} fallbackLabel={providerLabel(provider)} animateKey={animateKey} dataStart={dataStart} /> : <EmptyNote>{t('spend.chart.empty')}</EmptyNote>}
         </Panel>
-        <ProjectBreakdown projects={projects} />
+        <ProjectBreakdown projects={projects} onInvestigate={onInvestigate} />
       </div>
 
-      <Panel title="Cost flow · model → project" right="model → project flow for this range" className="scroll-x">
+      <BranchBreakdown period={period} provider={provider} range={range} />
+
+      <Panel title={t('spend.flow.title')} right={t('spend.flow.right')} className="scroll-x">
         {flow.data && flow.data.links.length ? (
           <Sankey flow={flow.data} />
         ) : flow.error ? (
           <CliErrorText error={flow.error} />
         ) : (
-          <EmptyNote>{flow.loading ? 'Loading cost flow…' : 'No model-project flow in this range yet.'}</EmptyNote>
+          <EmptyNote>{flow.loading ? t('spend.flow.loading') : t('spend.flow.empty')}</EmptyNote>
         )}
       </Panel>
+
+      <SpendPunchcard period={period} provider={provider} range={range} />
 
       <div className="spend-breakdowns">
         {breakdowns.length ? (
           breakdowns.map(section => <RowsPanel key={section.title} title={section.title} rows={section.rows} />)
         ) : (
-          <EmptyNote>No activity, tool, MCP, or subagent data in this range yet.</EmptyNote>
+          <EmptyNote>{t('spend.breakdown.emptyAll')}</EmptyNote>
         )}
       </div>
     </>
   )
 }
 
-function ProjectBreakdown({ projects }: { projects: Project[] }) {
+function ProjectBreakdown({ projects, onInvestigate }: { projects: Project[]; onInvestigate?: (request: InvestigateRequest) => void }) {
   const [expanded, setExpanded] = useState<string | null>(null)
 
   return (
-    <Panel title="By project" right={projects.length ? `top ${projects.length}` : undefined} className="spend-scroll">
+    <Panel title={t('spend.project.title')} right={projects.length ? t('spend.project.top', { count: projects.length }) : undefined} className="spend-scroll">
       {projects.length ? (
         projects.map((project, i) => {
-          const open = expanded === project.name
+          const rowKey = projectRowKey(project, i)
+          const open = expanded === rowKey
+          const name = project.temporary ? t('shell.project.temporary') : project.name
+          // Sessions filter by exact checkout ids, so only a complete list drills.
+          const drillable = (project.checkoutCount ?? 0) <= (project.checkouts?.length ?? 0)
           return (
-            <Fragment key={project.name}>
+            <Fragment key={rowKey}>
               <ListRow
                 no={String(i + 1).padStart(2, '0')}
-                title={project.name}
-                sub={`${project.sessions.toLocaleString('en-US')} ${project.sessions === 1 ? 'session' : 'sessions'}`}
+                title={name}
+                sub={<span title={project.sessionCountBasis === 'identity' ? undefined : sessionCountHelp()}>{formatSessionCount(project.sessions, project.sessionCountBasis)}</span>}
                 value={formatUsd(project.cost)}
                 expanded={open}
-                onClick={() => setExpanded(current => current === project.name ? null : project.name)}
+                onClick={() => setExpanded(current => current === rowKey ? null : rowKey)}
               />
               {open && (
-                <div className="spend-proj-detail" role="region" aria-label={`${project.name} sessions`}>
+                <div className="spend-proj-detail" role="region" aria-label={t('spend.project.sessionsAria', { name })}>
+                  {/* Drill-through entry: canonical project id (the same one the
+                      session rows carry), so the destination matches exactly. */}
+                  {onInvestigate && drillable && (
+                    <button
+                      className="ov-link spend-proj-drill"
+                      type="button"
+                      onClick={() => onInvestigate({ filters: projectFilters(...(project.checkouts?.map(c => c.id) ?? [project.id || project.name])) })}
+                    >
+                      {t('spend.project.viewSessions')}
+                    </button>
+                  )}
+                  {project.checkouts?.map(checkout => (
+                    <div className="spend-proj-session" key={checkout.id}>
+                      <span className="sps-date" />
+                      <span className="sps-model" title={checkout.id}>{shortenProjectPath(checkout.id, 2)}</span>
+                      <span className="sps-calls" title={checkout.matchedByFolderName ? t('spend.project.matchedByFolderNameTip') : undefined}>
+                        {checkout.matchedByFolderName ? t('spend.project.matchedByFolderName') : null}
+                      </span>
+                      <span className="sps-cost">{formatUsd(checkout.cost)}</span>
+                    </div>
+                  ))}
                   {project.sessionDetails.length ? (
                     project.sessionDetails.map((session, j) => (
                       <div className="spend-proj-session" key={`${session.date}-${j}`}>
                         <span className="sps-date">{formatProjectDay(session.date)}</span>
                         <span className="sps-model">{session.models[0]?.name ?? '—'}</span>
-                        <span className="sps-calls">{session.calls.toLocaleString('en-US')} calls</span>
+                        <span className="sps-calls">{formatCount(session.calls, 'call')}</span>
                         <span className="sps-cost">{formatUsd(session.cost)}</span>
                       </div>
                     ))
                   ) : (
-                    <div className="spend-proj-empty">No session detail for this project.</div>
+                    <div className="spend-proj-empty">{t('spend.project.noDetail')}</div>
                   )}
                 </div>
               )}
@@ -218,7 +279,7 @@ function ProjectBreakdown({ projects }: { projects: Project[] }) {
           )
         })
       ) : (
-        <EmptyNote>No project spend in this range yet.</EmptyNote>
+        <EmptyNote>{t('spend.project.empty')}</EmptyNote>
       )}
     </Panel>
   )

@@ -6,6 +6,10 @@
 
 export type Period = 'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime'
 
+// Dashboard usage scope: this device only ('local') or the aggregate across
+// every paired device ('combined'). Mirrors the macOS menubar's Scope setting.
+export type Scope = 'local' | 'combined'
+
 export type DateRange = { from: string; to: string }
 
 export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 'too-large' | 'bad-args'
@@ -14,10 +18,20 @@ export type CliErrorKind = 'not-found' | 'nonzero' | 'bad-json' | 'timeout' | 't
 export interface CliError {
   kind: CliErrorKind
   message: string
+  /** Set by the main process when the failure happened while the cold cache
+   *  hydration was still running. Such a failure is a "not ready yet", not a
+   *  broken install, so the UI keeps its splash/progress state. Optional so an
+   *  older preload simply never sets it. */
+  cold?: true
+  /** For `not-found` only: the resolution stage enum from the main process. */
+  stage?: string
 }
 
 export type AliasRow = { from: string; to: string }
 export type ActionResult = { ok: boolean; stdout: string; stderr: string; code: number | null }
+/** `savedPath` is where the CLI actually wrote, which is not the chosen folder:
+ *  CSV nests a dated subfolder, JSON appends the extension. */
+export type ExportResult = ActionResult & { savedPath?: string }
 
 export type QuotaWindow = {
   label: string
@@ -26,15 +40,25 @@ export type QuotaWindow = {
 }
 
 export type QuotaProvider = {
-  provider: 'claude' | 'codex'
-  connection: 'connected' | 'disconnected' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
+  provider: 'claude' | 'codex' | 'gemini' | 'copilot' | 'antigravity' | 'kimi' | 'zcode' | 'grokbot'
+  /** `keychainUnchecked` is darwin-only and distinct from `disconnected`: no
+   *  credential file was found and the keychain has NOT been looked at yet
+   *  (a keychain read raises a one-time macOS dialog, so only a user-initiated
+   *  forced refresh does one). It means "we do not know", not "logged out". */
+  connection: 'connected' | 'disconnected' | 'keychainUnchecked' | 'accessDenied' | 'loading' | 'stale' | 'transientFailure' | 'terminalFailure'
   primary: QuotaWindow | null
   details: QuotaWindow[]
   planLabel: string | null
   footerLines: string[]
   /** True when the provider is in a 429 backoff window (upstream rate limit). */
   rateLimited?: boolean
+  /** Set when the error is an auth expiry a (re)connect can fix (a 401/403 or an
+   *  expired token), or when a stuck "waiting" is capped to an actionable state,
+   *  so the card shows the Connect affordance. */
+  connectable?: boolean
 }
+
+export type ProviderName = QuotaProvider['provider']
 
 // ————— src/menubar-json.ts —————
 
@@ -45,6 +69,9 @@ export type DailyModelBreakdown = {
   calls: number
   inputTokens: number
   outputTokens: number
+  // Raw provider/model ids that collapsed into this display name. Present
+  // only when more than one folded in; absent for an older CLI (#1239).
+  rawModels?: string[]
 }
 
 export type DailyHistoryEntry = {
@@ -116,13 +143,70 @@ export type ClaudeConfigSelector = {
   options: ClaudeConfigOption[]
 }
 
+export type HydrationState = {
+  complete: boolean
+  indexedFiles: number
+  totalFiles: number
+}
+
+/** The optimize scan's figures. Carried by a full menubar payload, and — since
+ *  the poll runs with --no-optimize — cached on disk between daily recomputes. */
+export type OptimizeBlock = {
+  findingCount: number
+  savingsUSD: number
+  topFindings: Array<{
+    title: string
+    impact: 'high' | 'medium' | 'low'
+    savingsUSD: number
+  }>
+}
+
+/** A cached optimize scan: the figures plus WHEN and FOR WHICH query scope they
+ *  were computed, so a stored number is never shown as live or under another
+ *  period/provider/filter. */
+export type OptimizeSnapshot = {
+  scope: string
+  computedAt: string
+  appVersion: string
+  optimize: OptimizeBlock
+}
+
+export type CursorSyncStatus = {
+  enabled: boolean
+  state: 'ok' | 'syncing-never' | 'error' | 'off' | 'no-login'
+  lastSuccessAt: string | null
+  errorCode?: 'login' | 'network' | 'export'
+  error?: string
+}
+
 export type MenubarPayload = {
   generated: string
+  /** Consecutive active days across every provider, independent of the selected
+   *  period and provider filter. Omitted by CLIs that predate the field. */
+  streak?: number
+  /** Cost and calls for the headline windows this payload's live scan covered,
+   *  all from the one aggregation that produced it. A window that is absent was
+   *  not scanned, so the client falls back to that period's own payload.
+   *  Omitted entirely on scoped or filtered requests. */
+  periodTotals?: Partial<Record<'today' | 'week' | '30days' | 'month' | 'all' | 'lifetime', { cost: number; calls: number; inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }>>
+  // Optional: older CLIs omit it. Present and true only on a stale read-only
+  // serve; absent otherwise. Absence must always be read as "assume fresh."
+  stale?: boolean
+  // Optional: only the resident serve child emits it, and only it may answer
+  // partially (it polls, so it converges). `complete: false` means the totals
+  // cover the files indexed so far and a later poll returns more. Absence — an
+  // older CLI, or any one-shot spawn including the spawn fallback — must be
+  // read as complete.
+  hydration?: HydrationState
+  /** Cursor's usage sync from cursor.com (src/cursor-sync.ts). Absent on older
+   *  CLIs and whenever Cursor is not on this machine. */
+  cursorSync?: CursorSyncStatus
   current: {
     label: string
     cost: number
     calls: number
     sessions: number
+    sessionCountBasis?: 'identity' | 'partial'
     oneShotRate: number | null
     inputTokens: number
     outputTokens: number
@@ -136,6 +220,9 @@ export type MenubarPayload = {
       savingsUSD: number
       turns: number
       oneShotRate: number | null
+      // Raw TaskCategory key (additive, optional): `name` is the display label,
+      // this round-trips as the drill-through filter value.
+      rawCategory?: string
     }>
     topModels: Array<{
       name: string
@@ -143,19 +230,39 @@ export type MenubarPayload = {
       savingsUSD: number
       savingsBaselineModel: string
       calls: number
+      // Per-model token counts (src/menubar-json.ts buildTopModels): billable
+      // output, cache read = reused input, cache write separate. Optional:
+      // older CLIs omit them, and a row whose contributing legacy data lacked
+      // counts omits them even on a new CLI. Absent means unknown — render a
+      // dash, never zero, and never substitute a period-wide figure.
+      inputTokens?: number
+      outputTokens?: number
+      cacheReadTokens?: number
+      cacheWriteTokens?: number
+      // Portion of `cost` priced from estimates; optional on older CLIs.
+      estimatedCostUSD?: number
     }>
     unpricedModels?: Array<{ model: string; calls: number; tokens: number }>
     localModelSavings: LocalModelSavings
     providers: Record<string, number>
     // Optional: older CLIs omit it. `id` is the internal provider name (round-trips
-    // as --provider), `label` the display name. Fall back to `providers` when absent.
-    providerDetails?: Array<{ id: string; label: string; cost: number }>
+    // as --provider), `label` the display name. `hasUsage` distinguishes active $0
+    // providers from detected-but-idle providers when present.
+    providerDetails?: Array<{ id: string; label: string; cost: number; calls?: number; hasUsage?: boolean; excludedFromTotal?: boolean; sessions?: number; sessionCountBasis?: 'identity' | 'partial'; estimatedCostUSD?: number }>
     topProjects: Array<{
+      id?: string
       name: string
       cost: number
       savingsUSD: number
       sessions: number
-      avgCostPerSession: number
+      avgCostPerSession?: number
+      sessionCountBasis?: 'identity' | 'partial'
+      /** Clones and worktrees folded into this repository row, when several;
+       *  the costliest 50 of `checkoutCount`. */
+      checkouts?: Array<{ id: string; cost: number; matchedByFolderName?: boolean }>
+      checkoutCount?: number
+      /** The one row for every temp-root folder outside a known repository. */
+      temporary?: boolean
       sessionDetails: Array<{
         cost: number
         savingsUSD: number
@@ -164,6 +271,9 @@ export type MenubarPayload = {
         outputTokens: number
         date: string
         models: Array<{ name: string; cost: number; savingsUSD: number }>
+        // Drill-through identity (additive, optional): see topSessions.
+        sessionId?: string
+        provider?: string
       }>
     }>
     modelEfficiency: Array<{
@@ -177,6 +287,13 @@ export type MenubarPayload = {
       savingsUSD: number
       calls: number
       date: string
+      // Drill-through identity (additive, optional): provider + session id
+      // open the exact session even when another provider reuses id or title.
+      sessionId?: string
+      provider?: string
+      // Raw session project (the sessions-list row key); `project` stays the
+      // friendly display name.
+      projectKey?: string
     }>
     // Workflow-intelligence rollups (src/menubar-json.ts buildWorkflow /
     // buildTopReworkedFiles). Optional: older CLIs omit them, so the Overview
@@ -242,6 +359,22 @@ export type MenubarPayload = {
         approx?: boolean
         models?: string[]
         categories?: Array<{ name: string; cost: number }>
+        // Local PR signals (src/sessions-report.ts PrRow); older CLIs omit them.
+        runs?: number
+        linkEvidence?: 'explicit' | 'pr-link-only' | null
+        openedAt?: string | null
+        followUpRounds?: number | null
+        followUpPushes?: number
+        oneShot?: boolean | null
+        reviewRuns?: Array<{ kind: 'agent' | 'you'; label: string; model: string | null; costUSD: number; at: string; evidence: 'reads-pr' | 'gh-pr-review' }>
+        reviewCostUSD?: number
+        mergedAt?: string | null
+        timeToMergeMs?: number | null
+        costSplit?: { buildUSD: number; reviewUSD: number; fixesUSD: number }
+        carriedUSD?: number
+        runList?: Array<{ kind: 'session' | 'subagent'; description: string | null; model: string | null; costUSD: number; at: string; link: 'named' | 'pushed-head' | 'gh-pr' | 'opened' | 'carried' }>
+        state?: 'open' | 'draft' | 'merged' | 'closed' | null
+        followUpAt?: string[]
       }>
       distinctCost: number
       distinctSessions: number
@@ -252,23 +385,24 @@ export type MenubarPayload = {
       unattributedCost?: number
     }
   }
-  optimize: {
-    findingCount: number
-    savingsUSD: number
-    topFindings: Array<{
-      title: string
-      impact: 'high' | 'medium' | 'low'
-      savingsUSD: number
-    }>
-  }
+  optimize: OptimizeBlock
   history: {
     daily: DailyHistoryEntry[]
+    // Granular per-bucket timeline. Present only on the punchcard's dedicated
+    // fetch (every other payload passes --no-timeline).
+    timeline?: { bucketMinutes: number; points: Array<{ timestamp: string; cost: number }> }
   }
   // Active display currency. Payload costs are raw USD; the renderer multiplies by
   // `rate` and prefixes `symbol` at display time. Optional: older CLIs omit it.
   currency?: { code: string; symbol: string; rate: number }
   combined?: CombinedUsage
   claudeConfigs?: ClaudeConfigSelector
+  // The CLI's anonymised, fully bucketed daily aggregate (src/telemetry-snapshot.ts).
+  // Sent verbatim as the `usage_snapshot` telemetry event, so the desktop app and
+  // the Windows tray report identical shapes. Opaque here: the renderer never reads
+  // inside it. Absent on CLIs that predate the field, which is when the renderer's
+  // own fallback builder takes over.
+  telemetrySnapshot?: Record<string, unknown> | null
 }
 
 // ————— src/types.ts + src/models-report.ts —————
@@ -293,6 +427,9 @@ export type ModelReportRow = {
   providerDisplayName: string
   model: string
   modelDisplayName: string
+  // Raw provider/model ids folded into this row (e.g. two routes of the same
+  // model). Length 1 when nothing merged.
+  rawModels: string[]
   category: TaskCategory | null
   inputTokens: number
   outputTokens: number
@@ -300,6 +437,10 @@ export type ModelReportRow = {
   cacheReadTokens: number
   totalTokens: number
   costUSD: number
+  // Portion of costUSD priced from estimates, and the CLI's marker decision
+  // (src/format.ts isEstimatedCost). Optional: older CLIs omit both.
+  estimatedCostUSD?: number
+  isEstimated?: boolean
   savingsUSD: number
   savingsBaselineModel: string
   calls: number
@@ -353,9 +494,12 @@ export type PlanId =
   | 'cursor-pro'
   | 'supergrok'
   | 'supergrok-heavy'
+  | 'google-ai-pro'
+  | 'google-ai-ultra-5x'
+  | 'google-ai-ultra-20x'
   | 'custom'
   | 'none'
-export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'all'
+export type PlanProvider = 'claude' | 'codex' | 'cursor' | 'grok' | 'antigravity' | 'all'
 export type PlanStatus = 'under' | 'near' | 'over'
 
 /** Serialized plan summary from `attachPlanSummaries` (src/main.ts:90). */
@@ -393,12 +537,84 @@ export type SpendFlow = {
   links: SpendFlowLink[]
 }
 
+// ————— src/branch-spend.ts — Spend "By branch" lens (shared contract) —————
+
+export type BranchTokenSplit = {
+  inputTokens: number
+  outputTokens: number
+  reasoningTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+}
+
+/** One session's contribution inside a single (project, branch) row; cost is
+ *  the branch-sliced portion. `workingDirectory` is the provider-recorded
+ *  historical cwd (the worktree path itself when the session ran in one). */
+export type BranchSpendSessionRow = {
+  sessionId: string
+  title?: string
+  provider: string
+  workingDirectory?: string
+  isSidechain?: boolean
+  cost: number
+  calls: number
+  tokens: BranchTokenSplit
+  models: string[]
+  firstActive: string | null
+  lastActive: string | null
+}
+
+export type BranchWorktreeRow = { path: string; sessions: number; cost: number }
+
+export type BranchSpendRow = {
+  projectId: string
+  projectLabel: string
+  /** `null` = Unknown: spend before the session's first observed branch. */
+  branch: string | null
+  cost: number
+  calls: number
+  sessions: number
+  tokens: BranchTokenSplit
+  firstActive: string | null
+  lastActive: string | null
+  worktrees: BranchWorktreeRow[]
+  sessionRows: BranchSpendSessionRow[]
+}
+
+export type BranchSpendCoverage = {
+  branchKnownCost: number
+  branchUnknownCost: number
+  noBranchDataCost: number
+  noBranchDataSessions: number
+  noBranchDataProviders: string[]
+  /** Identity-based; never the sum of row session counts (rows overlap). */
+  distinctSessions: number
+}
+
+export type BranchSpendProjectReport = {
+  id: string
+  label: string
+  /** Normalized `origin` remote; shared by every clone and worktree of a repo. */
+  originKey?: string | null
+  totalCost: number
+  branches: BranchSpendRow[]
+  coverage: BranchSpendCoverage
+}
+
+export type BranchSpendReport = {
+  period: { label: string; start: string; end: string }
+  projects: BranchSpendProjectReport[]
+  totals: BranchSpendCoverage
+}
+
 // ————— src/optimize.ts —————
 
 export type WasteAction =
-  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' }
+  | { type: 'paste'; label: string; text: string; destination?: 'claude-md' | 'session-opener' | 'prompt' | 'shell-config' | 'manual' }
   | { type: 'command'; label: string; text: string }
   | { type: 'file-content'; label: string; path: string; content: string }
+
+export type FindingClass = 'fix' | 'nudge' | 'keep'
 
 export type OptimizeJsonReport = {
   period: { label: string; start: string | null; end: string | null }
@@ -413,6 +629,8 @@ export type OptimizeJsonReport = {
     potentialSavingsCostUSD: number
     potentialSavingsPercent: number | null
     costRateUSD: number
+    measuredSavingsUSD: number
+    byClass: Record<FindingClass, { tokensSaved: number; savingsUSD: number; count: number }>
   }
   findings: Array<{
     id: string
@@ -422,7 +640,20 @@ export type OptimizeJsonReport = {
     trend: 'active' | 'improving' | null
     tokensSaved: number
     estimatedSavingsUSD: number
+    class: FindingClass
+    basis: 'measured' | 'estimated'
     fix: WasteAction
+  }>
+  /** Still-applied fixes, re-measured on every run. Absent on older CLIs. */
+  appliedFixes?: Array<{
+    id: string
+    kind: string
+    findingId: string | null
+    appliedAt: string
+    verdict: 'worked' | 'partial' | 'no-effect' | 'pending'
+    estimatedTokens: number
+    realizedTokens: number
+    undoCommand: string
   }>
 }
 
@@ -457,7 +688,7 @@ export type DeviceScanResult = { found: ScannedDevice[] }
 // ————— src/act/report.ts buildActReportJson —————
 
 export type ActReportJson = {
-  totals: {
+  totals?: {
     realizedCostUSD: number
     measuredActions: number
   }
@@ -474,6 +705,10 @@ export type SessionRow = {
   provider: string
   models: string[]
   cost: number
+  // Portion of `cost` priced from estimates, and the CLI's marker decision.
+  // Optional: older CLIs omit both.
+  estimatedCost?: number
+  isEstimated?: boolean
   savingsUSD: number
   calls: number
   turns: number
@@ -484,6 +719,121 @@ export type SessionRow = {
   startedAt: string
   endedAt: string
   durationMs: number
+  // Subagent sessions folded into this parent row; their spend is already in
+  // the row's totals. Absent when none (and from older CLIs).
+  subagents?: SessionRow[]
+}
+
+// ————— src/session-contributions.ts (drill-through, `sessions --contributions`) —————
+
+/** One attributed slice of a session's in-range spend. Segments PARTITION the
+ *  session (every call lands in exactly one), so summing a single dimension
+ *  over all segments reconciles that dimension's aggregate exactly. `prs` is
+ *  the turn's ACTIVE PR set carried forward like the by-PR attribution: []
+ *  means unattributed, and a multi-PR set is listed whole (attributing to one
+ *  PR of the set is a 1/len share of the segment, never the full amount). */
+export type ContributionSegment = {
+  day: string
+  category: string | null
+  branch: string | null
+  /** Short model name -> attributed cost (same key family as modelBreakdown).
+   *  Sums to `cost`; the unattributable remainder rides under ''. */
+  models: Record<string, number>
+  /** Per-model request/token counts; absent in old cached reports. */
+  modelUsage?: Record<string, { calls: number; inputTokens: number; outputTokens: number }>
+  prs: string[]
+  /** True when the PR set is the legacy whole-session even split (transcript
+   *  expired before per-turn capture); absent otherwise. */
+  approx?: true
+  cost: number
+  calls: number
+  savingsUSD: number
+  inputTokens: number
+  outputTokens: number
+}
+
+/** Additive fields on SessionRow, present only in the contributions report. */
+export type SessionDrillFields = {
+  contributions?: { segments: ContributionSegment[] }
+  /** Canonical project identity (the same id topProjects[].id carries), so a
+   *  project chip matches rows exactly even when raw paths are prefix-similar. */
+  projectId?: string
+  /** Provider-recorded parent of a subagent transcript (integration point for
+   *  work-unit grouping). Absent for ordinary sessions. */
+  parentSessionId?: string
+  agentId?: string
+  isSidechain?: boolean
+}
+
+export type SessionDrillRow = SessionRow & SessionDrillFields
+
+// ————— src/session-why.ts (`sessions --id <id> --why --format json`) —————
+// Read on demand for one session; transcript text is never cached or synced.
+
+export type WhyParts = { input: number; output: number; cacheRead: number; cacheWrite: number; webSearch: number }
+export type WhyTokens = { input: number; output: number; cacheRead: number; cacheWrite: number }
+export type WhyAlt = { model: string; cost: number }
+export type WhyError = { exitCode: number | null; cause: string | null; location: string | null; secondary: string[] }
+export type WhyHelper = { id: string; description: string; agentType: string; models: string[]; calls: number; cost: number; nested: boolean; loose: boolean }
+export type WhyDetail = { command?: string; description?: string; output?: string; path?: string; diff?: string; lines?: number; input?: string; helper?: WhyHelper }
+export type WhyStep =
+  | { kind: 'model'; start: number; end: number; model: string; cost: number; parts: WhyParts; tokens: WhyTokens; startedBy: 'prompt' | 'tool' | 'message' }
+  | { kind: 'tool'; start: number; end: number; name: string; label: string; isError: boolean; error?: WhyError; helperCost?: number; detail: WhyDetail | null }
+export type WhyTurn = {
+  i: number
+  ts: string
+  prompt: { text: string; kind: 'text' | 'pasted' | 'system' }
+  cost: number
+  parts: WhyParts
+  tokens: WhyTokens
+  calls: number
+  models: string[]
+  helperCost: number
+  helpers: WhyHelper[]
+  wallMs: number
+  steps: WhyStep[]
+}
+type WhyBase = { id: string; turn?: number; step?: number; usd: number | null; share: number | null }
+export type WhyFinding = WhyBase & (
+  | { kind: 'helpers'; direct: number; nested: number; loose: number; models: string[]; descriptions: string[]; parts: WhyParts; tokens: WhyTokens; calls: number; minCalls: number; maxCalls: number; alt: WhyAlt | null }
+  | { kind: 'hotspot'; calls: number; toolCalls: number; models: string[]; median: number; parts: WhyParts; tokens: WhyTokens; alt: WhyAlt | null }
+  | { kind: 'coordination'; calls: number; toolCalls: number; model: string; parts: WhyParts; alt: WhyAlt | null }
+  | { kind: 'reread'; calls: number; avgTokens: number }
+  | { kind: 'failed'; tool: string; label: string; description: string; error: WhyError; userStopped: boolean; afterCalls: number | null }
+  | { kind: 'carry'; estimate: true; source: 'tool' | 'paste'; tool: string; label: string; chars: number; tokens: number; calls: number; writeUsd: number; readUsd: number }
+  | { kind: 'prefix'; estimate: true; tokens: number; cached: number; uncached: number; writeUsd: number; readUsd: number; laterCalls: number; readCalls: number }
+  | { kind: 'idle'; timeMs: number; endedBy: 'prompt' | 'tool' | 'message' | 'helper' }
+  | { kind: 'slowCall'; timeMs: number; model: string; outputTokens: number }
+)
+export type WhyRules = {
+  hotspotTopShare: number; hotspotMedianX: number; hotspotMinShare: number; helperShare: number
+  coordinationMinCalls: number; coordinationToolShare: number; rereadShare: number; rereadMinCalls: number
+  carryTokens: number; prefixTokens: number; idleMs: number; slowCallMs: number
+}
+export type SessionWhy = {
+  sessionId: string
+  title: string
+  project: string
+  startedAt: string
+  endedAt: string
+  cost: number
+  calls: number
+  parts: WhyParts
+  tokens: WhyTokens
+  models: Array<{ model: string; cost: number }>
+  helperCost: number
+  helperCount: number
+  median: number
+  turns: WhyTurn[]
+  findings: WhyFinding[]
+  rules: WhyRules
+  detailsOmitted: boolean
+  prWork?: WhyPrWork
+}
+export type WhyPrWork = {
+  opened: Array<{ url: string; at: string; head: string | null; followUpRounds: number | null; followUpPushes: number }>
+  reviewRuns: Array<{ helperId: string; description: string; models: string[]; cost: number; pr: number | null }>
+  reviewCost: number
 }
 
 // ————— src/compare-stats.ts —————
@@ -537,6 +887,198 @@ export type CompareJsonReport = {
   workingStyle: WorkingStyleRow[]
 }
 
+// ————— src/compare-cohorts.ts (compare --format cohort-json) —————
+// Mirrors the core contracts 1:1. The renderer never imports the Node engine,
+// so these hand copies ARE the IPC types; tests on both sides pin the same
+// percentile convention ([1,2,4,8] → median 3, P90 6.8).
+
+/** One observation = one edit turn whose behavioral calls carry exactly one
+ *  model. `costUSD` is that model's own recorded cost in the turn (never
+ *  another model's, never the session total). */
+export type CohortObservation = {
+  sessionId: string
+  provider: string
+  project: string
+  timestamp: string
+  category: string
+  model: string
+  costUSD: number
+  /** False when costUSD is 0 on a model the pricing rules do not declare free
+   *  — a pricing gap, never displayed as a real $0 observation. */
+  costKnown: boolean
+  retries: number
+  oneShot: boolean
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  /** input + cache-read tokens: an explicit PROXY for context size, never a
+   *  measured context window. */
+  contextProxyTokens: number
+  /** False when the turn's calls report no tokens at all; volume bands must
+   *  exclude and count these, never read them as small. */
+  tokensReported: boolean
+}
+
+export type CohortVolumeStats = {
+  outputMedian: number | null
+  outputP90: number | null
+  inputMedian: number | null
+  inputP90: number | null
+  contextProxyMedian: number | null
+  contextProxyP90: number | null
+  missingMeasureCount: number
+}
+
+export type CohortStats = {
+  model: string
+  label: string
+  /** Declared population the rates below divide by (selection filters, plus a
+   *  volume band when one is active). */
+  observationCount: number
+  distinctSessionCount: number
+  retryCount: number
+  retryRate: number | null
+  oneShotCount: number
+  oneShotRate: number | null
+  costKnownCount: number
+  unknownCostCount: number
+  costMedian: number | null
+  costP90: number | null
+  costMean: number | null
+  costHistogram: { edges: number[]; counts: number[] }
+  volume: CohortVolumeStats
+}
+
+export type CohortModelReport = {
+  model: string
+  label: string
+  stats: CohortStats
+  /** The declared population itself: every statistic is reproducible from it. */
+  observations: CohortObservation[]
+  exclusions: {
+    multiModelTurnCount: number
+    combinedMultiModelCostUSD: number
+    noBehavioralModelTurns: number
+  }
+}
+
+export type CohortComparisonReport = {
+  kind: 'cohort-comparison'
+  period: { label: string; provider: string }
+  selection: { projects: string[]; category: string | null; from: string | null; to: string | null }
+  conventions: {
+    percentile: string
+    contextProxy: string
+    attribution: string
+  }
+  modelA: CohortModelReport
+  modelB: CohortModelReport
+}
+
+export type CohortFacets = {
+  kind: 'cohort-facets'
+  models: ModelStats[]
+  projects: Array<{ id: string; project: string; projectPath: string; sessions: number; costUSD: number }>
+  categories: Array<{ id: string; label: string }>
+}
+// ---- Compare periods (period-diff; B minus A, A is the reference) ----
+// Mirrors the JSON emitted by `codeburn compare-periods --format json`
+// (src/period-diff.ts). Raw (unrounded) numbers; the UI formats.
+
+export type PeriodRangeInfo = { from: string; to: string; days: number }
+
+export type PeriodContribution = {
+  key: string
+  costA: number
+  costB: number
+  diff: number
+  /** diff / |costA| x 100; null when costA is 0 (the row is `new`). */
+  pct: number | null
+  status: 'new' | 'gone' | 'up' | 'down' | 'flat'
+  callsA: number
+  callsB: number
+}
+
+export type PeriodTotalsRow = {
+  cost: number
+  calls: number
+  sessions: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  savingsUSD: number
+  estimatedCostUSD: number
+}
+
+export type PeriodTotalsDiff = {
+  A: PeriodTotalsRow
+  B: PeriodTotalsRow
+  diff: PeriodTotalsRow
+  pct: Record<keyof PeriodTotalsRow, number | null>
+}
+
+export type NormalizedMetric = { a: number | null; b: number | null; diff: number | null; pct: number | null }
+
+export type AggregateDayRow = { date: string; historyCost: number; detailCost: number; aggregateOnly: number }
+
+export type PeriodDayCost = { date: string; cost: number }
+
+export type PeriodHistoryBasis = {
+  historyCost: { A: number; B: number }
+  detailCost: { A: number; B: number }
+  days: { A: AggregateDayRow[]; B: AggregateDayRow[] }
+  aggregateOnly: { A: number; B: number }
+  basis: string
+}
+
+export type PeriodDiffReport = {
+  schema: 1
+  provider: string
+  rangeA: PeriodRangeInfo
+  rangeB: PeriodRangeInfo
+  overlapDays: number
+  durationDeltaDays: number
+  totals: PeriodTotalsDiff
+  projects: PeriodContribution[]
+  models: PeriodContribution[]
+  normalized: {
+    perDay: NormalizedMetric
+    per100Calls: NormalizedMetric
+    denominators: { perDay: string; per100Calls: string }
+  }
+  /** Cost per local day for each side, zero-filled over every day in the range. */
+  daily: { A: PeriodDayCost[]; B: PeriodDayCost[] }
+  coverage: {
+    unpricedModelsA: Array<{ model: string; calls: number }>
+    unpricedModelsB: Array<{ model: string; calls: number }>
+    pricingCoverageA: number | null
+    pricingCoverageB: number | null
+  }
+  history?: PeriodHistoryBasis
+}
+
+export type PeriodSessionDiff = {
+  dimension: 'project' | 'model'
+  key: string
+  provider: string
+  rangeA: PeriodRangeInfo
+  rangeB: PeriodRangeInfo
+  sessions: Array<{
+    identity: string
+    provider: string
+    sessionId: string
+    project: string
+    title?: string
+    costA: number
+    costB: number
+    diff: number
+    callsA: number
+    callsB: number
+  }>
+}
+
 // ————— src/models.ts + src/audit-report.ts (audit --format json) —————
 
 /** Per-token rates used for pricing (src/models.ts ModelCosts). */
@@ -547,6 +1089,15 @@ export type ModelCosts = {
   cacheReadCostPerToken: number
   webSearchCostPerRequest: number
   fastMultiplier: number
+  /** The vendor's long-context tier, applied once prompt tokens reach the
+   *  threshold. Optional: absent on models without a published tier. */
+  longContextTier?: {
+    thresholdTokens: number
+    inputCostPerToken: number
+    outputCostPerToken: number
+    cacheWriteCostPerToken?: number
+    cacheReadCostPerToken?: number
+  }
 }
 
 /** One (provider, model) audit bucket (src/audit-report.ts AuditRow): raw
@@ -608,6 +1159,9 @@ export type TelemetryStatus = {
   enabled: boolean
   defaultEnabled: boolean
   onboarded: boolean
+  /** Set by the setters only: false when the decision holds in memory but could
+   *  not be written to disk, so the menu bar app still inherits the old one. */
+  persisted?: boolean
 }
 
 /** Cold-start scan progress streamed from the CLI warmup (src/parser.ts).
@@ -617,6 +1171,8 @@ export type ScanProgressEvent =
   | { kind: 'providers'; providers: string[]; cold?: boolean }
   | { kind: 'provider'; provider: string; state: 'start' | 'done' | 'skipped'; files?: number }
   | { kind: 'tick'; provider: string; done: number; total: number }
+  /** Proof of life during a silent parse phase; carries nothing else. */
+  | { kind: 'keepalive' }
   | { kind: 'done' }
 
 /** Update-availability status from the main process (app/electron/updates.ts). */
@@ -625,32 +1181,199 @@ export type UpdateStatus = {
   latestVersion: string | null
   updateAvailable: boolean
   tag: string | null
+  /** A Microsoft Store install, which the Store updates; nothing is checked or offered. */
+  storeManaged?: boolean
+  /** One-click update state; absent where the banner links to a download instead. */
+  install?: 'available' | 'downloading' | 'ready'
+  /** The restart into a downloaded update did not happen; the banner offers a retry. */
+  installFailed?: boolean
 }
 
+export type CompanionComponent = 'cli' | 'menubar'
+
+/** One component's latest step from the CLI's `codeburn update --json` engine. */
+export type CompanionStep = {
+  state: 'start' | 'progress' | 'done' | 'skipped' | 'error'
+  code?: string
+  from?: string
+  to?: string
+  message?: string
+  /** The manual fallback the engine names on an error. */
+  command?: string
+}
+
+/** The menubar app and global CLI against the desktop's version (app/electron/companion-update.ts). */
+export type CompanionUpdateStatus = {
+  state: 'idle' | 'available' | 'running' | 'done' | 'error'
+  version: string
+  behind: CompanionComponent[]
+  steps: Partial<Record<CompanionComponent, CompanionStep>>
+}
+
+/** The tray app and the Capacity Dock the Windows desktop app bundles (app/electron/menubar.ts).
+ *  `supported` is false everywhere else, and on a Windows build with nothing staged. */
+export type CompanionStatus = {
+  supported: boolean
+  menuBar: boolean
+  sidebar: boolean
+  /** The Store route, where launch at login is the package's own startup task. */
+  store: boolean
+  /** True when this run installed a tray app that Windows can only finish putting in place at
+   *  the next restart. Nothing is started until then, so the corner says so rather than
+   *  showing two switches on with nothing running. */
+  restartRequired?: boolean
+  // Mirrors MacMenubarStatus so the Plugins card renders one companion card per platform. All
+  // reflect on-disk truth, never intent. Optional so a preload predating them still parses.
+  canInstall?: boolean
+  installed?: boolean
+  running?: boolean
+  version?: string | null
+  outdated?: boolean
+}
+
+/** The discrete companion actions' return shape (install/quit/uninstall): the outcome plus the
+ *  status that followed. Mirrors MacMenubarInstall. */
+export type CompanionActionResult = { ok: boolean; error: string | null; status: CompanionStatus }
+
+/** The macOS menubar app (mac/) as the Plugins page sees it (app/electron/mac-menubar.ts). */
+export type MacMenubarStatus = {
+  supported: boolean
+  /** False in a Mac App Store build, which may not download an executable. */
+  canInstall: boolean
+  installed: boolean
+  path: string | null
+  version: string | null
+  running: boolean
+  dock: boolean
+  /** True for a menubar too old to be driven from here; the card offers Update instead. */
+  outdated: boolean
+}
+
+export type MacMenubarInstall = {
+  ok: boolean
+  error: string | null
+  status: MacMenubarStatus
+  /** Older bundles the CLI found and left in place. Absent on the actions that never install. */
+  leftovers?: string[]
+}
+
+/** The tray app's own settings, from the two files it reads them from
+ *  (windows-settings.json, windows-dock.json) plus the HKCU Run value. */
+export type TrayPrefs = {
+  app: {
+    metric: string
+    menubarPeriod: string
+    accent: string
+    trayBadge: boolean
+    usageRefreshSeconds: number
+    quotaCadenceSeconds: number
+    terminal: string
+  }
+  dock: {
+    enabled: boolean
+    preferred: string | null
+    scale: number
+    theme: string
+    gaugeShape: string
+    providers: string[]
+    manualSelection: boolean
+  }
+  launchAtLogin: boolean
+  /** True where launch at login belongs to Windows rather than to this app: the Store
+   *  package declares it as its own startup task, so the pane points at Settings > Apps >
+   *  Startup instead of showing a switch (app/electron/menubar.ts). */
+  launchAtLoginManaged: boolean
+}
+
+export type ProjectFilter = { project: string[]; exclude: string[] }
+
+export type ProjectRow = { name: string; path: string; cost: number; sessions: number; checkouts?: Array<{ path: string; cost: number; matchedByFolderName?: boolean }>; checkoutCount?: number; temporary?: boolean }
+
+export type ProjectsReport = { projects: ProjectRow[] }
+
+export type IdeCommand = { section?: string; period?: string; refresh?: boolean }
+
 export interface CodeburnBridge {
+  /** Set by the VS Code extension's webview bridge; absent in the desktop app. */
+  readonly host?: 'vscode'
+  /** The extension's own version, set beside `host`. */
+  readonly hostVersion?: string
+  /** The IDE's project scope: the open workspace's projects, or every project.
+   *  `label` names the workspace; null when no folder is open. */
+  readonly ideScope?: { workspace: boolean; label: string | null }
+  /** Switch the IDE scope. The host reloads the view under the new scope. */
+  setIdeScope?(workspace: boolean): Promise<void>
+  /** Open the editor's own settings for CodeBurn. */
+  openIdeSettings?(): Promise<void>
+  /** Editor commands aimed at an open dashboard: go to a section/period, or refresh. */
+  onIdeCommand?(cb: (command: IdeCommand) => void): () => void
+  /** The Electron app's own UI language tag (app.getLocale()), for the 'system'
+   *  locale choice. Absent on preloads that predate desktop localization. */
+  readonly appLocale?: string
+  /** The persisted shared config `language` (null/absent = follow the system). */
+  getLanguage?(): Promise<string | null>
+  /** Persist the config `language` (null clears it) and propagate to the menu bar. */
+  setLanguage?(language: string | null): Promise<void>
+  /** The config `cursorSync` switch (absent = on). */
+  getCursorSync?(): Promise<boolean>
+  setCursorSync?(enabled: boolean): Promise<void>
   /** Subscribe to cold-start scan progress; returns an unsubscribe fn. */
   onProgress(cb: (event: ScanProgressEvent) => void): () => void
   /** Read the cached update-availability status (launch + 24h background check). */
   getUpdateStatus(): Promise<UpdateStatus>
   /** Subscribe to pushed update-availability status; returns an unsubscribe fn. */
   onUpdateStatus(cb: (status: UpdateStatus) => void): () => void
-  getQuota(force?: boolean): Promise<QuotaProvider[]>
+  /** Start the one-click download; absent on bridges without auto-update. */
+  downloadUpdate?(): Promise<UpdateStatus>
+  /** Quit and install a downloaded update. */
+  installUpdate?(): Promise<void>
+  /** The menubar app and global CLI update; absent on bridges without companions. */
+  getCompanionUpdate?(): Promise<CompanionUpdateStatus | null>
+  onCompanionUpdate?(cb: (status: CompanionUpdateStatus) => void): () => void
+  updateCompanions?(): Promise<boolean>
+  getQuota(force?: boolean, disabled?: ProviderName[]): Promise<QuotaProvider[]>
   // `background` (prefetch only) requests background CLI-spawn priority; optional
   // so an older preload that ignores it degrades to interactive priority.
-  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean): Promise<MenubarPayload>
-  getPlans(period: Period): Promise<StatusJson>
+  // `scope` selects local-device usage ('local', default) or paired-device
+  // aggregate ('combined'); optional so an older preload degrades to local.
+  getOverview(period: Period, provider: string, range?: DateRange, configSource?: string | null, background?: boolean, scope?: string): Promise<MenubarPayload>
+  getTimeline(period: Period, provider: string, range?: DateRange): Promise<MenubarPayload>
+  getPlans(period: Period, background?: boolean): Promise<StatusJson>
   getActReport(): Promise<ActReportJson>
   readonly platform: string
   /** Node process.arch of the host ('arm64', 'x64', ...). Absent on preloads
    *  that predate the direct-download update link. */
   readonly arch?: string
-  getModels(period: Period, provider: string, byTask: boolean, range?: DateRange): Promise<ModelReportRow[]>
-  getSessions(period: Period, provider: string, range?: DateRange): Promise<SessionRow[]>
-  getCompareModels(period: Period, provider: string): Promise<ModelStats[]>
+  getModels(period: Period, provider: string, byTask: boolean, range?: DateRange, background?: boolean): Promise<ModelReportRow[]>
+  getSessions(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SessionRow[]>
+  /** Session rows with per-turn contribution segments (`sessions --contributions`).
+   *  Same population and filtering semantics as getSessions; additive fields only. */
+  getSessionsContributions(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SessionDrillRow[]>
+  /** One Claude Code session's cost diagnosis, read on demand (`sessions --id <id> --why`). */
+  getSessionWhy(id: string): Promise<SessionWhy>
+  getCompareModels(period: Period, provider: string, background?: boolean): Promise<ModelStats[]>
   getCompare(period: Period, provider: string, modelA: string, modelB: string): Promise<CompareJsonReport>
-  getYield(period: Period, provider: string, range?: DateRange): Promise<YieldJsonReport>
-  getSpendFlow(period: Period, provider: string, range?: DateRange): Promise<SpendFlow>
-  getOptimizeReport(period: Period, provider: string, range?: DateRange): Promise<OptimizeJsonReport>
+  /** Cohort mode facets: models, canonical projects, activity categories. */
+  getCompareCohortModels(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<CohortFacets>
+  /** Cohort mode report; projects contains exact ids from CohortFacets. */
+  getCompareCohort(period: Period, provider: string, modelA: string, modelB: string, range?: DateRange, projects?: string[], category?: string, background?: boolean): Promise<CohortComparisonReport>
+  /** Compare periods (B minus A). Both ranges are required local YYYY-MM-DD keys. */
+  getPeriodCompare(rangeA: DateRange, rangeB: DateRange, provider: string, background?: boolean): Promise<PeriodDiffReport>
+  /** Sessions behind one project/model contribution, joined across A and B. */
+  getPeriodCompareSessions(rangeA: DateRange, rangeB: DateRange, provider: string, dimension: 'project' | 'model', key: string): Promise<PeriodSessionDiff>
+  getYield(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<YieldJsonReport>
+  getSpendFlow(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<SpendFlow>
+  /** Spend per canonical project × branch (`spend --format branch-json`). */
+  getBranchSpend(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<BranchSpendReport>
+  getOptimizeReport(period: Period, provider: string, range?: DateRange, background?: boolean): Promise<OptimizeJsonReport>
+  /** The once-a-day optimize scan for this query scope, cached on disk.
+   *  `maxAgeMs` 0 forces a recompute. Optional so an older preload degrades to
+   *  no coach figures rather than throwing. */
+  getOptimizeSnapshot?(period: Period, provider: string, range?: DateRange, configSource?: string | null, scope?: string, maxAgeMs?: number): Promise<OptimizeSnapshot>
+  /** Whether the machine is on battery. Optional: an older preload reads as AC. */
+  powerStatus?(): Promise<boolean>
+  /** Subscribe to power-source changes; returns an unsubscribe fn. */
+  onPowerStatus?(cb: (onBattery: boolean) => void): () => void
   getDevices(period: Period): Promise<CombinedUsage>
   getDevicesScan(): Promise<DeviceScanResult>
   getShareStatus(): Promise<ShareStatus>
@@ -659,6 +1382,13 @@ export interface CodeburnBridge {
   getProxyPaths(): Promise<string[]>
   getAudit(period: Period, provider: string, range?: DateRange): Promise<AuditRow[]>
   getPriceOverrides(): Promise<PriceOverrideList>
+  getProjectFilter(): Promise<ProjectFilter>
+  setProjectFilter(filter: ProjectFilter): Promise<ProjectFilter>
+  /** Every project that exists, filter NOT applied: the Projects pane's checklist. */
+  getUnfilteredProjects(): Promise<ProjectsReport>
+  /** Scope every report to one project path until cleared or the app restarts.
+   *  Absent on the IDE host, which has its own workspace scope. */
+  setTransientProject?(projectPath: string | null): Promise<void>
   setPriceOverride(model: string, rates: PriceRates): Promise<ActionResult>
   removePriceOverride(model: string): Promise<ActionResult>
   setCurrency(code: string): Promise<ActionResult>
@@ -668,7 +1398,7 @@ export interface CodeburnBridge {
   removeDevice(name: string): Promise<ActionResult>
   setPlan(id: string, provider: string): Promise<ActionResult>
   resetPlan(provider: string): Promise<ActionResult>
-  exportData(format: string, provider: string, outPath: string): Promise<ActionResult>
+  exportData(format: string, provider: string, outPath: string): Promise<ExportResult>
   chooseDirectory(): Promise<string | null>
   cliStatus(): Promise<{ found: boolean; path: string | null; error?: string }>
   telemetryStatus(): Promise<TelemetryStatus | null>
@@ -676,4 +1406,40 @@ export interface CodeburnBridge {
   completeOnboarding(enabled: boolean): Promise<TelemetryStatus | null>
   telemetryTrack(name: string, props?: Record<string, unknown>): Promise<boolean>
   openExternal(url: string): Promise<void>
+  /** The bundled tray app and Capacity Dock (Windows). Optional so a preload that
+   *  predates them degrades to "not supported" rather than throwing. */
+  companionStatus?(): Promise<CompanionStatus>
+  /** The Plugins card's discrete actions, mirroring the macOS card. Optional for the same
+   *  reason: a preload that predates them leaves the buttons inert rather than throwing. */
+  companionInstall?(): Promise<CompanionActionResult>
+  companionOpen?(): Promise<CompanionStatus>
+  companionQuit?(): Promise<CompanionActionResult>
+  companionUninstall?(): Promise<CompanionActionResult>
+  companionSetDock?(enabled: boolean): Promise<CompanionStatus>
+  /** The tray app's own settings. Null when there is no tray app to have any. */
+  trayPrefs?(): Promise<TrayPrefs | null>
+  setTrayAppPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setTrayDockPref?(patch: Record<string, unknown>): Promise<TrayPrefs | null>
+  setLaunchAtLogin?(enabled: boolean): Promise<TrayPrefs | null>
+  /** The macOS menubar app. Optional so a preload that predates the card degrades to
+   *  "not supported" rather than throwing. */
+  macMenubarStatus?(): Promise<MacMenubarStatus>
+  macMenubarInstall?(): Promise<MacMenubarInstall>
+  macMenubarOpen?(): Promise<MacMenubarStatus>
+  macMenubarSetDock?(enabled: boolean): Promise<MacMenubarStatus>
+  macMenubarSettings?(): Promise<MacMenubarInstall>
+  macMenubarQuit?(): Promise<MacMenubarInstall>
+  macMenubarUninstall?(): Promise<MacMenubarInstall>
+  /** Named steps of a running install: Downloading, Verifying, Installing, Starting. */
+  onMacMenubarProgress?(cb: (phase: string) => void): () => void
+  // Plugin management
+  pluginList(): Promise<unknown>
+  pluginInfo(name: string): Promise<unknown>
+  pluginAdd(source: string): Promise<ActionResult>
+  pluginRemove(name: string): Promise<ActionResult>
+  pluginVerify(name: string): Promise<ActionResult>
+  // Sync auto
+  syncAutoStatus(): Promise<unknown>
+  syncAutoEnable(cadence: string, attribution: boolean, accept: boolean): Promise<unknown>
+  syncAutoDisable(): Promise<ActionResult>
 }

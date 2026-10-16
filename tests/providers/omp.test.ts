@@ -3,7 +3,11 @@ import { mkdtemp, mkdir, writeFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
+import { setModelAliases, setPriceOverrides } from '../../src/models.js'
+import { filterProjectsByDateRange } from '../../src/parser.js'
 import { createOmpProvider } from '../../src/providers/pi.js'
+import { aggregateSessions } from '../../src/sessions-report.js'
+import type { ParsedApiCall, ProjectSummary } from '../../src/types.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 
 let tmpDir: string
@@ -16,12 +20,12 @@ afterEach(async () => {
   await rm(tmpDir, { recursive: true, force: true })
 })
 
-function sessionMeta(opts: { id?: string; cwd?: string } = {}) {
+function sessionMeta(opts: { id?: string; cwd?: string; timestamp?: string } = {}) {
   return JSON.stringify({
     type: 'session',
     version: 3,
     id: opts.id ?? 'sess-001',
-    timestamp: '2026-04-14T10:00:00.000Z',
+    timestamp: opts.timestamp ?? '2026-04-14T10:00:00.000Z',
     cwd: opts.cwd ?? '/Users/test/myproject',
   })
 }
@@ -42,12 +46,13 @@ function userMessage(text: string) {
 function assistantMessage(opts: {
   id?: string
   responseId?: string
-  timestamp?: string
+  timestamp?: string | null
   model?: string
   input?: number
   output?: number
   cacheRead?: number
   cacheWrite?: number
+  cost?: number
   tools?: Array<{ name: string; command?: string }>
 }) {
   const content = (opts.tools ?? []).map(t => ({
@@ -60,7 +65,7 @@ function assistantMessage(opts: {
   return JSON.stringify({
     type: 'message',
     id: opts.id ?? 'msg-asst-1',
-    timestamp: opts.timestamp ?? '2026-04-14T10:00:30.000Z',
+    ...(opts.timestamp === null ? {} : { timestamp: opts.timestamp ?? '2026-04-14T10:00:30.000Z' }),
     message: {
       role: 'assistant',
       content,
@@ -72,7 +77,7 @@ function assistantMessage(opts: {
         output: opts.output ?? 200,
         cacheRead: opts.cacheRead ?? 0,
         cacheWrite: opts.cacheWrite ?? 0,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: opts.cost ?? 0 },
       },
       timestamp: 1776023230000,
     },
@@ -84,6 +89,52 @@ async function writeSession(projectDir: string, filename: string, lines: string[
   const filePath = join(projectDir, filename)
   await writeFile(filePath, lines.join('\n') + '\n')
   return filePath
+}
+
+function projectWithCalls(calls: ParsedProviderCall[]): ProjectSummary[] {
+  return [{
+    project: 'myproject',
+    projectPath: '/Users/test/myproject',
+    sessions: [{
+      sessionId: calls[0]!.sessionId,
+      project: 'myproject',
+      turns: calls.map(call => {
+        const assistantCall: ParsedApiCall = {
+          provider: call.provider,
+          model: call.model,
+          usage: {
+            inputTokens: call.inputTokens,
+            outputTokens: call.outputTokens,
+            cacheCreationInputTokens: call.cacheCreationInputTokens,
+            cacheReadInputTokens: call.cacheReadInputTokens,
+            cachedInputTokens: call.cachedInputTokens,
+            reasoningTokens: call.reasoningTokens,
+            webSearchRequests: call.webSearchRequests,
+          },
+          costUSD: call.costUSD,
+          tools: call.tools,
+          mcpTools: call.tools.filter(tool => tool.startsWith('mcp__')),
+          skills: call.skills ?? [],
+          subagentTypes: call.subagentTypes ?? [],
+          hasAgentSpawn: call.tools.includes('Agent'),
+          hasPlanMode: call.tools.includes('EnterPlanMode'),
+          speed: call.speed,
+          timestamp: call.timestamp,
+          bashCommands: call.bashCommands,
+          deduplicationKey: call.deduplicationKey,
+        }
+        return {
+          userMessage: call.userMessage,
+          assistantCalls: [assistantCall],
+          timestamp: call.timestamp,
+          sessionId: call.sessionId,
+          category: 'general' as const,
+          retries: 0,
+          hasEdits: false,
+        }
+      }),
+    }],
+  }] as unknown as ProjectSummary[]
 }
 
 describe('omp provider - identity', () => {
@@ -110,13 +161,56 @@ describe('omp provider - session discovery', () => {
     expect(sessions[0]!.project).toBe('myproject')
   })
 
+  it('discovers title-first sessions', async () => {
+    const projectDir = join(tmpDir, '--Users-test-myproject--')
+    await writeSession(projectDir, 'title-first.jsonl', [
+      JSON.stringify({ type: 'title', title: 'OMP title-first session' }),
+      '',
+      sessionMeta({ cwd: '/Users/test/myproject' }),
+      assistantMessage({}),
+    ])
+
+    const provider = createOmpProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.provider).toBe('omp')
+    expect(sessions[0]!.project).toBe('myproject')
+  })
+
+  it('discovers nested per-agent sessions with their resolved model and start time', async () => {
+    const projectDir = join(tmpDir, '--Users-test-myproject--')
+    const agentDir = join(projectDir, '2026-04-14T10-00-00-000Z_parent-001')
+    const filePath = await writeSession(agentDir, 'KillSwitch.jsonl', [
+      sessionMeta({ id: 'agent-001', timestamp: '2026-04-14T10:00:00.000Z' }),
+      JSON.stringify({ type: 'model_change', model: 'openai-codex/gpt-5.6-terra' }),
+      assistantMessage({ model: 'gpt-5.6-terra' }),
+    ])
+
+    const provider = createOmpProvider(tmpDir)
+    const sessions = await provider.discoverSessions()
+
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]).toMatchObject({
+      path: filePath,
+      agentName: 'KillSwitch',
+      agentStartedAt: '2026-04-14T10:00:00.000Z',
+    })
+
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(sessions[0]!, new Set()).parse()) {
+      calls.push(call)
+    }
+    expect(calls[0]!.model).toBe('openai-codex/gpt-5.6-terra')
+  })
+
   it('returns empty for non-existent directory', async () => {
     const provider = createOmpProvider('/nonexistent/omp/path')
     const sessions = await provider.discoverSessions()
     expect(sessions).toEqual([])
   })
 
-  it('skips files whose first line is not a session entry', async () => {
+  it('skips files without a session entry', async () => {
     const projectDir = join(tmpDir, '--Users-test-myproject--')
     await writeSession(projectDir, 'bad.jsonl', [
       JSON.stringify({ type: 'message', id: 'x' }),
@@ -168,11 +262,11 @@ describe('omp provider - JSONL parsing', () => {
     expect(call.deduplicationKey).toContain('resp-omp-1')
   })
 
-  it('ignores the embedded usage.cost and recalculates cost', async () => {
+  it('preserves a provider-reported nonzero cost', async () => {
     const projectDir = join(tmpDir, '--Users-test-myproject--')
     const filePath = await writeSession(projectDir, 'session.jsonl', [
       sessionMeta(),
-      assistantMessage({ input: 1000, output: 200, cacheRead: 0, cacheWrite: 0 }),
+      assistantMessage({ input: 1000, output: 200, cacheRead: 0, cacheWrite: 0, cost: 1.234 }),
     ])
 
     const provider = createOmpProvider(tmpDir)
@@ -182,10 +276,92 @@ describe('omp provider - JSONL parsing', () => {
       calls.push(call)
     }
 
-    // cost must be calculated by codeburn, not taken from usage.cost (which is zeroed in fixture)
-    expect(calls[0]!.costUSD).toBeGreaterThanOrEqual(0)
+    expect(calls.map(call => call.costUSD)).toEqual([1.234])
   })
 
+  it('prices a zero reported cost through its alias and price override', async () => {
+    setModelAliases({ 'xai-oauth/grok-4.6': 'omp-grok-price-test' })
+    setPriceOverrides({ 'omp-grok-price-test': { input: 2, output: 4 } })
+    try {
+      const projectDir = join(tmpDir, '--Users-test-myproject--')
+      const filePath = await writeSession(projectDir, 'session.jsonl', [
+        sessionMeta(),
+        assistantMessage({
+          model: 'xai-oauth/grok-4.6',
+          input: 1_000_000,
+          output: 1_000_000,
+          cost: 0,
+        }),
+      ])
+
+      const provider = createOmpProvider(tmpDir)
+      const source = { path: filePath, project: 'myproject', provider: 'omp' }
+      const calls: ParsedProviderCall[] = []
+      for await (const call of provider.createSessionParser(source, new Set()).parse()) {
+        calls.push(call)
+      }
+
+      expect(calls[0]!.costUSD).toBeCloseTo(6, 12)
+    } finally {
+      setModelAliases({})
+      setPriceOverrides({})
+    }
+  })
+
+  it('uses user attribution timestamps to date-slice records in one OMP session', async () => {
+    const projectDir = join(tmpDir, '--Users-test-myproject--')
+    const firstTimestamp = '2026-04-15T10:00:00.000Z'
+    const secondTimestamp = '2026-04-16T10:00:00.000Z'
+    const filePath = await writeSession(projectDir, 'session.jsonl', [
+      sessionMeta(),
+      assistantMessage({ id: 'assistant-header', responseId: 'response-header', timestamp: null }),
+      JSON.stringify({
+        type: 'message',
+        id: 'user-first',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'first request' }],
+          attribution: { timestamp: Date.parse(firstTimestamp) },
+        },
+      }),
+      assistantMessage({ id: 'assistant-first', responseId: 'response-first', timestamp: null }),
+      JSON.stringify({
+        type: 'message',
+        id: 'user-second',
+        message: {
+          role: 'user',
+          content: [{ type: 'text', text: 'second request' }],
+          attribution: { timestamp: Date.parse(secondTimestamp) },
+        },
+      }),
+      assistantMessage({ id: 'assistant-second', responseId: 'response-second', timestamp: null }),
+    ])
+
+    const provider = createOmpProvider(tmpDir)
+    const source = { path: filePath, project: 'myproject', provider: 'omp' }
+    const calls: ParsedProviderCall[] = []
+    for await (const call of provider.createSessionParser(source, new Set()).parse()) {
+      calls.push(call)
+    }
+
+    expect(calls.map(call => call.timestamp)).toEqual([
+      '2026-04-14T10:00:00.000Z',
+      firstTimestamp,
+      secondTimestamp,
+    ])
+
+    const filtered = filterProjectsByDateRange(projectWithCalls(calls), {
+      start: new Date('2026-04-16T00:00:00.000Z'),
+      end: new Date('2026-04-16T23:59:59.999Z'),
+    })
+    const filteredCalls = filtered.flatMap(project =>
+      project.sessions.flatMap(session => session.turns.flatMap(turn => turn.assistantCalls)),
+    )
+
+    expect(filteredCalls).toHaveLength(1)
+    expect(filteredCalls[0]!.timestamp).toBe(secondTimestamp)
+    expect(aggregateSessions(filtered)[0]!.startedAt).toBe(secondTimestamp)
+  })
   it('collects tool names from toolCall content items', async () => {
     const projectDir = join(tmpDir, '--Users-test-myproject--')
     const filePath = await writeSession(projectDir, 'session.jsonl', [
@@ -221,5 +397,93 @@ describe('omp provider - JSONL parsing', () => {
     }
 
     expect(calls).toHaveLength(0)
+  })
+})
+
+function modelUsage(opts: {
+  id: string
+  purpose?: string
+  provider?: string
+  model?: string
+  input?: number
+  output?: number
+  cost?: number
+  stopReason?: string
+}) {
+  return JSON.stringify({
+    type: 'model_usage',
+    id: opts.id,
+    parentId: 'parent',
+    timestamp: '2026-04-14T10:01:00.000Z',
+    purpose: opts.purpose ?? 'find',
+    role: 'typesafe',
+    api: 'openrouter-decisions',
+    provider: opts.provider ?? 'openrouter',
+    model: opts.model ?? '~typesafe/jev-latest',
+    usage: {
+      input: opts.input ?? 6244,
+      output: opts.output ?? 1220,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: (opts.input ?? 6244) + (opts.output ?? 1220),
+      cost: { input: opts.cost ?? 0.000262248, output: 0, cacheRead: 0, cacheWrite: 0, total: opts.cost ?? 0.000262248 },
+    },
+    stopReason: opts.stopReason ?? 'stop',
+  })
+}
+
+async function parseLines(lines: string[], seen = new Set<string>()): Promise<ParsedProviderCall[]> {
+  const filePath = await writeSession(join(tmpDir, '--Users-test-myproject--'), 'session.jsonl', lines)
+  const provider = createOmpProvider(tmpDir)
+  const source = { path: filePath, project: 'myproject', provider: 'omp' }
+  const calls: ParsedProviderCall[] = []
+  for await (const call of provider.createSessionParser(source, seen).parse()) calls.push(call)
+  return calls
+}
+
+describe('omp provider - model_usage side calls', () => {
+  it('counts a side call beside the assistant turn, with its reported cost and purpose', async () => {
+    const calls = await parseLines([
+      sessionMeta(),
+      userMessage('find the parser'),
+      assistantMessage({ cost: 0.5 }),
+      modelUsage({ id: 'mu-1' }),
+    ])
+
+    expect(calls).toHaveLength(2)
+    const side = calls.find(call => call.tools.includes('omp:find'))!
+    expect(side.model).toBe('openrouter/~typesafe/jev-latest')
+    expect(side.inputTokens).toBe(6244)
+    expect(side.outputTokens).toBe(1220)
+    expect(side.costUSD).toBeCloseTo(0.000262248, 12)
+    expect(side.userMessage).toBe('')
+    expect(side.timestamp).toBe('2026-04-14T10:01:00.000Z')
+    expect(calls.find(call => !call.tools.includes('omp:find'))!.userMessage).toBe('find the parser')
+  })
+
+  it('prices a zero reported cost through the price table', async () => {
+    setPriceOverrides({ 'openrouter/~typesafe/jev-latest': { input: 0.042, output: 0 } })
+    try {
+      const calls = await parseLines([sessionMeta(), modelUsage({ id: 'mu-2', input: 1_000_000, output: 5, cost: 0 })])
+      expect(calls[0]!.costUSD).toBeCloseTo(0.042, 12)
+    } finally {
+      setPriceOverrides({})
+    }
+  })
+
+  it('skips an errored side call that consumed no tokens', async () => {
+    const calls = await parseLines([
+      sessionMeta(),
+      modelUsage({ id: 'mu-3', input: 0, output: 0, cost: 0, stopReason: 'error' }),
+    ])
+    expect(calls).toHaveLength(0)
+  })
+
+  it('counts a repeated side call once across parses that share dedup keys', async () => {
+    const seen = new Set<string>()
+    const first = await parseLines([sessionMeta(), modelUsage({ id: 'mu-4' })], seen)
+    const second = await parseLines([sessionMeta(), modelUsage({ id: 'mu-4' })], seen)
+    expect(first).toHaveLength(1)
+    expect(second).toHaveLength(0)
   })
 })

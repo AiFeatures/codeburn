@@ -1,8 +1,11 @@
 import chalk from 'chalk'
 import stripAnsi from 'strip-ansi'
 
+import { behavioralCallWeight } from './behavioral-weight.js'
 import { codexCredits } from './codex-credits.js'
-import { formatCost, formatTokens } from './format.js'
+import { ESTIMATED_COST_LEGEND, formatCost, formatTokens, isEstimatedCost, markEstimated } from './format.js'
+import { billableOutputTokens, fallbackRawModelDisplayName, getModelRoute, getRouteById, getShortModelName, modelRowKey, resolveCanonicalModelId, routeSuffix, sanitizeModelForDisplay } from './models.js'
+import { classifyPeak, peakBillingKind } from './peak-hours.js'
 import { getProvider } from './providers/index.js'
 import { CATEGORY_LABELS, type ProjectSummary, type TaskCategory } from './types.js'
 
@@ -23,12 +26,43 @@ export type ModelReportRow = {
   cacheReadTokens: number
   totalTokens: number
   costUSD: number
+  /// Portion of `costUSD` from calls flagged `isEstimated`. Never subtracted
+  /// from `costUSD`; `isEstimatedCost` decides whether the row is marked.
+  estimatedCostUSD: number
   savingsUSD: number
   savingsBaselineModel: string
   calls: number
+  /// Raw provider/model ids folded into this row by the canonical-id merge
+  /// above (e.g. `minimax/MiniMax-M3` and `MiniMaxAI/MiniMax-M3` both showing
+  /// as "MiniMax M3"). Length 1 when nothing merged. Lets a cached vs
+  /// uncached route stay visible even though the row is one model (#1239).
+  rawModels: string[]
+  /// Billing route id this row's calls went through (`bedrock`), or null for
+  /// the direct door. Part of the row identity: the same model through two
+  /// doors is two rows (#1449). Additive; JSON consumers that predate it
+  /// ignore it.
+  route: string | null
   /// Codex credit consumption (issues #408/#495). null for non-Codex models or
-  /// Codex models without a known credit rate.
+  /// Codex models without a known credit rate. A merged row that mixed rated
+  /// and unrated buckets stores the partial sum of the rated ones.
   credits: number | null
+  /// True when `credits` is a partial sum because some contributing buckets
+  /// had no known credit rate.
+  creditsIncomplete?: boolean
+  /// Peak-hours split (#peak-hours): consumption shares of the stored
+  /// `costUSD` (list rate), never a repricing — `peakUSD + offPeakUSD ==
+  /// costUSD` for every split row, because the vendor's own bill applies the
+  /// off-peak discount. Null on rows whose route has no first-party peak
+  /// regime (see peak-hours.ts) or whose calls all landed in `unknown`
+  /// (missing/invalid timestamps) — never guessed.
+  peakUSD?: number | null
+  offPeakUSD?: number | null
+  peakCalls?: number | null
+  offPeakCalls?: number | null
+  /// Which vendor's windows the split ran under: 'deepseek-usd' (0.5x off-peak
+  /// on the DeepSeek API bill) or 'zai-credits' (0.5x off-peak in Z.ai plan
+  /// credits). Absent with the split.
+  peakKind?: 'deepseek-usd' | 'zai-credits'
   topCategory?: TaskCategory
   topCategoryCost?: number
   topCategoryShare?: number
@@ -52,6 +86,11 @@ export type AggregateOptions = {
 type Bucket = {
   provider: string
   model: string
+  /// Route id the call recorded (see ParsedApiCall.route); the id shape fills
+  /// it at fold time when absent. Part of the bucket identity so a
+  /// `billing_provider = bedrock` call never shares a bucket with the direct
+  /// call of the same id.
+  route: string | null
   category: TaskCategory | null
   agentType: string | null
   inputTokens: number
@@ -59,22 +98,92 @@ type Bucket = {
   cacheWriteTokens: number
   cacheReadTokens: number
   costUSD: number
+  estimatedCostUSD: number
   savingsUSD: number
   savingsBaselineModel: string
   calls: number
+  /// Peak-hours split (#peak-hours): additive per-window cost/calls resolved
+  /// from each call's own timestamp, at the stored list rate. peakCostUSD +
+  /// offPeakCostUSD == costUSD for classified calls — a consumption share,
+  /// never a repricing (the vendor's bill applies the off-peak discount).
+  peakKind: 'deepseek-usd' | 'zai-credits' | null
+  peakCostUSD: number
+  offPeakCostUSD: number
+  peakCalls: number
+  offPeakCalls: number
+  /// Codex credits summed per call (an alias's rate can depend on the call's
+  /// date); null until a call is rated. creditsUnrated marks any unrated call.
+  credits: number | null
+  creditsUnrated: boolean
 }
 
 type ModelKey = string
 type CategoryKey = TaskCategory
 
-function bucketKey(provider: string, model: string, category: TaskCategory | null, agentType: string | null): string {
-  return `${provider} ${model} ${category ?? ''} ${agentType ?? ''}`
+/// Canonical identity of one SKU through one door: the alias-resolved id plus
+/// the door's suffix from the row key — never the route id. Two route ids can
+/// share one label (a door with two endpoint names), and folding on the id
+/// then prints two rows the reader cannot tell apart while every label-keyed
+/// surface shows one. The id is NOT peeled to its base: `us.anthropic.…`
+/// prices above `anthropic.…` and stays its own row, exactly as before #1450.
+/// Exported for the test that pins the row key, not the id, as the fold.
+export function modelFoldKey(model: string, routeId: string | null): string {
+  return `${resolveCanonicalModelId(model)} ${routeSuffix(model, routeId)}`
+}
+
+function rowFoldKey(row: Pick<ModelReportRow, 'provider' | 'model' | 'route'>): string {
+  return `${row.provider} ${modelFoldKey(row.model, row.route)}`
+}
+
+/// Provider-first label with the route kept visible. A provider's own table
+/// may already name the model ("Sonnet 4.5"); when the call went through a
+/// door, the door's label is appended the same way modelRowKey does it, so
+/// `models` reads "Sonnet 4.5 (Bedrock)" exactly where the menubar and the
+/// overview do. Without a route the provider label is returned unchanged.
+function routedDisplayName(providerLabel: string, model: string, routeId: string | null): string {
+  const suffix = routeSuffix(model, routeId)
+  if (!suffix) return providerLabel
+  // The provider had no local name for a Bedrock id and echoed it (or the
+  // global short name of it): the row key already resolves the base model.
+  if (providerLabel === model || providerLabel === getShortModelName(model)) return modelRowKey(model, routeId)
+  return providerLabel.endsWith(suffix) ? providerLabel : `${providerLabel} ${suffix}`
+}
+
+function bucketKey(provider: string, model: string, route: string | null, category: TaskCategory | null, agentType: string | null): string {
+  return `${provider} ${model} ${route ?? ''} ${category ?? ''} ${agentType ?? ''}`
+}
+
+/// Additive peak-hours merge (#peak-hours): buckets fold into a row only when
+/// they share one canonical id, so the split sums cleanly across folded
+/// aliases. A row whose calls all landed `unknown` keeps null fields (never
+/// guessed); the kind is set only while the split is non-empty.
+function peakSplitForRow(bucket: Bucket): Pick<ModelReportRow, 'peakUSD' | 'offPeakUSD' | 'peakCalls' | 'offPeakCalls' | 'peakKind'> {
+  if (!bucket.peakKind || (bucket.peakCostUSD === 0 && bucket.offPeakCostUSD === 0)) {
+    return { peakUSD: null, offPeakUSD: null, peakCalls: null, offPeakCalls: null }
+  }
+  return {
+    peakUSD: bucket.peakCostUSD,
+    offPeakUSD: bucket.offPeakCostUSD,
+    peakCalls: bucket.peakCalls,
+    offPeakCalls: bucket.offPeakCalls,
+    peakKind: bucket.peakKind,
+  }
+}
+
+function mergePeakSplit(row: ModelReportRow, bucket: Bucket): void {
+  if (!bucket.peakKind || (bucket.peakCostUSD === 0 && bucket.offPeakCostUSD === 0)) return
+  row.peakUSD = (row.peakUSD ?? 0) + bucket.peakCostUSD
+  row.offPeakUSD = (row.offPeakUSD ?? 0) + bucket.offPeakCostUSD
+  row.peakCalls = (row.peakCalls ?? 0) + bucket.peakCalls
+  row.offPeakCalls = (row.offPeakCalls ?? 0) + bucket.offPeakCalls
+  row.peakKind = bucket.peakKind
 }
 
 /// Walks every parsed turn, attributes each assistant call to a
-/// (provider, model, category, agent) bucket, and returns rows keyed by
-/// (provider, model) by default, (provider, model, category) under `byTask`, or
-/// (provider, model, agent) under `byAgent`.
+/// (provider, raw-model, category, agent) bucket, then merges buckets that
+/// resolve to the same provider + alias-resolved canonical id. Display names
+/// stay cosmetic. Returned rows are keyed by (provider, canonical id) by
+/// default, plus category under `byTask` or agent under `byAgent`.
 ///
 /// Default view: rows sorted by cost descending.
 /// byTask / byAgent view: rows grouped by (provider, model) so the renderer can
@@ -99,12 +208,14 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
           // their spend all lands under '(main)'. That is correct: the report never
           // fabricates an agent for calls that were not driven by one.
           const agentType: string | null = opts.byAgent ? (session.agentType ?? '(main)') : null
-          const key = bucketKey(provider, model, category, agentType)
+          const route = call.route ?? null
+          const key = bucketKey(provider, model, route, category, agentType)
           let bucket = buckets.get(key)
           if (!bucket) {
             bucket = {
               provider,
               model,
+              route,
               category,
               agentType,
               inputTokens: 0,
@@ -112,14 +223,22 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
               cacheWriteTokens: 0,
               cacheReadTokens: 0,
               costUSD: 0,
+              estimatedCostUSD: 0,
               savingsUSD: 0,
               savingsBaselineModel: '',
               calls: 0,
+              peakKind: peakBillingKind(provider, model),
+              peakCostUSD: 0,
+              offPeakCostUSD: 0,
+              peakCalls: 0,
+              offPeakCalls: 0,
+              credits: null,
+              creditsUnrated: false,
             }
             buckets.set(key, bucket)
           }
           bucket.inputTokens += call.usage.inputTokens
-          bucket.outputTokens += call.usage.outputTokens + call.usage.reasoningTokens
+          bucket.outputTokens += billableOutputTokens(provider, call.usage.outputTokens, call.usage.reasoningTokens)
           bucket.cacheWriteTokens += call.usage.cacheCreationInputTokens
           // cacheReadInputTokens (Anthropic vocab) and cachedInputTokens (OpenAI vocab)
           // are two names for the same thing. Providers populate one or set both to the
@@ -127,13 +246,46 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
           // provider that fills both fields.
           bucket.cacheReadTokens += Math.max(call.usage.cacheReadInputTokens, call.usage.cachedInputTokens)
           bucket.costUSD += call.costUSD
+          if (call.isEstimated) bucket.estimatedCostUSD += call.costUSD
           bucket.savingsUSD += call.savingsUSD ?? 0
+          // outputTokens is the billable output (for Codex that includes
+          // reasoning, so nothing is added on top), and inputTokens is
+          // non-cached with the cache read holding cached input - exactly what
+          // the credit rates expect.
+          if (provider === 'codex') {
+            const credits = codexCredits(model, {
+              inputTokens: call.usage.inputTokens,
+              cachedReadTokens: Math.max(call.usage.cacheReadInputTokens, call.usage.cachedInputTokens),
+              outputTokens: billableOutputTokens(provider, call.usage.outputTokens, call.usage.reasoningTokens),
+            }, call.timestamp)
+            if (credits === null) bucket.creditsUnrated = true
+            else bucket.credits = (bucket.credits ?? 0) + credits
+          }
           if (!bucket.savingsBaselineModel && call.savingsBaselineModel) {
             bucket.savingsBaselineModel = call.savingsBaselineModel
           }
-          bucket.calls += 1
+          // Supplementary accounting calls keep their tokens and cost above but are not
+          // distinct requests, so they add no call weight (see behavioral-weight.ts).
+          const callWeight = behavioralCallWeight(call)
+          bucket.calls += callWeight
+          // Peak-hours split (#peak-hours): classify from the call's own
+          // timestamp, never guessed — unknown when the route has no
+          // first-party peak regime or the timestamp is missing/invalid.
+          // Both legs carry the stored list-rate cost, so the split is a
+          // consumption share that adds back up to costUSD; the vendor's
+          // bill, not this report, applies the off-peak discount.
+          if (bucket.peakKind) {
+            const peak = classifyPeak(provider, model, call.timestamp)
+            if (peak === 'peak') {
+              bucket.peakCostUSD += call.costUSD
+              bucket.peakCalls += callWeight
+            } else if (peak === 'off-peak') {
+              bucket.offPeakCostUSD += call.costUSD
+              bucket.offPeakCalls += callWeight
+            }
+          }
 
-          const modelKey = `${provider} ${model}`
+          const modelKey = `${provider} ${model} ${route ?? ''}`
           let perCat = perModelCategoryCost.get(modelKey)
           if (!perCat) {
             perCat = new Map()
@@ -153,73 +305,138 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
     const p = await getProvider(name)
     const entry = {
       displayName: p?.displayName ?? name,
-      formatModel: p ? (m: string) => p.modelDisplayName(m) : (m: string) => m,
+      formatModel: p
+        ? (m: string) => sanitizeModelForDisplay(fallbackRawModelDisplayName(p.modelDisplayName(m), m))
+        : (m: string) => sanitizeModelForDisplay(getShortModelName(m)),
     }
     providerCache.set(name, entry)
     return entry
   }
 
-  const rows: ModelReportRow[] = []
+  const rowsByKey = new Map<string, ModelReportRow>()
+  const foldedCategoryCost = new Map<string, Map<CategoryKey, number>>()
+  const foldedTotalCost = new Map<string, number>()
+  const foldedRawSeen = new Set<string>()
+  // Empty string on the row means both "none seen" and "conflict". Track
+  // distinct non-empty baselines separately so a later bucket cannot
+  // repopulate a conflict that was already detected.
+  const baselinesByKey = new Map<string, Set<string>>()
+
   for (const bucket of buckets.values()) {
     const meta = await resolveProvider(bucket.provider)
+    // Fold by canonical id AND the row key's door suffix, and label the row
+    // with the same key every other surface uses (modelRowKey), so `models`,
+    // the menubar payload and the overview agree on what one row is. The
+    // route is the persisted one when the provider recorded it, else what the
+    // id's shape names.
+    const routeId = getRouteById(bucket.route)?.id ?? getModelRoute(bucket.model)?.id ?? null
+    const modelDisplayName = sanitizeModelForDisplay(routedDisplayName(meta.formatModel(bucket.model), bucket.model, routeId))
+    const canonicalId = modelFoldKey(bucket.model, routeId)
+    const resolvedKey = bucketKey(bucket.provider, canonicalId, null, bucket.category, bucket.agentType)
+    const foldKey = `${bucket.provider} ${canonicalId}`
     const total = bucket.inputTokens + bucket.outputTokens + bucket.cacheWriteTokens + bucket.cacheReadTokens
-    const row: ModelReportRow = {
-      provider: bucket.provider,
-      providerDisplayName: meta.displayName,
-      model: bucket.model,
-      modelDisplayName: meta.formatModel(bucket.model),
-      category: bucket.category,
-      agentType: bucket.agentType,
-      inputTokens: bucket.inputTokens,
-      outputTokens: bucket.outputTokens,
-      cacheWriteTokens: bucket.cacheWriteTokens,
-      cacheReadTokens: bucket.cacheReadTokens,
-      totalTokens: total,
-      costUSD: bucket.costUSD,
-      savingsUSD: bucket.savingsUSD,
-      savingsBaselineModel: bucket.savingsBaselineModel,
-      calls: bucket.calls,
-      // outputTokens already includes reasoning (folded in above), and for Codex
-      // inputTokens is non-cached with cacheReadTokens holding cached input, which
-      // is exactly what the credit rates expect.
-      credits: bucket.provider === 'codex'
-        ? codexCredits(bucket.model, {
-            inputTokens: bucket.inputTokens,
-            cachedReadTokens: bucket.cacheReadTokens,
-            outputTokens: bucket.outputTokens,
-          })
-        : null,
+    // Sum the rated calls and flag the row incomplete when any contributor is
+    // unrated — nulling the whole merge would zero a real menubar total.
+    const bucketCredits = bucket.credits
+    const bucketCreditsIncomplete = bucketCredits !== null && bucket.creditsUnrated
+
+    const baselines = baselinesByKey.get(resolvedKey) ?? new Set<string>()
+    if (bucket.savingsBaselineModel) baselines.add(bucket.savingsBaselineModel)
+    baselinesByKey.set(resolvedKey, baselines)
+    const resolvedBaseline = baselines.size === 1 ? [...baselines][0]! : ''
+
+    const existing = rowsByKey.get(resolvedKey)
+    if (existing) {
+      existing.inputTokens += bucket.inputTokens
+      existing.outputTokens += bucket.outputTokens
+      existing.cacheWriteTokens += bucket.cacheWriteTokens
+      existing.cacheReadTokens += bucket.cacheReadTokens
+      existing.totalTokens += total
+      existing.costUSD += bucket.costUSD
+      existing.estimatedCostUSD += bucket.estimatedCostUSD
+      existing.savingsUSD += bucket.savingsUSD
+      existing.calls += bucket.calls
+      mergePeakSplit(existing, bucket)
+      existing.savingsBaselineModel = resolvedBaseline
+      if (!existing.rawModels.includes(bucket.model)) existing.rawModels.push(bucket.model)
+      const existingRated = existing.credits !== null
+      const incomingRated = bucketCredits !== null
+      if (incomingRated) existing.credits = (existing.credits ?? 0) + bucketCredits
+      if (existingRated !== incomingRated || bucketCreditsIncomplete) existing.creditsIncomplete = true
+    } else {
+      rowsByKey.set(resolvedKey, {
+        provider: bucket.provider,
+        providerDisplayName: meta.displayName,
+        model: bucket.model,
+        modelDisplayName,
+        route: routeId,
+        category: bucket.category,
+        agentType: bucket.agentType,
+        inputTokens: bucket.inputTokens,
+        outputTokens: bucket.outputTokens,
+        cacheWriteTokens: bucket.cacheWriteTokens,
+        cacheReadTokens: bucket.cacheReadTokens,
+        totalTokens: total,
+        costUSD: bucket.costUSD,
+        estimatedCostUSD: bucket.estimatedCostUSD,
+        savingsUSD: bucket.savingsUSD,
+        savingsBaselineModel: resolvedBaseline,
+        calls: bucket.calls,
+        rawModels: [bucket.model],
+        credits: bucketCredits,
+        ...(bucketCreditsIncomplete ? { creditsIncomplete: true } : {}),
+        ...peakSplitForRow(bucket),
+      })
     }
 
-    if (!opts.byTask && !opts.byAgent) {
-      const perCat = perModelCategoryCost.get(`${bucket.provider} ${bucket.model}`)
-      if (perCat && perCat.size > 0) {
-        let topCat: TaskCategory = 'general'
-        let topCost = -1
-        let totalCost = 0
-        for (const [cat, cost] of perCat.entries()) {
-          totalCost += cost
-          if (cost > topCost) {
-            topCost = cost
-            topCat = cat
-          }
+    const rawKey = `${bucket.provider} ${bucket.model} ${bucket.route ?? ''}`
+    if (!foldedRawSeen.has(rawKey)) {
+      foldedRawSeen.add(rawKey)
+      const rawCat = perModelCategoryCost.get(rawKey)
+      if (rawCat) {
+        let folded = foldedCategoryCost.get(foldKey)
+        if (!folded) {
+          folded = new Map()
+          foldedCategoryCost.set(foldKey, folded)
         }
-        row.topCategory = topCat
-        row.topCategoryCost = topCost
-        row.topCategoryShare = totalCost > 0 ? topCost / totalCost : 0
+        for (const [cat, cost] of rawCat) {
+          folded.set(cat, (folded.get(cat) ?? 0) + cost)
+        }
+      }
+      foldedTotalCost.set(
+        foldKey,
+        (foldedTotalCost.get(foldKey) ?? 0) + (perModelTotalCost.get(rawKey) ?? 0),
+      )
+    }
+  }
+
+  const rows = [...rowsByKey.values()]
+  for (const row of rows) {
+    if (opts.byTask || opts.byAgent) continue
+    const perCat = foldedCategoryCost.get(rowFoldKey(row))
+    if (!perCat || perCat.size === 0) continue
+    let topCat: TaskCategory = 'general'
+    let topCost = -1
+    let totalCost = 0
+    for (const [cat, cost] of perCat.entries()) {
+      totalCost += cost
+      if (cost > topCost) {
+        topCost = cost
+        topCat = cat
       }
     }
-
-    rows.push(row)
+    row.topCategory = topCat
+    row.topCategoryCost = topCost
+    row.topCategoryShare = totalCost > 0 ? topCost / totalCost : 0
   }
 
   if (opts.byTask || opts.byAgent) {
     rows.sort((a, b) => {
-      const aTotal = perModelTotalCost.get(`${a.provider} ${a.model}`) ?? 0
-      const bTotal = perModelTotalCost.get(`${b.provider} ${b.model}`) ?? 0
+      const aTotal = foldedTotalCost.get(rowFoldKey(a)) ?? 0
+      const bTotal = foldedTotalCost.get(rowFoldKey(b)) ?? 0
       if (aTotal !== bTotal) return bTotal - aTotal
       if (a.provider !== b.provider) return a.provider.localeCompare(b.provider)
-      if (a.model !== b.model) return a.model.localeCompare(b.model)
+      if (a.modelDisplayName !== b.modelDisplayName) return a.modelDisplayName.localeCompare(b.modelDisplayName)
       return (b.costUSD + b.savingsUSD) - (a.costUSD + a.savingsUSD)
     })
   } else {
@@ -236,6 +453,14 @@ export async function aggregateModels(projects: ProjectSummary[], opts: Aggregat
     filtered = filtered.slice(0, opts.topN)
   }
   return filtered
+}
+
+/// One-line "peak X / off-peak Y" cell (#peak-hours): list-rate consumption
+/// shares that add back up to the row's cost. '-' when the row carries no
+/// split.
+export function formatPeakSplit(row: Pick<ModelReportRow, 'peakUSD' | 'offPeakUSD' | 'peakKind'>): string {
+  if (row.peakUSD == null && row.offPeakUSD == null) return '-'
+  return `${formatCost(row.peakUSD ?? 0)} / ${formatCost(row.offPeakUSD ?? 0)}`
 }
 
 function visibleLength(text: string): number {
@@ -277,7 +502,7 @@ type Column = {
   /// Drop priority. 0 = always shown; higher numbers get dropped first when
   /// the terminal is narrow.
   priority: number
-  key: 'provider' | 'model' | 'task' | 'input' | 'output' | 'cacheWrite' | 'cacheRead' | 'total' | 'cost' | 'saved'
+  key: 'provider' | 'model' | 'task' | 'input' | 'output' | 'cacheWrite' | 'cacheRead' | 'total' | 'cost' | 'saved' | 'peak'
 }
 
 type TableRenderOptions = {
@@ -302,13 +527,14 @@ const DROP_COLUMN_GROUPS: Array<Array<Column['key']>> = [
   ['saved'],
 ]
 
-function defaultColumns(byTask: boolean, byAgent: boolean, showSaved: boolean): Column[] {
+function defaultColumns(byTask: boolean, byAgent: boolean, showSaved: boolean, showPeak = false): Column[] {
   // Higher priority numbers drop FIRST when the terminal is narrow.
   // Cache columns are the cheapest to lose, then input/output, then top-task.
   // Provider/Model/Total/Cost stay regardless. The Saved column only appears
   // when local-model savings actually exist (a `codeburn model-savings`
   // mapping produced nonzero avoided spend); otherwise it would be a column of
-  // dashes for the majority of users, so it is omitted entirely.
+  // dashes for the majority of users, so it is omitted entirely. Same rule
+  // for Peak: only when some row carries a peak/off-peak split.
   // Widths are MINIMUMS; sizeColumnsToContent() expands them to fit cell text.
   return [
     { key: 'provider',   header: 'Provider',                          align: 'left',  width: 8,  priority: 0 },
@@ -321,6 +547,7 @@ function defaultColumns(byTask: boolean, byAgent: boolean, showSaved: boolean): 
     { key: 'total',      header: 'Total',                      align: 'right', width: 6,  priority: 0 },
     { key: 'cost',       header: 'Cost',                       align: 'right', width: 6,  priority: 0 },
     ...(showSaved ? [{ key: 'saved' as const, header: 'Saved', align: 'right' as const, width: 6, priority: 0 }] : []),
+    ...(showPeak ? [{ key: 'peak' as const, header: 'Peak / Off-peak', align: 'right' as const, width: 15, priority: 1 }] : []),
   ]
 }
 
@@ -345,8 +572,8 @@ function frameWidth(columns: Column[]): number {
   return 2 + columns.reduce((acc, c) => acc + c.width + 2, 0) + (columns.length - 1)
 }
 
-function chooseColumns(byTask: boolean, byAgent: boolean, available: number, showSaved: boolean): Column[] {
-  const all = defaultColumns(byTask, byAgent, showSaved)
+function chooseColumns(byTask: boolean, byAgent: boolean, available: number, showSaved: boolean, showPeak = false): Column[] {
+  const all = defaultColumns(byTask, byAgent, showSaved, showPeak)
   if (frameWidth(all) <= available) return all
 
   // Drop in this order so the table degrades sensibly. Cache columns drop as
@@ -453,6 +680,8 @@ export function renderTable(
   const fullWidth = opts.fullWidth ?? true
   // Only render the Saved column when something was actually saved.
   const showSaved = rows.some(r => r.savingsUSD > 0)
+  // Same rule for the Peak column: only when a row carries a split.
+  const showPeak = rows.some(r => r.peakUSD != null || r.offPeakUSD != null)
 
   const valueOf = (row: ModelReportRow, key: Column['key'], isNewGroup: boolean): string => {
     switch (key) {
@@ -469,8 +698,10 @@ export function renderTable(
       case 'cacheWrite': return formatTokens(row.cacheWriteTokens)
       case 'cacheRead':  return formatTokens(row.cacheReadTokens)
       case 'total':      return formatTokens(row.totalTokens)
-      case 'cost':       return formatCost(row.costUSD)
+      case 'cost':       return markEstimated(formatCost(row.costUSD), isEstimatedCost(row.costUSD, row.estimatedCostUSD))
       case 'saved':      return row.savingsUSD > 0 ? formatCost(row.savingsUSD) : chalk.dim('-')
+      case 'peak':
+        return (row.peakUSD != null || row.offPeakUSD != null) ? formatPeakSplit(row) : chalk.dim('-')
     }
   }
 
@@ -479,10 +710,10 @@ export function renderTable(
   const rowEntries: RowCells[] = []
   let prevProviderModel = ''
   for (const row of rows) {
-    const groupKey = `${row.provider} ${row.model}`
+    const groupKey = `${row.provider} ${row.modelDisplayName}`
     const isNewGroup = !grouped || groupKey !== prevProviderModel
     prevProviderModel = groupKey
-    const allCells = defaultColumns(byTask, byAgent, showSaved).map(col => {
+    const allCells = defaultColumns(byTask, byAgent, showSaved, showPeak).map(col => {
       const raw = valueOf(row, col.key, isNewGroup)
       if (col.key === 'provider' && raw) return chalk.dim(raw)
       return raw
@@ -501,11 +732,14 @@ export function renderTable(
         acc.total += r.totalTokens
         acc.cost += r.costUSD
         acc.savings += r.savingsUSD
+        acc.peak += r.peakUSD ?? 0
+        acc.offPeak += r.offPeakUSD ?? 0
         return acc
       },
-      { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, total: 0, cost: 0, savings: 0 },
+      { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, total: 0, cost: 0, savings: 0, peak: 0, offPeak: 0 },
     )
-    const cells = defaultColumns(byTask, byAgent, showSaved).map(col => {
+    const totalsPeak = { peakUSD: totals.peak, offPeakUSD: totals.offPeak, peakKind: undefined } as const
+    const cells: string[] = defaultColumns(byTask, byAgent, showSaved, showPeak).map(col => {
       switch (col.key) {
         case 'provider':   return ''
         case 'model':      return chalk.yellow.bold('Total')
@@ -517,6 +751,7 @@ export function renderTable(
         case 'total':      return chalk.yellow.bold(formatTokens(totals.total))
         case 'cost':       return chalk.yellow.bold(formatCost(totals.cost))
         case 'saved':      return totals.savings > 0 ? chalk.yellow.bold(formatCost(totals.savings)) : chalk.dim('-')
+        case 'peak':       return showPeak ? chalk.yellow.bold(formatPeakSplit(totalsPeak)) : chalk.dim('-')
       }
     })
     totalsEntry = { kind: 'totals', cells, isNewGroup: true }
@@ -525,9 +760,9 @@ export function renderTable(
   // Pick which columns to include based on terminal width, then size them.
   // We index into `cells` by the column key to avoid object-identity pitfalls
   // across defaultColumns() invocations.
-  const allKeys = defaultColumns(byTask, byAgent, showSaved).map(c => c.key)
+  const allKeys = defaultColumns(byTask, byAgent, showSaved, showPeak).map(c => c.key)
   const indexByKey = new Map(allKeys.map((k, i) => [k, i]))
-  const columns = chooseColumns(byTask, byAgent, available, showSaved)
+  const columns = chooseColumns(byTask, byAgent, available, showSaved, showPeak)
   const projectColumns = (cols: Column[], entry: RowCells) =>
     cols.map(c => entry.cells[indexByKey.get(c.key)!] ?? '')
   const cellMatrix = [
@@ -587,6 +822,8 @@ export function renderJson(rows: ModelReportRow[]): string {
       providerDisplayName: r.providerDisplayName,
       model: r.model,
       modelDisplayName: r.modelDisplayName,
+      rawModels: r.rawModels,
+      route: r.route,
       category: r.category ?? r.topCategory ?? null,
       agentType: r.agentType ?? null,
       topCategory: r.topCategory ?? null,
@@ -601,6 +838,21 @@ export function renderJson(rows: ModelReportRow[]): string {
       savingsUSD: r.savingsUSD,
       savingsBaselineModel: r.savingsBaselineModel,
       credits: r.credits,
+      creditsIncomplete: r.creditsIncomplete === true,
+      estimatedCostUSD: r.estimatedCostUSD,
+      isEstimated: isEstimatedCost(r.costUSD, r.estimatedCostUSD),
+      // Peak keys exist only on rows that carry a split: a report with no
+      // DeepSeek/Z.ai first-party usage keeps its exact historical shape,
+      // instead of five null keys on every row.
+      ...(r.peakUSD != null || r.offPeakUSD != null
+        ? {
+            peakUSD: r.peakUSD,
+            offPeakUSD: r.offPeakUSD,
+            peakCalls: r.peakCalls ?? null,
+            offPeakCalls: r.offPeakCalls ?? null,
+            peakKind: r.peakKind ?? null,
+          }
+        : {}),
     })),
     null,
     2,
@@ -629,8 +881,9 @@ export function renderMarkdown(rows: ModelReportRow[], opts: { byTask?: boolean;
   const byAgent = opts.byAgent ?? false
   const showTotals = opts.showTotals ?? true
 
-  const header = ['Provider', 'Model', thirdColumnHeader(byTask, byAgent), 'Input', 'Output', 'Cache Write', 'Cache Read', 'Total', 'Cost', 'Saved']
-  const align = ['---', '---', '---', '---:', '---:', '---:', '---:', '---:', '---:', '---:']
+  const showPeak = rows.some(r => r.peakUSD != null || r.offPeakUSD != null)
+  const header = ['Provider', 'Model', thirdColumnHeader(byTask, byAgent), 'Input', 'Output', 'Cache Write', 'Cache Read', 'Total', 'Cost', 'Saved', ...(showPeak ? ['Peak / Off-peak'] : [])]
+  const align = ['---', '---', '---', '---:', '---:', '---:', '---:', '---:', '---:', '---:', ...(showPeak ? ['---:'] : [])]
 
   const lines: string[] = []
   lines.push(`| ${header.join(' | ')} |`)
@@ -653,8 +906,9 @@ export function renderMarkdown(rows: ModelReportRow[], opts: { byTask?: boolean;
       formatTokens(row.cacheWriteTokens),
       formatTokens(row.cacheReadTokens),
       formatTokens(row.totalTokens),
-      formatCost(row.costUSD),
+      markEstimated(formatCost(row.costUSD), isEstimatedCost(row.costUSD, row.estimatedCostUSD)),
       row.savingsUSD > 0 ? formatCost(row.savingsUSD) : '-',
+      ...(showPeak ? [formatPeakSplit(row)] : []),
     ]
     lines.push(`| ${cells.join(' | ')} |`)
   }
@@ -669,9 +923,11 @@ export function renderMarkdown(rows: ModelReportRow[], opts: { byTask?: boolean;
         acc.total += r.totalTokens
         acc.cost += r.costUSD
         acc.savings += r.savingsUSD
+        acc.peak += r.peakUSD ?? 0
+        acc.offPeak += r.offPeakUSD ?? 0
         return acc
       },
-      { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, total: 0, cost: 0, savings: 0 },
+      { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, total: 0, cost: 0, savings: 0, peak: 0, offPeak: 0 },
     )
     const totalCells = [
       '',
@@ -684,9 +940,11 @@ export function renderMarkdown(rows: ModelReportRow[], opts: { byTask?: boolean;
       `**${formatTokens(totals.total)}**`,
       `**${formatCost(totals.cost)}**`,
       totals.savings > 0 ? `**${formatCost(totals.savings)}**` : '-',
+      ...(showPeak ? [`**${formatPeakSplit({ peakUSD: totals.peak, offPeakUSD: totals.offPeak })}**`] : []),
     ]
     lines.push(`| ${totalCells.join(' | ')} |`)
   }
+  if (rows.some(r => isEstimatedCost(r.costUSD, r.estimatedCostUSD))) lines.push('', `_${ESTIMATED_COST_LEGEND}_`)
 
   return lines.join('\n')
 }
@@ -696,12 +954,27 @@ export function renderCsv(rows: ModelReportRow[], opts: { byTask?: boolean; byAg
   const byAgent = opts.byAgent ?? false
   // CSV intentionally repeats provider/model on every row so downstream
   // consumers can sort/filter without first reconstructing the grouping.
+  // Peak columns are appended only when a row carries a split, so existing
+  // consumers never see new columns on data that has no peak-hours content.
+  const showPeak = rows.some(r => r.peakUSD != null || r.offPeakUSD != null)
+  const peakHeader = ['peak_usd', 'off_peak_usd', 'peak_calls', 'off_peak_calls', 'peak_kind']
   const header = byAgent
-    ? ['provider', 'model', 'agent', 'input_tokens', 'output_tokens', 'cache_write_tokens', 'cache_read_tokens', 'total_tokens', 'calls', 'cost_usd', 'savings_usd', 'savings_baseline_model']
+    ? ['provider', 'model', 'agent', 'input_tokens', 'output_tokens', 'cache_write_tokens', 'cache_read_tokens', 'total_tokens', 'calls', 'cost_usd', 'savings_usd', 'savings_baseline_model', ...(showPeak ? peakHeader : [])]
     : byTask
-    ? ['provider', 'model', 'task', 'input_tokens', 'output_tokens', 'cache_write_tokens', 'cache_read_tokens', 'total_tokens', 'calls', 'cost_usd', 'savings_usd', 'savings_baseline_model']
-    : ['provider', 'model', 'top_task', 'top_task_share', 'input_tokens', 'output_tokens', 'cache_write_tokens', 'cache_read_tokens', 'total_tokens', 'calls', 'cost_usd', 'savings_usd', 'savings_baseline_model']
+    ? ['provider', 'model', 'task', 'input_tokens', 'output_tokens', 'cache_write_tokens', 'cache_read_tokens', 'total_tokens', 'calls', 'cost_usd', 'savings_usd', 'savings_baseline_model', ...(showPeak ? peakHeader : [])]
+    : ['provider', 'model', 'top_task', 'top_task_share', 'input_tokens', 'output_tokens', 'cache_write_tokens', 'cache_read_tokens', 'total_tokens', 'calls', 'cost_usd', 'savings_usd', 'savings_baseline_model', ...(showPeak ? peakHeader : [])]
   const lines: string[] = [header.join(',')]
+  // Peak cells appended only with the peak header, so rows without a split
+  // keep the exact historical shape.
+  const peakCells = (r: ModelReportRow): string[] => showPeak
+    ? [
+        r.peakUSD != null ? r.peakUSD.toFixed(6) : '',
+        r.offPeakUSD != null ? r.offPeakUSD.toFixed(6) : '',
+        r.peakCalls != null ? String(r.peakCalls) : '',
+        r.offPeakCalls != null ? String(r.offPeakCalls) : '',
+        r.peakKind ?? '',
+      ]
+    : []
   for (const r of rows) {
     const cells = byAgent
       ? [
@@ -717,6 +990,7 @@ export function renderCsv(rows: ModelReportRow[], opts: { byTask?: boolean; byAg
           r.costUSD.toFixed(6),
           (r.savingsUSD ?? 0).toFixed(6),
           csvEscape(r.savingsBaselineModel),
+          ...peakCells(r),
         ]
       : byTask
       ? [
@@ -732,6 +1006,7 @@ export function renderCsv(rows: ModelReportRow[], opts: { byTask?: boolean; byAg
           r.costUSD.toFixed(6),
           (r.savingsUSD ?? 0).toFixed(6),
           csvEscape(r.savingsBaselineModel),
+          ...peakCells(r),
         ]
       : [
           csvEscape(r.providerDisplayName),
@@ -747,6 +1022,7 @@ export function renderCsv(rows: ModelReportRow[], opts: { byTask?: boolean; byAg
           r.costUSD.toFixed(6),
           (r.savingsUSD ?? 0).toFixed(6),
           csvEscape(r.savingsBaselineModel),
+          ...peakCells(r),
         ]
     lines.push(cells.join(','))
   }

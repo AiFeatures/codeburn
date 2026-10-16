@@ -1,7 +1,7 @@
 {
   "name": "codeburn-desktop",
   "private": true,
-  "version": "0.9.19",
+  "version": "0.9.27",
   "description": "CodeBurn Desktop — Electron app fed by the codeburn CLI",
   "main": "dist/electron/main.js",
   "scripts": {
@@ -12,36 +12,46 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "stage-cli": "npm --prefix .. run build:cli && node scripts/stage-cli.mjs",
+    "stage-menubar": "node scripts/stage-menubar.mjs --target nsis",
+    "stage-menubar:store": "node scripts/stage-menubar.mjs --target appx",
     "package": "npm run stage-cli && npm run build && electron-builder --mac",
     "package:arm64": "npm run stage-cli && npm run build && electron-builder --mac --arm64",
     "package:x64": "npm run stage-cli && npm run build && electron-builder --mac --x64",
-    "package:win": "npm run stage-cli && npm run build && electron-builder --win",
-    "package:linux": "npm run stage-cli && npm run build && electron-builder --linux"
+    "package:win": "npm run stage-cli && npm run stage-menubar && npm run build && electron-builder --win",
+    "package:win:arm64": "npm run stage-cli && npm run stage-menubar && npm run build && cross-env ELECTRON_BUILDER_7Z_FILTER=BCJ electron-builder --win nsis --arm64",
+    "package:store": "npm run stage-cli && npm run stage-menubar:store && npm run build && electron-builder --win appx --x64",
+    "package:linux": "npm run stage-cli && npm run build && electron-builder --linux",
+    "package:snap": "npm run stage-cli && npm run build && electron-builder --linux snap --x64",
+    "build:vscode": "vite build --config vite.vscode.config.ts"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@gsap/react": "^2.1.2",
+    "electron-updater": "^6.8.9",
     "gsap": "^3.15.0",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7"
+    "lz-string": "^1.5.0",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.9.1",
-    "@testing-library/react": "^16.3.2",
-    "@testing-library/user-event": "^14.6.1",
-    "@types/node": "^26.1.1",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^4.7.0",
     "@vitest/ui": "^3.2.7",
-    "concurrently": "^10.0.3",
+    "concurrently": "^10.0.5",
     "cross-env": "^10.1.0",
-    "electron": "^43.1.0",
+    "electron": "^43.7.5",
     "electron-builder": "^26.15.3",
     "jsdom": "^29.1.1",
     "typescript": "^7.0.2",
     "vite": "^6.4.3",
     "vitest": "^3.2.7",
-    "wait-on": "^9.0.10"
+    "wait-on": "^9.1.0"
   },
   "build": {
     "appId": "org.agentseal.codeburn-desktop",
@@ -55,6 +65,12 @@
       "package.json"
     ],
     "afterPack": "./scripts/after-pack.cjs",
+    "publish": [
+      {
+        "provider": "generic",
+        "url": "https://github.com/getagentseal/codeburn/releases/download/update-feeds"
+      }
+    ],
     "mac": {
       "target": [
         {
@@ -73,9 +89,11 @@
         }
       ],
       "category": "public.app-category.developer-tools",
-      "icon": "build/icon.png",
+      "icon": "build/icon.icns",
       "identity": "-",
       "hardenedRuntime": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
       "gatekeeperAssess": false,
       "extendInfo": {
         "NSDocumentsFolderUsageDescription": "CodeBurn reads your local AI coding tool session logs (Claude Code, Codex, Cursor, and others) to calculate your token usage and cost. Your data never leaves your machine.",
@@ -83,7 +101,28 @@
         "NSDownloadsFolderUsageDescription": "CodeBurn reads your local AI coding tool session logs (Claude Code, Codex, Cursor, and others) to calculate your token usage and cost. Your data never leaves your machine."
       }
     },
-    "dmg": {},
+    "dmg": {
+      "background": null,
+      "backgroundColor": "#ffffff",
+      "window": {
+        "width": 540,
+        "height": 380
+      },
+      "iconSize": 100,
+      "contents": [
+        {
+          "x": 150,
+          "y": 180,
+          "type": "file"
+        },
+        {
+          "x": 390,
+          "y": 180,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    },
     "win": {
       "target": [
         {
@@ -93,12 +132,37 @@
           ]
         }
       ],
-      "icon": "build/icon.png"
+      "icon": "build/icon.png",
+      "extraResources": [
+        {
+          "from": "build/menubar",
+          "to": "menubar",
+          "filter": [
+            "**/*"
+          ]
+        }
+      ]
     },
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "artifactName": "CodeBurn-Setup-${version}.${ext}"
+      "artifactName": "CodeBurn-Setup-${version}.${ext}",
+      "include": "build/installer.nsh"
+    },
+    "appx": {
+      "customExtensionsPath": "build/appx-extensions.xml",
+      "applicationId": "CodeBurn",
+      "identityName": "Codeburn.CodeBurn",
+      "publisher": "CN=3EFA3336-87E1-46F2-9DFA-2EB5A7693F89",
+      "publisherDisplayName": "Codeburn",
+      "displayName": "CodeBurn",
+      "artifactName": "CodeBurn-Store-${version}-${arch}.${ext}",
+      "backgroundColor": "#15100D",
+      "languages": [
+        "en-US"
+      ],
+      "minVersion": "10.0.17763.0",
+      "maxVersionTested": "10.0.26100.0"
     },
     "linux": {
       "target": [
@@ -125,6 +189,117 @@
       "icon": "build/icon.png",
       "maintainer": "AgentSeal <hello@agentseal.org>",
       "executableName": "codeburn"
+    },
+    "snap": {
+      "confinement": "strict",
+      "grade": "stable",
+      "summary": "See where your AI coding spend actually goes",
+      "artifactName": "codeburn_${version}_${arch}.${ext}",
+      "plugs": [
+        "desktop",
+        "desktop-legacy",
+        "home",
+        "x11",
+        "wayland",
+        "unity7",
+        "browser-support",
+        "network",
+        "gsettings",
+        "opengl",
+        {
+          "ai-agent-session-logs": {
+            "interface": "personal-files",
+            "read": [
+              "$HOME/.claude/projects",
+              "$HOME/.codex/sessions",
+              "$HOME/.codex/archived_sessions",
+              "$HOME/.cline/data/tasks",
+              "$HOME/.cline/data/sessions",
+              "$HOME/.codewhale/sessions",
+              "$HOME/.commandcode/projects",
+              "$HOME/.copilot/session-state",
+              "$HOME/.copilot/session-store.db",
+              "$HOME/.cursor/projects",
+              "$HOME/.cursor/ai-tracking/ai-code-tracking.db",
+              "$HOME/.deepseek/sessions",
+              "$HOME/.dsh/sessions",
+              "$HOME/.factory/sessions",
+              "$HOME/.gemini/tmp",
+              "$HOME/.gemini/antigravity/conversations",
+              "$HOME/.gemini/antigravity-cli/conversations",
+              "$HOME/.gemini/antigravity-cli/implicit",
+              "$HOME/.gemini/antigravity-ide/conversations",
+              "$HOME/.gemini/antigravity-ide/implicit",
+              "$HOME/.grok/sessions",
+              "$HOME/.hermes/profiles",
+              "$HOME/.hermes/state.db",
+              "$HOME/.kimi/sessions",
+              "$HOME/.kimi-code/sessions",
+              "$HOME/.kiro/sessions",
+              "$HOME/.lingtai",
+              "$HOME/.lingtai-tui",
+              "$HOME/.mux/sessions",
+              "$HOME/.mux/config.json",
+              "$HOME/.omp/agent/sessions",
+              "$HOME/.openclaude/projects",
+              "$HOME/.openclaw/agents",
+              "$HOME/.clawdbot/agents",
+              "$HOME/.moltbot/agents",
+              "$HOME/.moldbot/agents",
+              "$HOME/.pi/agent/sessions",
+              "$HOME/.qwen/projects",
+              "$HOME/.quickwork/profiles.json",
+              "$HOME/.quickwork/sessions",
+              "$HOME/.quickwork/metrics",
+              "$HOME/.vibe/logs/session",
+              "$HOME/.forge/.forge.db",
+              "$HOME/.zcode/cli/db/db.sqlite",
+              "$HOME/.config/Claude/local-agent-mode-sessions",
+              "$HOME/.config/Code/User/globalStorage/saoudrizwan.claude-dev/tasks",
+              "$HOME/.config/Code/User/globalStorage/kilocode.kilo-code/tasks",
+              "$HOME/.config/Code/User/globalStorage/github.copilot-chat",
+              "$HOME/.config/Code/User/globalStorage/emptyWindowChatSessions",
+              "$HOME/.config/Code/User/workspaceStorage",
+              "$HOME/.config/Code - Insiders/User/globalStorage/saoudrizwan.claude-dev/tasks",
+              "$HOME/.config/Code - Insiders/User/globalStorage/kilocode.kilo-code/tasks",
+              "$HOME/.config/Code - Insiders/User/globalStorage/github.copilot-chat",
+              "$HOME/.config/Code - Insiders/User/globalStorage/emptyWindowChatSessions",
+              "$HOME/.config/Code - Insiders/User/workspaceStorage",
+              "$HOME/.config/VSCodium/User/globalStorage/saoudrizwan.claude-dev/tasks",
+              "$HOME/.config/VSCodium/User/globalStorage/kilocode.kilo-code/tasks",
+              "$HOME/.config/VSCodium/User/globalStorage/github.copilot-chat",
+              "$HOME/.config/VSCodium/User/globalStorage/emptyWindowChatSessions",
+              "$HOME/.config/VSCodium/User/workspaceStorage",
+              "$HOME/.config/Cursor/User/globalStorage/state.vscdb",
+              "$HOME/.config/Cursor/User/workspaceStorage",
+              "$HOME/.config/Kiro/User/globalStorage/kiro.kiroagent",
+              "$HOME/.config/Kiro/User/workspaceStorage",
+              "$HOME/.config/Open Design/runs",
+              "$HOME/.config/Open Design/data/runs",
+              "$HOME/.config/Open Design/namespaces",
+              "$HOME/.kiro-server/data/User/globalStorage/kiro.kiroagent",
+              "$HOME/.config/IBM Bob/User/globalStorage/ibm.bob-code",
+              "$HOME/.config/Bob-IDE/User/globalStorage/ibm.bob-code",
+              "$HOME/.config/manicode/projects",
+              "$HOME/.local/share/zed/threads",
+              "$HOME/.local/share/opencode",
+              "$HOME/.local/share/crush",
+              "$HOME/.local/share/goose/sessions",
+              "$HOME/.local/share/amp/threads",
+              "$HOME/.local/share/kilo",
+              "$HOME/.local/share/zerostack/sessions"
+            ]
+          }
+        },
+        {
+          "claude-quota-credentials": {
+            "interface": "personal-files",
+            "read": [
+              "$HOME/.claude/.credentials.json"
+            ]
+          }
+        }
+      ]
     }
   },
   "homepage": "https://github.com/getagentseal/codeburn",

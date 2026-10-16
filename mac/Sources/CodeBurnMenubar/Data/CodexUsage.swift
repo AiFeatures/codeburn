@@ -31,7 +31,12 @@ struct CodexUsage: Sendable, Equatable {
             case .k12: "K-12"
             case .enterprise: "Enterprise"
             case .edu: "Edu"
-            case let .unknown(raw): raw.isEmpty ? "Subscription" : raw.capitalized
+            case let .unknown(raw):
+                raw.isEmpty
+                    ? "Subscription"
+                    : raw.replacingOccurrences(of: "_", with: " ")
+                         .replacingOccurrences(of: "-", with: " ")
+                         .capitalized
             }
         }
     }
@@ -69,11 +74,92 @@ struct CodexUsage: Sendable, Equatable {
     }
 
     /// Account-level limit-reset credits: grants that restore a rate-limit
-    /// window early, each with its own expiry. Only what the popover renders —
-    /// the available count and the soonest expiry among available credits.
+    /// window early, each with its own expiry. Carries what the popover renders
+    /// (the available count and the soonest expiry among available credits) plus
+    /// the per-credit identities a newly banked grant is detected from.
     struct ResetCredits: Sendable, Equatable {
+        /// One available credit, reduced to the three things a notice needs.
+        struct Grant: Sendable, Equatable, Codable {
+            /// Stable identity: the payload's `id`, else its raw `granted_at`
+            /// string. A credit carrying neither is left out entirely — it
+            /// cannot be told apart from the next one, so it must never be
+            /// announced as new.
+            let id: String
+            /// `reset_type` verbatim ("weekly", …). Nil when the payload omits it.
+            let resetType: String?
+            let grantedAt: Date?
+        }
+
         let availableCount: Int
+        /// `applicable_available_count`: how many of the available credits can be
+        /// applied right now. Nil when the payload omits it — which is not the
+        /// same as zero, so it is never defaulted.
+        let applicableAvailableCount: Int?
+        /// Available credits that carry a stable identity, in payload order.
+        let grants: [Grant]
         let nextExpiresAt: Date?
+
+        init(
+            availableCount: Int,
+            applicableAvailableCount: Int? = nil,
+            grants: [Grant] = [],
+            nextExpiresAt: Date? = nil
+        ) {
+            self.availableCount = availableCount
+            self.applicableAvailableCount = applicableAvailableCount
+            self.grants = grants
+            self.nextExpiresAt = nextExpiresAt
+        }
+
+        /// The most recently granted credit. Only credits that say when they were
+        /// granted can compete: "most recent" is a claim about time, and a credit
+        /// with no timestamp cannot support it.
+        var latestGrant: Grant? {
+            grants
+                .filter { $0.grantedAt != nil }
+                .max { ($0.grantedAt ?? .distantPast) < ($1.grantedAt ?? .distantPast) }
+        }
+    }
+
+    /// The monthly allowance an admin sets. Credit-metered workspaces report
+    /// `rate_limit: null`, so this is their only limit.
+    struct CreditLimit: Sendable, Equatable {
+        let used: Double
+        let limit: Double
+        let usedPercent: Double        // 0.0 ... 100.0
+        let resetsAt: Date?
+        /// Calendar month the allowance resets on, for pace projection. Not the
+        /// payload's `reset_after_seconds`, which is the time remaining.
+        let windowSeconds: Int?
+        /// Allowance already spent: a hard stop, not a near-limit warning.
+        let reached: Bool
+
+        /// `.halfUp` matches the desktop decoder's `Math.round`.
+        var displayLabel: String {
+            let formatter = NumberFormatter()
+            formatter.numberStyle = .decimal
+            formatter.maximumFractionDigits = 0
+            formatter.roundingMode = .halfUp
+            // `en_US`, not `en_US_POSIX`: the latter drops grouping entirely.
+            formatter.locale = Locale(identifier: "en_US")
+            func text(_ value: Double) -> String {
+                formatter.string(from: NSNumber(value: value)) ?? "\(Int(value.rounded()))"
+            }
+            // The two figures are already grouped by the formatter above, so
+            // they are substituted formatted and only the sentence is translated.
+            let base = L("Monthly usage limit · %1$@ / %2$@ credits", text(used), text(limit))
+            return reached ? L("%@ · limit reached", base) : base
+        }
+
+        var shortLabel: String {
+            reached ? L("Monthly usage limit · limit reached") : L("Monthly usage limit")
+        }
+
+        /// The identity behind `shortLabel`: pre-localization and free of the
+        /// `reached` state, so the early-reset monitor's storage key and name
+        /// survive a language switch and do not flip at the limit boundary —
+        /// the goodwill reset the monitor announces happens exactly there.
+        var storageLabel: String { "Monthly usage limit" }
     }
 
     let plan: PlanType
@@ -81,11 +167,17 @@ struct CodexUsage: Sendable, Equatable {
     let secondary: Window?
     let additionalLimits: [AdditionalLimit]
     let creditsBalance: Double?
+    /// Account settles in credits, not dollars, which changes `creditsBalance`.
+    let hasCredits: Bool
+    /// Uncapped on purpose, as distinct from a limit we failed to read.
+    let creditsUnlimited: Bool
+    let creditLimit: CreditLimit?
     let resetCredits: ResetCredits?
     let fetchedAt: Date
 
     static func planType(from raw: String?) -> PlanType {
-        guard let raw = raw?.lowercased() else { return .unknown("") }
+        guard let original = raw?.lowercased() else { return .unknown("") }
+        let raw = normalizePlanType(original)
         switch raw {
         case "guest": return .guest
         case "free": return .free
@@ -101,7 +193,28 @@ struct CodexUsage: Sendable, Equatable {
         case "k12": return .k12
         case "enterprise": return .enterprise
         case "edu": return .edu
+        // Normalized, so an unknown composite reads "Some Future Tier".
         default: return .unknown(raw)
         }
+    }
+
+    /// Credit-based-pricing tiers arrive composite (`enterprise_cbp_usage_based`).
+    private static func normalizePlanType(_ raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for suffix in ["_usage_based", "-usage-based", "_usage-based", "-usage_based"]
+        where value.hasSuffix(suffix) {
+            value.removeLast(suffix.count)
+        }
+        for prefix in ["self_serve_", "self-serve-", "self_serve-", "self-serve_"]
+        where value.hasPrefix(prefix) {
+            value.removeFirst(prefix.count)
+        }
+        for suffix in ["_cbp", "-cbp"] where value.hasSuffix(suffix) {
+            value.removeLast(suffix.count)
+        }
+        for infix in ["_cbp_", "-cbp-", "_cbp-", "-cbp_"] {
+            value = value.replacingOccurrences(of: infix, with: "_")
+        }
+        return value
     }
 }

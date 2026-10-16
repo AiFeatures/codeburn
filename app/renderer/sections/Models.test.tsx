@@ -20,6 +20,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Anthropic',
     model: 'claude-opus-4.8',
     modelDisplayName: 'Claude Opus 4.8',
+    rawModels: ['claude-opus-4.8'],
     category: null,
     topCategory: 'coding',
     topCategoryShare: 0.71,
@@ -39,6 +40,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Codex',
     model: 'gpt-5.5-codex',
     modelDisplayName: 'GPT-5.5 Codex',
+    rawModels: ['gpt-5.5-codex'],
     category: null,
     topCategory: 'debugging',
     topCategoryShare: 0.42,
@@ -58,6 +60,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Local',
     model: 'llama-local',
     modelDisplayName: 'Llama Local',
+    rawModels: ['llama-local'],
     category: null,
     inputTokens: 750_000,
     outputTokens: 400_000,
@@ -75,6 +78,7 @@ const rows: ModelReportRow[] = [
     providerDisplayName: 'Custom',
     model: 'my-proxy-model',
     modelDisplayName: 'my-proxy-model',
+    rawModels: ['my-proxy-model'],
     category: null,
     inputTokens: 4_800_000,
     outputTokens: 400_000,
@@ -164,8 +168,8 @@ describe('Models', () => {
     expect(screen.getByText('$35.10')).toHaveClass('pos')
 
     const dots = [...container.querySelectorAll('.mdot')]
-    expect(dots[0]).toHaveAttribute('style', expect.stringContaining('var(--s-opus)'))
-    expect(dots[1]).toHaveAttribute('style', expect.stringContaining('var(--s-gpt)'))
+    expect(dots[0]).toHaveAttribute('style', expect.stringContaining('var(--s-flagship)'))
+    expect(dots[1]).toHaveAttribute('style', expect.stringContaining('var(--s-balanced)'))
   })
 
   it('names the provider on each model row so duplicate model names stay distinguishable', async () => {
@@ -219,14 +223,21 @@ describe('Models', () => {
     expect(screen.queryByText('add alias ›')).not.toBeInTheDocument()
   })
 
-  it('renders unpriced proxy rows as dim with alias affordance and dashes', async () => {
+  it('renders unpriced proxy rows as dim with alias affordance, keeping observed tokens visible', async () => {
     getModels.mockResolvedValue([rows[3]])
 
     render(<Models period="30days" provider="all" />)
 
     expect(await screen.findByText('my-proxy-model')).toHaveClass('dim')
     expect(screen.getByText('add alias ›')).toHaveClass('alias')
-    expect(screen.getAllByText('—')).toHaveLength(5)
+    // Tokens are observed usage, not a pricing artifact: they render even
+    // though the model has no pricing entry. Cache read shows its known zero.
+    expect(screen.getByText('4.8M')).toBeInTheDocument()
+    expect(screen.getByText('400K')).toBeInTheDocument()
+    expect(screen.getByText('0')).toBeInTheDocument()
+    expect(screen.getByText('4.8M')).not.toHaveClass('dim')
+    // Only cost and saved collapse to dashes.
+    expect(screen.getAllByText('—')).toHaveLength(2)
     expect(screen.queryByText('$0.00')).not.toBeInTheDocument()
   })
 
@@ -270,6 +281,32 @@ describe('Models', () => {
     expect(screen.getByText('$252.00')).toBeInTheDocument()
     // Only the unpriced row (rates: null) is flagged estimated.
     expect(screen.getAllByText('est')).toHaveLength(1)
+  })
+
+  it('marks fully and partly estimated rows with ~ from the CLI estimated portion, and leaves exact rows plain', async () => {
+    const base = rows[0]!
+    getModels.mockResolvedValue([
+      { ...base, provider: 'cursor', providerDisplayName: 'Cursor', model: 'cursor-auto', modelDisplayName: 'Cursor (auto)', costUSD: 579.13, savingsUSD: 0, estimatedCostUSD: 579.13 },
+      { ...base, provider: 'kimi-code', providerDisplayName: 'Kimi Code', model: 'kimi-k3', modelDisplayName: 'Kimi K3', costUSD: 177.51, savingsUSD: 0, estimatedCostUSD: 20 },
+      { ...base, provider: 'codex', providerDisplayName: 'Codex', model: 'gpt-5.6-terra', modelDisplayName: 'GPT-5.6 Terra', costUSD: 1.44, savingsUSD: 0, estimatedCostUSD: 0.004 },
+      { ...base, savingsUSD: 0, estimatedCostUSD: 0 },
+      { ...base, provider: 'codex', providerDisplayName: 'Codex', model: 'gpt-5.5', modelDisplayName: 'GPT-5.5', costUSD: 0.0002, savingsUSD: 0, estimatedCostUSD: 0.0002 },
+    ])
+
+    render(<Models period="30days" provider="all" />)
+
+    const full = await screen.findByText('~$579.13')
+    expect(screen.getByText('~$177.51')).toBeInTheDocument()
+    expect(screen.getByText('$1.44')).toBeInTheDocument()
+    expect(screen.getByText('$331.20')).toBeInTheDocument()
+    expect(screen.queryByText('~$1.44')).toBeNull()
+    expect(screen.queryByText('~$331.20')).toBeNull()
+    const costCells = [...document.querySelectorAll('[data-usd]')].map(el => el.textContent)
+    expect(costCells).toContain('$0.00')
+    expect(costCells).not.toContain('~$0.00')
+
+    fireEvent.mouseEnter(full)
+    expect(await screen.findByText('~ estimated cost (priced from estimated tokens)')).toBeInTheDocument()
   })
 
   it('shows the audit empty state when there is nothing to audit', async () => {

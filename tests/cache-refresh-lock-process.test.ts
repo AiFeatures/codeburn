@@ -36,8 +36,8 @@ function waitForExit(child: ChildProcess): Promise<void> {
   })
 }
 
-function worker(cacheDir: string, barriers: string, id: string, source: string, bypass = false): ChildProcess {
-  return spawn(process.execPath, ['--import', 'tsx', join(process.cwd(), 'tests/fixtures/cache-refresh-worker.ts'), cacheDir, barriers, id, source, String(bypass)], {
+function worker(cacheDir: string, barriers: string, id: string, source: string, bypass = false, exitViaCleanup = false): ChildProcess {
+  return spawn(process.execPath, ['--import', 'tsx', join(process.cwd(), 'tests/fixtures/cache-refresh-worker.ts'), cacheDir, barriers, id, source, String(bypass), String(exitViaCleanup)], {
     cwd: process.cwd(),
     stdio: ['ignore', 'ignore', 'pipe'],
   })
@@ -79,10 +79,108 @@ describe('warm refresh child-process regression', () => {
     const loserOutcome = await waitForAny(barriers, [
       `${loser}.timed-out`, `${loser}.parsed`, `${loser}.completed-by-other`, `${loser}.unavailable`,
     ])
-    expect(loserOutcome, (await readdir(barriers)).join(',')).toBe(`${loser}.timed-out`)
+    // Exactly one owner publishes. The loser of a stale-lock contest is not
+    // the owner: `timed-out` is the usual wait-out, but missing+missing during
+    // the winner's unlink-guard/create-successor gap is honestly
+    // `completed-by-other` (#904). Do not require timed-out.
+    expect(loserOutcome, (await readdir(barriers)).join(',')).not.toBe(`${loser}.parsed`)
+    expect([`${loser}.timed-out`, `${loser}.completed-by-other`, `${loser}.unavailable`]).toContain(loserOutcome)
     await writeFile(join(barriers, `${winner}.save`), '')
     await Promise.all([waitForExit(a), waitForExit(b)])
     await expect(stat(join(cacheDir, 'session-refresh.lock.takeover'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('gives exactly one contender ownership of a stale zero-byte lock', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cb-refresh-corrupt-'))
+    roots.push(root)
+    const cacheDir = join(root, 'cache')
+    const barriers = join(root, 'barriers')
+    await mkdir(cacheDir, { recursive: true })
+    await mkdir(barriers, { recursive: true })
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    const initial = emptyCache()
+    initial.complete = true
+    await saveCache(initial)
+    const corruptPath = join(cacheDir, 'session-refresh.lock')
+    await writeFile(corruptPath, '')
+    await utimes(corruptPath, new Date(1), new Date(1))
+    const source = join(root, 'changed.json')
+    await writeFile(source, JSON.stringify({ output: 404 }))
+
+    const a = worker(cacheDir, barriers, 'a', source)
+    const b = worker(cacheDir, barriers, 'b', source)
+    const winner = await Promise.race([
+      waitFor(join(barriers, 'a.parsed')).then(() => 'a'),
+      waitFor(join(barriers, 'b.parsed')).then(() => 'b'),
+    ])
+    const loser = winner === 'a' ? 'b' : 'a'
+    expect(Number(existsSync(join(barriers, 'a.parsed'))) + Number(existsSync(join(barriers, 'b.parsed')))).toBe(1)
+    const loserOutcome = await waitForAny(barriers, [
+      `${loser}.timed-out`, `${loser}.parsed`, `${loser}.completed-by-other`, `${loser}.unavailable`,
+    ])
+    // Exactly one owner publishes. The loser of a stale-lock contest is not
+    // the owner: `timed-out` is the usual wait-out, but missing+missing during
+    // the winner's unlink-guard/create-successor gap is honestly
+    // `completed-by-other` (#904). Do not require timed-out.
+    expect(loserOutcome, (await readdir(barriers)).join(',')).not.toBe(`${loser}.parsed`)
+    expect([`${loser}.timed-out`, `${loser}.completed-by-other`, `${loser}.unavailable`]).toContain(loserOutcome)
+    await writeFile(join(barriers, `${winner}.save`), '')
+    await Promise.all([waitForExit(a), waitForExit(b)])
+    await expect(stat(join(cacheDir, 'session-refresh.lock.takeover'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(Object.keys((await loadCache()).providers['regression']?.files ?? {})).toEqual([source])
+  })
+
+  // #1117: the menubar/desktop watchdog kills a CLI child with SIGTERM first,
+  // precisely so the holder can unlink its own lock instead of leaving one for
+  // every later spawn to wait out.
+  it('unlinks its own lock when the holder is SIGTERMed mid-transaction', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cb-refresh-sigterm-'))
+    roots.push(root)
+    const cacheDir = join(root, 'cache')
+    const barriers = join(root, 'barriers')
+    await mkdir(cacheDir, { recursive: true })
+    await mkdir(barriers, { recursive: true })
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    const initial = emptyCache()
+    initial.complete = true
+    await saveCache(initial)
+    const source = join(root, 'changed.json')
+    await writeFile(source, JSON.stringify({ output: 505 }))
+
+    const holder = worker(cacheDir, barriers, 'a', source)
+    // The worker blocks on its save barrier while holding the lock.
+    await waitFor(join(barriers, 'a.parsed'))
+    const lock = join(cacheDir, 'session-refresh.lock')
+    expect(existsSync(lock)).toBe(true)
+
+    const exited = new Promise<void>(resolve => { holder.once('exit', () => resolve()) })
+    holder.kill('SIGTERM')
+    await exited
+    expect(existsSync(lock)).toBe(false)
+  })
+
+  it('unlinks its own warm-refresh lock on the TUI direct-exit boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cb-refresh-direct-exit-'))
+    roots.push(root)
+    const cacheDir = join(root, 'cache')
+    const barriers = join(root, 'barriers')
+    await mkdir(cacheDir, { recursive: true })
+    await mkdir(barriers, { recursive: true })
+    process.env['CODEBURN_CACHE_DIR'] = cacheDir
+    const initial = emptyCache()
+    initial.complete = true
+    await saveCache(initial)
+    const source = join(root, 'changed.json')
+    await writeFile(source, JSON.stringify({ output: 606 }))
+
+    const holder = worker(cacheDir, barriers, 'a', source, false, true)
+    await waitFor(join(barriers, 'a.parsed'))
+    const lock = join(cacheDir, 'session-refresh.lock')
+    expect(existsSync(lock)).toBe(true)
+
+    await writeFile(join(barriers, 'a.exit'), '')
+    await waitForExit(holder)
+    expect(existsSync(lock)).toBe(false)
   })
 
   it('serializes disjoint parsed updates so the later publication cannot drop the first', async () => {

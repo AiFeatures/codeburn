@@ -3,15 +3,27 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 
 import { extractBashCommands } from '../bash-utils.js'
-import { calculateCost } from '../models.js'
+import { calculateCost, pricingModelAt } from '../models.js'
+import { FS_SCAN_CONCURRENCY, mapWithConcurrency } from '../fs-utils.js'
 import type { ParsedProviderCall, ProbeRoot, Provider, SessionParser, SessionSource } from './types.js'
+import type { ToolCall } from '../types.js'
 
 type JsonObject = Record<string, unknown>
 
 type SessionState = {
   createdAt?: string
+  /// Epoch-ms `createdAt`, which is how the CLI store writes it (the string
+  /// form above belongs to other hosts).
+  createdAtMs?: number
+  cwd?: string
   updatedAt?: string
   workDir?: string
+  /// Map of agent name -> descriptor. Carries the `parentAgentId` field
+  /// the provider records for every subagent: `null` for the `main` agent
+  /// (so it has no parent of its own), the parent agent name otherwise.
+  /// `state.json` keeps this map for every session; the wire parser uses
+  /// it only for CB-1 lineage attribution.
+  agents?: Record<string, { parentAgentId?: string | null }>
 }
 
 type RequestContext = {
@@ -71,8 +83,18 @@ function timestampIso(value: unknown): string {
   return Number.isNaN(date.getTime()) ? '' : date.toISOString()
 }
 
-function kimicodeHome(override?: string): string {
-  return resolve(override || process.env['KIMI_CODE_HOME'] || join(homedir(), '.kimi-code'))
+export function kimicodeHomes(override?: string): string[] {
+  const explicit = override || process.env['KIMI_CODE_HOME']
+  if (explicit) return [resolve(explicit)]
+  // Default stores. Beyond the CLI's own ~/.kimi-code, embedded runtimes keep
+  // the same wire layout under their own home (Kimi desktop app, Kimi Code
+  // IDE); each home is scanned so embedded-agent usage is not invisible.
+  const home = homedir()
+  const homes = [
+    join(home, '.kimi-code'),
+    join(home, 'Library', 'Application Support', 'kimi-desktop', 'daimon-share', 'daimon', 'runtime', 'kimi-code', 'home'),
+  ]
+  return [...new Set(homes.map(h => resolve(h)))]
 }
 
 async function directoryEntries(path: string) {
@@ -91,56 +113,84 @@ async function isFile(path: string): Promise<boolean> {
   }
 }
 
-async function readState(sessionDir: string): Promise<SessionState> {
+export async function readState(sessionDir: string): Promise<SessionState> {
   try {
     const state = asObject(JSON.parse(await readFile(join(sessionDir, 'state.json'), 'utf8')))
     if (!state) return {}
+    const agents = asObject(state['agents'])
+    let agentsMap: SessionState['agents']
+    if (agents) {
+      agentsMap = {}
+      for (const [name, descriptor] of Object.entries(agents)) {
+        const desc = asObject(descriptor)
+        if (!desc) continue
+        const parent = desc['parentAgentId']
+        agentsMap[name] = { parentAgentId: parent === null || typeof parent === 'string' ? parent : undefined }
+      }
+    }
     return {
       createdAt: stringValue(state['createdAt']) || undefined,
+      createdAtMs: nonNegativeNumber(state['createdAt']) || undefined,
+      cwd: stringValue(state['cwd']) || undefined,
       updatedAt: stringValue(state['updatedAt']) || undefined,
       workDir: stringValue(state['workDir']) || undefined,
+      ...(agentsMap ? { agents: agentsMap } : {}),
     }
   } catch {
     return {}
   }
 }
 
-function projectFromWorkDir(workDir: string, workDirKey: string): string {
+export function projectFromWorkDir(workDir: string, workDirKey: string): string {
   if (workDir) return basename(workDir.replace(/[\\/]+$/, '')) || workDir
   const match = /^wd_(.+)_[a-f0-9]{12}$/i.exec(workDirKey)
   return match?.[1] || workDirKey.replace(/^wd_/, '') || 'kimicode'
 }
 
+// Walked one level at a time with each level fanned out, rather than as nested
+// serial loops: the tree is thousands of tiny state.json reads and wire.jsonl
+// stats, and issuing them one at a time left the corpus scan waiting on the
+// kernel. The final sort makes the result order independent of completion order.
 async function discoverSources(root: string): Promise<SessionSource[]> {
-  const sources: SessionSource[] = []
   const sessionsDir = join(root, 'sessions')
 
-  for (const workDirEntry of await directoryEntries(sessionsDir)) {
-    if (!workDirEntry.isDirectory() || !workDirEntry.name.startsWith('wd_')) continue
-    const workDirPath = join(sessionsDir, workDirEntry.name)
+  const workDirs = (await directoryEntries(sessionsDir))
+    .filter(e => e.isDirectory() && e.name.startsWith('wd_'))
+    .map(e => ({ key: e.name, path: join(sessionsDir, e.name) }))
 
-    for (const sessionEntry of await directoryEntries(workDirPath)) {
-      if (!sessionEntry.isDirectory() || !sessionEntry.name.startsWith('session_')) continue
-      const sessionDir = join(workDirPath, sessionEntry.name)
-      const state = await readState(sessionDir)
-      const project = projectFromWorkDir(state.workDir ?? '', workDirEntry.name)
+  // Session dir naming differs by host product: the CLI uses session_*,
+  // embedded runtimes (desktop app, IDE) use conv-*/ctitle-*. Any directory is
+  // accepted; the agents/*/wire.jsonl probe below gates real sessions.
+  const sessionDirs = (await mapWithConcurrency(workDirs, FS_SCAN_CONCURRENCY, async wd =>
+    (await directoryEntries(wd.path))
+      .filter(e => e.isDirectory())
+      .map(e => ({ workDirKey: wd.key, sessionDir: join(wd.path, e.name) })),
+  )).flat()
 
-      for (const agentEntry of await directoryEntries(join(sessionDir, 'agents'))) {
-        if (!agentEntry.isDirectory()) continue
-        const wirePath = join(sessionDir, 'agents', agentEntry.name, 'wire.jsonl')
-        if (!await isFile(wirePath)) continue
-        sources.push({
-          path: wirePath,
-          project,
-          provider: 'kimicode',
-          sourceId: agentEntry.name,
-          sourceLabel: agentEntry.name,
-          sourcePath: state.workDir,
-        })
-      }
-    }
+  const agents = (await mapWithConcurrency(sessionDirs, FS_SCAN_CONCURRENCY, async sd => {
+    const state = await readState(sd.sessionDir)
+    const workDir = state.workDir ?? state.cwd
+    const project = projectFromWorkDir(workDir ?? '', sd.workDirKey)
+    const agentsDir = join(sd.sessionDir, 'agents')
+    return (await directoryEntries(agentsDir))
+      .filter(e => e.isDirectory())
+      .map(e => ({ agentName: e.name, wirePath: join(agentsDir, e.name, 'wire.jsonl'), project, workDir }))
+  })).flat()
+
+  const present = await mapWithConcurrency(agents, FS_SCAN_CONCURRENCY, a => isFile(a.wirePath))
+
+  const sources: SessionSource[] = []
+  for (const [i, a] of agents.entries()) {
+    if (!present[i]) continue
+    sources.push({
+      path: a.wirePath,
+      project: a.project,
+      provider: 'kimicode',
+      sourceId: a.agentName,
+      sourceLabel: a.agentName,
+      sourcePath: a.workDir,
+    })
   }
-
   return sources.sort((a, b) => a.path.localeCompare(b.path))
 }
 
@@ -154,6 +204,32 @@ function sessionIdForWire(path: string): string {
 
 function agentIdForWire(path: string): string {
   return basename(dirname(path))
+}
+
+/// Provider-recorded parent/child lineage for a single Kimi Code source.
+/// The provider writes `state.json` `agents[<name>].parentAgentId` for every
+/// agent in the session - `null` (or absent) for `main`, an agent name
+/// otherwise. A non-`main` agent whose `parentAgentId === 'main'` is a
+/// child of the session's own root. A `main` agent is a root when at
+/// least one non-`main` entry exists alongside it. Returns `undefined`
+/// when `state.json` is missing or carries no `agents` map, so the
+/// install path can omit the field without a default.
+export async function kimicodeLineageForSource(path: string, agentId: string): Promise<import('../types.js').SessionLineage | undefined> {
+  const state = await readState(sessionDirForWire(path))
+  const agents = state.agents
+  if (!agents) return undefined
+  if (agentId !== 'main') {
+    const self = agents[agentId]
+    if (!self) return undefined
+    // The parent is `main` (the canonical session root). Provider-recorded.
+    if (self.parentAgentId !== 'main') return undefined
+    return { parentSessionId: 'main', role: 'child', evidence: 'provider-recorded' }
+  }
+  // `main` is a root only when another agent sits alongside it. A
+  // standalone main session has no children to be the parent of.
+  const hasChild = Object.entries(agents).some(([name, desc]) => name !== 'main' && desc.parentAgentId === 'main')
+  if (!hasChild) return undefined
+  return { role: 'root', evidence: 'provider-recorded' }
 }
 
 function turnIdFromStep(value: unknown): string {
@@ -174,7 +250,7 @@ function inputText(value: unknown): string {
     .join('\n')
 }
 
-function toolDetails(value: unknown): { name: string; bashCommands: string[] } | null {
+function toolDetails(value: unknown): { name: string; bashCommands: string[]; step: ToolCall } | null {
   const event = asObject(value)
   if (!event || stringValue(event['type']) !== 'tool.call') return null
   const rawName = stringValue(event['name'])
@@ -190,9 +266,14 @@ function toolDetails(value: unknown): { name: string; bashCommands: string[] } |
     }
   }
   const command = stringValue(args?.['command'])
+  const path = stringValue(args?.['path'])
+  const step: ToolCall = { tool: name }
+  if (path) step.file = path
+  if (command) step.command = command
   return {
     name,
     bashCommands: name === 'Bash' && command ? extractBashCommands(command) : [],
+    step,
   }
 }
 
@@ -211,13 +292,14 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
       const agentId = source.sourceId || agentIdForWire(source.path)
       const state = await readState(sessionDir)
       const fallbackTimestamp = timestampIso(state.updatedAt) || timestampIso(state.createdAt)
-      const projectPath = state.workDir || source.sourcePath
+      const projectPath = state.workDir || state.cwd || source.sourcePath
       const aliasModels = new Map<string, string>()
       const prompts = new Map<string, string>()
       let currentPrompt = ''
       let currentRequest: RequestContext | null = null
       let pendingTools: string[] = []
       let pendingBashCommands: string[] = []
+      let pendingToolSequence: ToolCall[][] = []
       let usageOrdinal = 0
 
       const lines = contents.split(/\r?\n/)
@@ -237,6 +319,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (type === 'turn.prompt') {
           pendingTools = []
           pendingBashCommands = []
+          pendingToolSequence = []
           currentPrompt = inputText(record['input'])
           continue
         }
@@ -261,6 +344,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           if (tool) {
             pendingTools.push(tool.name)
             pendingBashCommands.push(...tool.bashCommands)
+            pendingToolSequence.push([tool.step])
           }
           continue
         }
@@ -280,6 +364,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (!timestamp) {
           pendingTools = []
           pendingBashCommands = []
+          pendingToolSequence = []
           continue
         }
 
@@ -288,6 +373,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (seenKeys.has(deduplicationKey)) {
           pendingTools = []
           pendingBashCommands = []
+          pendingToolSequence = []
           continue
         }
         seenKeys.add(deduplicationKey)
@@ -303,7 +389,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD: calculateCost(
-            realModel,
+            pricingModelAt(realModel, timestamp),
             inputTokens,
             outputTokens,
             cacheCreationInputTokens,
@@ -313,6 +399,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           costIsEstimated: true,
           tools: pendingTools,
           bashCommands: pendingBashCommands,
+          toolSequence: pendingToolSequence.length > 0 ? pendingToolSequence : undefined,
           timestamp,
           speed: 'standard',
           deduplicationKey,
@@ -325,6 +412,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         pendingTools = []
         pendingBashCommands = []
+        pendingToolSequence = []
       }
     },
   }
@@ -344,11 +432,15 @@ export function createKimicodeProvider(homeOverride?: string): Provider {
     },
 
     async probeRoots(): Promise<ProbeRoot[]> {
-      return [{ path: kimicodeHome(homeOverride), label: 'Kimi Code home' }]
+      return kimicodeHomes(homeOverride).map(path => ({ path, label: 'Kimi Code home' }))
     },
 
     async discoverSessions(): Promise<SessionSource[]> {
-      return discoverSources(kimicodeHome(homeOverride))
+      const all: SessionSource[] = []
+      for (const home of kimicodeHomes(homeOverride)) {
+        all.push(...await discoverSources(home))
+      }
+      return all.sort((a, b) => a.path.localeCompare(b.path))
     },
 
     createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {

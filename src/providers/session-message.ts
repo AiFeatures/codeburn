@@ -1,4 +1,4 @@
-import { calculateCost } from '../models.js'
+import { billableOutputTokens, calculateCost, recordedCostFallback, routeFromProviderField } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import type { ParsedProviderCall } from './types.js'
 
@@ -8,6 +8,7 @@ import type { ParsedProviderCall } from './types.js'
 export type MessageData = {
   role: string
   modelID?: string
+  providerID?: string
   model?: string
   cost?: number
   tokens?: {
@@ -130,22 +131,26 @@ export function buildAssistantCall(opts: {
     .filter(Boolean)
 
   const model = data.modelID ?? data.model ?? 'unknown'
+  const route = routeFromProviderField(data.providerID)?.id
   let costUSD = calculateCost(
     model,
     tokens.input,
-    tokens.output + tokens.reasoning,
+    // Same single source of truth the cache-rehydration path uses, so a fresh
+    // parse and a cached read can never disagree about whether this provider's
+    // reasoning tokens already sit inside its output count. (#1075, #1334)
+    billableOutputTokens(opts.providerName, tokens.output, tokens.reasoning),
     tokens.cacheWrite,
     tokens.cacheRead,
     0,
   )
 
-  if (costUSD === 0 && typeof data.cost === 'number' && data.cost > 0) {
-    costUSD = data.cost
-  }
+  const fallbackCostUSD = recordedCostFallback(model, costUSD, data.cost)
+  if (fallbackCostUSD) costUSD = fallbackCostUSD
 
   return {
     provider: opts.providerName,
     model,
+    ...(route ? { route } : {}),
     inputTokens: tokens.input,
     outputTokens: tokens.output,
     cacheCreationInputTokens: tokens.cacheWrite,
@@ -154,6 +159,9 @@ export function buildAssistantCall(opts: {
     reasoningTokens: tokens.reasoning,
     webSearchRequests: 0,
     costUSD,
+    ...(fallbackCostUSD ? { fallbackCostUSD } : {}),
+    // A call with output but no usage recorded has unknown tokens, not zero.
+    ...(allZero && costUSD === 0 ? { costIsEstimated: true } : {}),
     tools,
     bashCommands,
     skills,

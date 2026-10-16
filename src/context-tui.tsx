@@ -3,6 +3,7 @@ import { render, Box, Text, useApp, useInput } from 'ink'
 
 import { formatTokens } from './format.js'
 import { patchStdoutForWindows } from './ink-win.js'
+import { startUserTimingGuard } from './user-timing-guard.js'
 import {
   buildContextTree,
   listRecentTitledSessions,
@@ -26,6 +27,14 @@ const PROVIDERS: Array<{ key: Provider; label: string }> = [
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text
+}
+
+/// The primary label for a session row: its AI-generated title when present,
+/// else a clear placeholder. The short id is demoted to the dim metadata
+/// cluster, so a titled session reads by what it was about, not its hash.
+export function sessionPrimaryLabel(title: string | undefined): string {
+  const trimmed = (title ?? '').trim()
+  return trimmed || 'untitled session'
 }
 
 async function loadSessions(provider: Provider): Promise<TitledSessionRef[]> {
@@ -164,14 +173,12 @@ function ContextTuiApp({ initialScope }: { initialScope: Scope }) {
           <Box key={s.filePath} flexDirection="column">
             <Text>
               <Text color={ORANGE}>{selected ? '❯ ' : '  '}</Text>
-              <Text color={selected ? ORANGE : undefined}>{s.sessionId.slice(0, 8)}</Text>
-              <Text color={expanded || selected ? undefined : DIM}>
-                {'  '}
-                {truncate(s.title || 'untitled session', titleWidth).padEnd(titleWidth)}
+              <Text bold={selected} color={selected ? ORANGE : undefined}>
+                {truncate(sessionPrimaryLabel(s.title), titleWidth).padEnd(titleWidth)}
               </Text>
               <Text color={DIM}>
                 {'  '}
-                {truncate(s.project, 12).padEnd(12)} {relativeAge(s.mtimeMs).padStart(8)} {`${(s.sizeBytes / 1024 / 1024).toFixed(1)}MB`.padStart(8)}
+                {s.sessionId.slice(0, 8)}  {truncate(s.project, 12).padEnd(12)} {relativeAge(s.mtimeMs).padStart(8)} {`${(s.sizeBytes / 1024 / 1024).toFixed(1)}MB`.padStart(8)}
               </Text>
             </Text>
             {expanded && error && (
@@ -198,6 +205,11 @@ function ContextTuiApp({ initialScope }: { initialScope: Scope }) {
 
 export async function runContextTui(opts: { initialScope?: Scope } = {}): Promise<void> {
   patchStdoutForWindows()
-  const instance = render(<ContextTuiApp initialScope={opts.initialScope ?? 'effective'} />)
-  await instance.waitUntilExit()
+  const stopUserTimingGuard = startUserTimingGuard()
+  try {
+    const instance = render(<ContextTuiApp initialScope={opts.initialScope ?? 'effective'} />)
+    await instance.waitUntilExit()
+  } finally {
+    stopUserTimingGuard()
+  }
 }

@@ -1,11 +1,15 @@
+import { amp } from './amp.js'
 import { claude } from './claude.js'
 import { cline } from './cline.js'
+import { clineCli } from './cline-cli.js'
 import { codewhale } from './codewhale.js'
+import { commandCode } from './command-code.js'
 import { codebuff } from './codebuff.js'
 import { codex } from './codex.js'
 import { copilot } from './copilot.js'
 import { droid } from './droid.js'
 import { devin } from './devin.js'
+import { dsh } from './dsh.js'
 import { gemini } from './gemini.js'
 import { hermes } from './hermes.js'
 import { ibmBob } from './ibm-bob.js'
@@ -17,13 +21,16 @@ import { lingtaiTui } from './lingtai-tui.js'
 import { mistralVibe } from './mistral-vibe.js'
 import { mux } from './mux.js'
 import { openclaw } from './openclaw.js'
+import { openclaude } from './openclaude.js'
 import { openDesign } from './open-design.js'
 import { pi, omp } from './pi.js'
 import { qwen } from './qwen.js'
 import { quickdesk } from './quickdesk.js'
-import { rooCode } from './roo-code.js'
 import { zerostack } from './zerostack.js'
 import { grok } from './grok.js'
+import { grokbot } from './grokbot.js'
+import { isBlockedDatabaseError } from '../sqlite.js'
+import { clearProviderIssue, recordProviderIssue } from '../provider-issues.js'
 import type { Provider, SessionSource } from './types.js'
 
 let antigravityProvider: Provider | null = null
@@ -190,11 +197,34 @@ async function loadZed(): Promise<Provider | null> {
   }
 }
 
-const coreProviders: Provider[] = [claude, cline, codewhale, codebuff, codex, copilot, devin, droid, gemini, hermes, ibmBob, kiloCode, kiro, kimi, kimicode, lingtaiTui, mistralVibe, mux, openclaw, openDesign, pi, omp, qwen, quickdesk, rooCode, zerostack, grok]
+const coreProviders: Provider[] = [claude, cline, clineCli, codewhale, codebuff, codex, copilot, devin, droid, dsh, gemini, hermes, ibmBob, kiloCode, kiro, kimi, kimicode, lingtaiTui, mistralVibe, mux, openclaw, openclaude, openDesign, pi, omp, qwen, quickdesk, zerostack, grok, grokbot, amp, commandCode]
 
 // Lazily loaded providers, listed by name so --provider validation works even
 // when an optional module fails to load. Must stay in sync with getAllProviders.
 const lazyProviderNames = ['antigravity', 'forge', 'goose', 'cursor', 'opencode', 'cursor-agent', 'crush', 'warp', 'vercel-gateway', 'zcode', 'zed']
+
+// Display names for lazy providers. Must match the `displayName` on the
+// loaded Provider object; `providerDisplayName` + getAllProviders() test
+// is the drift check.
+const lazyProviderDisplayNames: Record<string, string> = {
+  antigravity: 'Antigravity',
+  forge: 'Forge',
+  goose: 'Goose',
+  cursor: 'Cursor',
+  opencode: 'OpenCode',
+  'cursor-agent': 'Cursor Agent',
+  crush: 'Crush',
+  warp: 'Warp',
+  'vercel-gateway': 'Vercel AI Gateway',
+  zcode: 'ZCode',
+  zed: 'Zed',
+}
+
+export function providerDisplayName(name: string): string {
+  const core = coreProviders.find(p => p.name === name)
+  if (core) return core.displayName
+  return lazyProviderDisplayNames[name] ?? name
+}
 
 // Canonical set of every provider name (core + lazy), used to validate the
 // --provider CLI flag. Computed lazily so importing this module never depends on
@@ -235,37 +265,61 @@ export const providers = coreProviders
 // provider per run, then skip it. Mirrors the parse-failure isolation already
 // used per-file in parser.ts.
 const warnedDiscoveryFailures = new Set<string>()
-export async function safeDiscoverSessions(provider: Provider): Promise<SessionSource[]> {
+async function discoverOne(provider: Provider): Promise<{ sources: SessionSource[]; failed: boolean }> {
   try {
-    return await provider.discoverSessions()
+    const sources = await provider.discoverSessions()
+    clearProviderIssue(provider.name, 'locate')
+    return { sources, failed: false }
   } catch (err) {
-    if (!warnedDiscoveryFailures.has(provider.name)) {
+    recordProviderIssue(provider.name, 'locate', err)
+    // An error that already explained itself on stderr does not need a second,
+    // vaguer line.
+    if (!warnedDiscoveryFailures.has(provider.name) && !isBlockedDatabaseError(err)) {
       warnedDiscoveryFailures.add(provider.name)
       const msg = err instanceof Error ? err.message : String(err)
       process.stderr.write(
         `codeburn: skipped ${provider.name} discovery after an error: ${msg}\n`
       )
     }
-    return []
+    return { sources: [], failed: true }
+  }
+}
+
+export async function safeDiscoverSessions(provider: Provider): Promise<SessionSource[]> {
+  return (await discoverOne(provider)).sources
+}
+
+/** Names of the providers whose discovery threw, alongside the sources the rest
+ *  found. The empty list a failed provider contributes is indistinguishable
+ *  from "this provider has no sessions", and a caller that reads the first as
+ *  the second concludes it has seen a corpus it never saw. */
+export type SessionDiscovery = { sources: SessionSource[]; failedProviders: string[] }
+
+export async function discoverAllSessionsWithFailures(
+  providerFilter?: string,
+  // Injectable for tests so the isolation loop itself is exercised, not just
+  // the helper. Defaults to the real registry.
+  providerList?: Provider[],
+): Promise<SessionDiscovery> {
+  const allProviders = providerList ?? await getAllProviders()
+  const filtered = providerFilter && providerFilter !== 'all'
+    ? allProviders.filter(p => p.name === providerFilter)
+    : allProviders
+  // Each provider's discovery is its own serial directory walk; run them
+  // concurrently and concatenate in registry order so the result stays
+  // byte-identical to the sequential version.
+  const perProvider = await Promise.all(filtered.map(discoverOne))
+  return {
+    sources: perProvider.flatMap(r => r.sources),
+    failedProviders: filtered.filter((_, i) => perProvider[i]!.failed).map(p => p.name),
   }
 }
 
 export async function discoverAllSessions(
   providerFilter?: string,
-  // Injectable for tests so the isolation loop itself is exercised, not just
-  // the helper. Defaults to the real registry.
   providerList?: Provider[],
 ): Promise<SessionSource[]> {
-  const allProviders = providerList ?? await getAllProviders()
-  const filtered = providerFilter && providerFilter !== 'all'
-    ? allProviders.filter(p => p.name === providerFilter)
-    : allProviders
-  const all: SessionSource[] = []
-  for (const provider of filtered) {
-    const sessions = await safeDiscoverSessions(provider)
-    all.push(...sessions)
-  }
-  return all
+  return (await discoverAllSessionsWithFailures(providerFilter, providerList)).sources
 }
 
 export async function getProvider(name: string): Promise<Provider | undefined> {

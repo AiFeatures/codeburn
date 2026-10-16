@@ -1,12 +1,14 @@
-import { mkdir, mkdtemp, rm } from 'fs/promises'
+import { mkdir, mkdtemp, rm, utimes, writeFile } from 'fs/promises'
 import { basename, dirname, join } from 'path'
-import { tmpdir } from 'os'
+import { tmpdir, homedir } from 'os'
 import { createRequire } from 'node:module'
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { calculateCost } from '../../src/models.js'
 import { createHermesProvider } from '../../src/providers/hermes.js'
 import { isSqliteAvailable } from '../../src/sqlite.js'
+import { aggregateProjectsIntoDays } from '../../src/day-aggregator.js'
+import { currentTzKey, DAILY_CACHE_VERSION, ensureCacheHydrated, toDateString, type DailyEntry } from '../../src/daily-cache.js'
 import type { ParsedProviderCall } from '../../src/providers/types.js'
 import type { DateRange } from '../../src/types.js'
 
@@ -22,12 +24,22 @@ let tmpDir: string
 let cacheDir: string
 let originalHermesHome: string | undefined
 let originalCodeburnCacheDir: string | undefined
+let originalLocalAppData: string | undefined
+let originalHome: string | undefined
+let originalUserProfile: string | undefined
 
 beforeEach(async () => {
   tmpDir = await mkdtemp(join(tmpdir(), 'hermes-provider-test-'))
   cacheDir = await mkdtemp(join(tmpdir(), 'hermes-provider-cache-'))
   originalHermesHome = process.env['HERMES_HOME']
   originalCodeburnCacheDir = process.env['CODEBURN_CACHE_DIR']
+  originalLocalAppData = process.env['LOCALAPPDATA']
+  originalHome = process.env['HOME']
+  originalUserProfile = process.env['USERPROFILE']
+  process.env['HERMES_HOME'] = tmpDir
+  process.env['CODEBURN_CACHE_DIR'] = cacheDir
+  const { resetHermesSessionLedgerForTests } = await import('../../src/hermes-session-ledger.js')
+  resetHermesSessionLedgerForTests()
 })
 
 afterEach(async () => {
@@ -35,9 +47,26 @@ afterEach(async () => {
   else process.env['HERMES_HOME'] = originalHermesHome
   if (originalCodeburnCacheDir === undefined) delete process.env['CODEBURN_CACHE_DIR']
   else process.env['CODEBURN_CACHE_DIR'] = originalCodeburnCacheDir
+  if (originalLocalAppData === undefined) delete process.env['LOCALAPPDATA']
+  else process.env['LOCALAPPDATA'] = originalLocalAppData
+  if (originalHome === undefined) delete process.env['HOME']
+  else process.env['HOME'] = originalHome
+  if (originalUserProfile === undefined) delete process.env['USERPROFILE']
+  else process.env['USERPROFILE'] = originalUserProfile
   await rm(tmpDir, { recursive: true, force: true })
   await rm(cacheDir, { recursive: true, force: true })
 })
+
+async function withProcessPlatform<T>(platform: NodeJS.Platform, action: () => Promise<T>): Promise<T> {
+  const original = Object.getOwnPropertyDescriptor(process, 'platform')
+  if (!original?.configurable) throw new Error('process.platform cannot be mocked in this runtime')
+  Object.defineProperty(process, 'platform', { ...original, value: platform })
+  try {
+    return await action()
+  } finally {
+    Object.defineProperty(process, 'platform', original)
+  }
+}
 
 function createHermesDb(homeDir: string): string {
   const { DatabaseSync: Database } = requireForTest('node:sqlite')
@@ -49,6 +78,7 @@ function createHermesDb(homeDir: string): string {
       source TEXT,
       model TEXT,
       cwd TEXT,
+      git_repo_root TEXT,
       billing_provider TEXT,
       billing_base_url TEXT,
       billing_mode TEXT,
@@ -117,12 +147,31 @@ async function createProfileHermesDb(hermesHome: string, profile: string): Promi
   return createHermesDb(profileDir)
 }
 
+async function createHermesDbWithSession(hermesHome: string, sessionId: string): Promise<string> {
+  await mkdir(hermesHome, { recursive: true })
+  const dbPath = createHermesDb(hermesHome)
+  withTestDb(dbPath, (db) => {
+    insertSession(db, {
+      id: sessionId,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      reasoningTokens: 0,
+      startedAt: 1779549200,
+    })
+  })
+  return dbPath
+}
+
 function insertSession(db: TestDb, values: {
   id: string
   source?: string
   model?: string
   cwd?: string | null
+  gitRepoRoot?: string | null
   billingProvider?: string
+  costStatus?: string
   inputTokens: number
   outputTokens: number
   cacheReadTokens: number
@@ -137,15 +186,16 @@ function insertSession(db: TestDb, values: {
 }): void {
   db.prepare(
     `INSERT INTO sessions (
-      id, source, model, cwd, billing_provider, input_tokens, output_tokens,
+      id, source, model, cwd, git_repo_root, billing_provider, input_tokens, output_tokens,
       cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated_cost_usd,
-      actual_cost_usd, api_call_count, tool_call_count, started_at, title
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      actual_cost_usd, cost_status, api_call_count, tool_call_count, started_at, title
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     values.id,
     values.source ?? 'cli',
     values.model ?? 'gpt-5.5',
     values.cwd ?? null,
+    values.gitRepoRoot ?? null,
     values.billingProvider ?? 'openai-codex',
     values.inputTokens,
     values.outputTokens,
@@ -154,6 +204,7 @@ function insertSession(db: TestDb, values: {
     values.reasoningTokens,
     values.estimatedCost ?? null,
     values.actualCost ?? null,
+    values.costStatus ?? null,
     values.apiCalls ?? 1,
     values.toolCalls ?? 0,
     values.startedAt,
@@ -178,8 +229,9 @@ function dayRange(): DateRange {
   }
 }
 
-async function loadParserWithHermesHome(hermesHome: string, codeburnCacheDir: string) {
-  process.env['HERMES_HOME'] = hermesHome
+async function loadParserWithHermesHome(hermesHome: string | undefined, codeburnCacheDir: string) {
+  if (hermesHome === undefined) delete process.env['HERMES_HOME']
+  else process.env['HERMES_HOME'] = hermesHome
   process.env['CODEBURN_CACHE_DIR'] = codeburnCacheDir
   vi.resetModules()
   const parser = await import('../../src/parser.js')
@@ -198,6 +250,187 @@ async function collectCalls(hermesHome: string, sourcePath: string): Promise<Par
 const skipUnlessSqlite = isSqliteAvailable() ? describe : describe.skip
 
 skipUnlessSqlite('hermes provider', () => {
+  it.each([
+    ['unset', undefined],
+    ['empty', ''],
+    ['whitespace', ' \t '],
+  ])('uses LOCALAPPDATA for the Windows default with %s HERMES_HOME and discovers default and named profiles', async (_label, configuredHome) => {
+    await withProcessPlatform('win32', async () => {
+      if (configuredHome === undefined) delete process.env['HERMES_HOME']
+      else process.env['HERMES_HOME'] = configuredHome
+      const localAppData = join(tmpDir, 'local-app-data')
+      process.env['LOCALAPPDATA'] = localAppData
+      const hermesHome = join(localAppData, 'hermes')
+      const rootDbPath = await createHermesDbWithSession(hermesHome, 'windows-default')
+      const profileDbPath = await createHermesDbWithSession(join(hermesHome, 'profiles', 'coder'), 'windows-profile')
+
+      const provider = createHermesProvider()
+      expect(await provider.probeRoots()).toEqual([{ path: hermesHome, label: 'home' }])
+      const sessions = await provider.discoverSessions()
+      expect(sessions.map(session => session.path).sort()).toEqual([
+        `${profileDbPath}#hermes-session=windows-profile`,
+        `${rootDbPath}#hermes-session=windows-default`,
+      ].sort())
+      expect(sessions.map(session => session.project).sort()).toEqual(['coder', 'hermes'])
+    })
+  })
+
+  it('re-derives a finalized v47 daily cache from the Windows Hermes home and carries unavailable history', async () => {
+    const now = new Date()
+    const sessionStartedAt = Math.floor((now.getTime() - 4 * 24 * 60 * 60 * 1000) / 1000)
+    const hermesDate = toDateString(new Date(sessionStartedAt * 1000))
+    const sourceGoneDate = toDateString(new Date(now.getTime() - 9 * 24 * 60 * 60 * 1000))
+    const yesterday = toDateString(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))
+
+    const localAppData = join(tmpDir, 'local-app-data')
+    const hermesHome = join(localAppData, 'hermes')
+    delete process.env['HERMES_HOME']
+    process.env['LOCALAPPDATA'] = localAppData
+    await mkdir(hermesHome, { recursive: true })
+    const dbPath = createHermesDb(hermesHome)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'daily-cache-windows-session',
+        inputTokens: 123,
+        outputTokens: 45,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        actualCost: 0.75,
+        startedAt: sessionStartedAt,
+      })
+    })
+
+    const cachedDay = (date: string, provider: string, calls: number, cost: number, inputTokens: number): DailyEntry => {
+      const modelStats = {
+        calls,
+        cost,
+        savingsUSD: 0,
+        inputTokens,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+      }
+      const slice = {
+        calls,
+        cost,
+        savingsUSD: 0,
+        sessions: 1,
+        inputTokens,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        models: { 'gpt-5.5': modelStats },
+        categories: {},
+      }
+      return {
+        date,
+        cost,
+        savingsUSD: 0,
+        calls,
+        sessions: 1,
+        inputTokens,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        editTurns: 0,
+        oneShotTurns: 0,
+        models: { 'gpt-5.5': modelStats },
+        categories: {},
+        providers: { [provider]: slice },
+      }
+    }
+
+    await writeFile(join(cacheDir, 'daily-cache.v47.json'), JSON.stringify({
+      version: 47,
+      savingsConfigHash: '',
+      tzKey: currentTzKey(),
+      lastComputedDate: yesterday,
+      days: [
+        cachedDay(hermesDate, 'codex', 2, 0.4, 80),
+        cachedDay(sourceGoneDate, 'claude', 3, 1.2, 300),
+      ],
+      complete: true,
+      watermarkTrusted: true,
+    }), 'utf-8')
+
+    const { clearSessionCache, parseAllSessions } = await withProcessPlatform('win32', () =>
+      loadParserWithHermesHome(undefined, cacheDir),
+    )
+    clearSessionCache()
+    let reparsedProjects: Awaited<ReturnType<typeof parseAllSessions>> = []
+    const hydrated = await ensureCacheHydrated(
+      async range => {
+        reparsedProjects = await parseAllSessions(range)
+        return reparsedProjects
+      },
+      aggregateProjectsIntoDays,
+    )
+
+    expect(hydrated.version).toBe(DAILY_CACHE_VERSION)
+    expect(reparsedProjects.flatMap(project => project.sessions)).toHaveLength(1)
+    const refreshedHermesDay = hydrated.days.find(day => day.date === hermesDate)
+    expect(refreshedHermesDay?.providers['hermes']).toMatchObject({
+      calls: 1,
+      cost: 0.75,
+      inputTokens: 123,
+      outputTokens: 45,
+    })
+    expect(refreshedHermesDay?.providers['codex']).toMatchObject({ calls: 2, cost: 0.4, inputTokens: 80 })
+    expect(hydrated.days.find(day => day.date === sourceGoneDate)).toMatchObject({
+      carried: true,
+      providers: { claude: { calls: 3, cost: 1.2, inputTokens: 300 } },
+    })
+  })
+
+  it('falls back to the Windows home AppData path when LOCALAPPDATA is blank', async () => {
+    await withProcessPlatform('win32', async () => {
+      delete process.env['HERMES_HOME']
+      process.env['HOME'] = tmpDir
+      process.env['USERPROFILE'] = tmpDir
+      process.env['LOCALAPPDATA'] = '  \t  '
+      const hermesHome = join(homedir(), 'AppData', 'Local', 'hermes')
+      await createHermesDbWithSession(hermesHome, 'windows-fallback')
+
+      const provider = createHermesProvider()
+      expect(await provider.probeRoots()).toEqual([{ path: hermesHome, label: 'home' }])
+      expect((await provider.discoverSessions()).map(session => session.project)).toEqual(['hermes'])
+    })
+  })
+
+  it('keeps Unix home discovery and explicit Hermes home overrides', async () => {
+    await withProcessPlatform('linux', async () => {
+      delete process.env['HERMES_HOME']
+      process.env['HOME'] = tmpDir
+      process.env['USERPROFILE'] = tmpDir
+      delete process.env['LOCALAPPDATA']
+      const unixHome = join(homedir(), '.hermes')
+      await createHermesDbWithSession(unixHome, 'unix-default')
+
+      const defaultProvider = createHermesProvider()
+      expect(await defaultProvider.probeRoots()).toEqual([{ path: unixHome, label: 'home' }])
+
+      const localAppData = join(tmpDir, 'local-app-data')
+      const legacyHome = join(tmpDir, 'legacy-hermes-home')
+      process.env['LOCALAPPDATA'] = localAppData
+      process.env['HERMES_HOME'] = legacyHome
+      const envOverrideDb = await createHermesDbWithSession(legacyHome, 'env-override')
+      const envProvider = createHermesProvider()
+      expect(await envProvider.probeRoots()).toEqual([{ path: legacyHome, label: 'home' }])
+      expect((await envProvider.discoverSessions()).map(session => session.path)).toEqual([
+        `${envOverrideDb}#hermes-session=env-override`,
+      ])
+
+      const constructorOverride = join(tmpDir, 'constructor-hermes-home')
+      const constructorDb = await createHermesDbWithSession(constructorOverride, 'constructor-override')
+      const constructorProvider = createHermesProvider(constructorOverride)
+      expect(await constructorProvider.probeRoots()).toEqual([{ path: constructorOverride, label: 'home' }])
+      expect((await constructorProvider.discoverSessions()).map(session => session.path)).toEqual([
+        `${constructorDb}#hermes-session=constructor-override`,
+      ])
+    })
+  })
+
   it('discovers state.db sessions with token usage', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
@@ -222,7 +455,7 @@ skipUnlessSqlite('hermes provider', () => {
     expect(sessions).toHaveLength(1)
     expect(sessions[0]!.provider).toBe('hermes')
     expect(sessions[0]!.path).toBe(`${dbPath}#hermes-session=session-1`)
-    expect(sessions[0]!.project).toBe('default')
+    expect(sessions[0]!.project).toBe('hermes')
   })
 
   it('parses session-level token usage and tool calls from messages', async () => {
@@ -310,6 +543,86 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls).toHaveLength(1)
     expect(calls[0]!.costUSD).toBe(calculateCost('claude-sonnet-4-20250514', 1000, 250, 0, 0, 0))
     expect(calls[0]!.reasoningTokens).toBe(50)
+  })
+
+  it('carries the billing route the session recorded, and stays silent for every other door', async () => {
+    // billing_provider is the door the call went through; it was SELECTed and
+    // dropped before #1450. The direct `anthropic` door has no route: its row
+    // IS the direct row. `openrouter` joined `bedrock` once usage-bearing
+    // sessions existed (#1451); `bedrock-mantle` is still a real Hermes value
+    // with no sessions on disk, so it is treated as an unknown door.
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      const rows: Array<[string, string, string]> = [
+        ['route-bedrock', 'openai.gpt-5.6-luna', 'bedrock'],
+        ['route-plain-id-bedrock', 'claude-sonnet-4-5', 'bedrock'],
+        ['route-openrouter', 'claude-sonnet-4-5', 'openrouter'],
+        ['route-codex', 'gpt-5.6-sol', 'openai-codex'],
+        ['route-anthropic', 'claude-fable-5-1', 'anthropic'],
+        ['route-mantle', 'claude-fable-5-1', 'bedrock-mantle'],
+      ]
+      for (const [id, model, billingProvider] of rows) {
+        insertSession(db, { id, model, billingProvider, inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, startedAt: 1779549200 })
+        db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)').run(id, 'user', 'hi', 1779549201)
+      }
+    })
+
+    const byId = new Map<string, ParsedProviderCall>()
+    for (const id of ['route-bedrock', 'route-plain-id-bedrock', 'route-openrouter', 'route-codex', 'route-anthropic', 'route-mantle']) {
+      const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=${id}`)
+      expect(calls, id).toHaveLength(1)
+      byId.set(id, calls[0]!)
+    }
+    expect(byId.get('route-bedrock')!.route).toBe('bedrock')
+    expect(byId.get('route-plain-id-bedrock')!.route).toBe('bedrock')
+    expect(byId.get('route-openrouter')!.route).toBe('openrouter')
+    for (const id of ['route-codex', 'route-anthropic', 'route-mantle']) {
+      expect(byId.get(id)!.route, id).toBeUndefined()
+    }
+  })
+
+  it('carries the billing mode only where the session recorded the cost basis', async () => {
+    // Hermes resolves each session's cost to a basis. `included` is usage a
+    // subscription already paid for; an `actual` amount is a recorded invoice
+    // line, so it is metered — an explicit $0 still counts as recorded, which
+    // is what the two OpenRouter `:free` sessions of 2026-09-18 look like. An
+    // estimate proves nothing about which account was charged, so it carries
+    // no mode at all rather than being guessed into one.
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      const rows: Array<{ id: string; billingProvider: string; costStatus?: string; actualCost?: number | null }> = [
+        { id: 'basis-included', billingProvider: 'openai-codex', costStatus: 'included' },
+        { id: 'basis-actual', billingProvider: 'anthropic', actualCost: 0.42 },
+        { id: 'basis-openrouter-free', billingProvider: 'openrouter', actualCost: 0 },
+        { id: 'basis-estimated', billingProvider: 'anthropic', costStatus: 'estimated' },
+        { id: 'basis-calculated', billingProvider: 'anthropic' },
+        // A recorded `included` outranks the door's own metered default.
+        { id: 'basis-included-on-bedrock', billingProvider: 'bedrock', costStatus: 'included' },
+      ]
+      for (const row of rows) {
+        insertSession(db, {
+          id: row.id, model: 'claude-sonnet-4-5', billingProvider: row.billingProvider,
+          costStatus: row.costStatus, actualCost: row.actualCost ?? null, estimatedCost: row.costStatus === 'estimated' ? 0.01 : null,
+          inputTokens: 1000, outputTokens: 100, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, startedAt: 1779549200,
+        })
+        db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)').run(row.id, 'user', 'hi', 1779549201)
+      }
+    })
+
+    const byId = new Map<string, ParsedProviderCall>()
+    for (const id of ['basis-included', 'basis-actual', 'basis-openrouter-free', 'basis-estimated', 'basis-calculated', 'basis-included-on-bedrock']) {
+      const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=${id}`)
+      expect(calls, id).toHaveLength(1)
+      byId.set(id, calls[0]!)
+    }
+    expect(byId.get('basis-included')!.billing).toBe('subscription')
+    expect(byId.get('basis-included-on-bedrock')!.billing).toBe('subscription')
+    expect(byId.get('basis-actual')!.billing).toBe('metered')
+    expect(byId.get('basis-openrouter-free')!.billing).toBe('metered')
+    expect(byId.get('basis-openrouter-free')!.route).toBe('openrouter')
+    for (const id of ['basis-estimated', 'basis-calculated']) {
+      expect(byId.get(id)!.billing, id).toBeUndefined()
+    }
   })
 
   it('does not split multibyte characters when truncating the first user message', async () => {
@@ -407,7 +720,7 @@ skipUnlessSqlite('hermes provider', () => {
       `${profileDbPath}#hermes-session=profile-session`,
       `${rootDbPath}#hermes-session=root-session`,
     ].sort())
-    expect(discovered.map(s => s.project).sort()).toEqual(['coder', 'default'])
+    expect(discovered.map(s => s.project).sort()).toEqual(['coder', 'hermes'])
 
     const rootCalls = await collectCalls(tmpDir, `${rootDbPath}#hermes-session=root-session`)
     const profileCalls = await collectCalls(tmpDir, `${profileDbPath}#hermes-session=profile-session`)
@@ -425,11 +738,54 @@ skipUnlessSqlite('hermes provider', () => {
     expect(sessions.reduce((sum, session) => sum + session.totalCacheReadTokens, 0)).toBe(41)
     expect(sessions.reduce((sum, session) => sum + session.totalCacheWriteTokens, 0)).toBe(53)
     expect(sessions.reduce((sum, session) => sum + session.totalCostUSD, 0)).toBeCloseTo(0.72)
+    // Prompt-derived names remain useful for local grouping, but never become
+    // trusted projectPath/workingDirectory provenance.
     expect(projects.map(project => project.project).sort()).toEqual(['tmp-profile-project', 'tmp-root-project'])
 
     const modelTokens = sessions.flatMap(session => Object.values(session.modelBreakdown).map(model => model.tokens))
     expect(modelTokens.reduce((sum, tokens) => sum + tokens.outputTokens, 0)).toBe(90)
     expect(modelTokens.reduce((sum, tokens) => sum + tokens.reasoningTokens, 0)).toBe(22)
+  })
+
+  // Regression for issue #913: Hermes writes state.db in WAL mode and keeps
+  // the writer connection open for the life of the agent, so recent sessions
+  // live in state.db-wal while the main file's mtime stays at the last
+  // checkpoint. The date-range mtime pre-filter in parseProviderSources
+  // then reads the source as "older than the range" and skips it, and every
+  // session committed since the last checkpoint disappears from reports.
+  // The fingerprint must fold the -wal sibling in so a stale main-file stat
+  // cannot hide fresh sessions.
+  it('still parses sessions committed to the WAL when the main db stat is checkpoint-stale', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'wal-session',
+        inputTokens: 100,
+        outputTokens: 20,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+        title: 'WAL Session',
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('wal-session', 'user', 'Session committed after the last checkpoint', 1779549201)
+    })
+
+    // Simulate the WAL-mode stat shape: the main file's mtime predates the
+    // requested range (last checkpoint days ago), while a fresh -wal sibling
+    // holds the recent commits. The db itself was written in rollback-journal
+    // mode, so SQLite ignores the stray -wal on open; only its stat matters.
+    const beforeRange = new Date('2026-05-20T00:00:00.000Z')
+    await utimes(dbPath, beforeRange, beforeRange)
+    await writeFile(`${dbPath}-wal`, 'wal-frames')
+
+    const { clearSessionCache, parseAllSessions } = await loadParserWithHermesHome(tmpDir, cacheDir)
+    clearSessionCache()
+    const projects = await parseAllSessions(dayRange(), 'hermes')
+    const sessions = projects.flatMap(project => project.sessions)
+    expect(sessions).toHaveLength(1)
+    expect(sessions[0]!.totalInputTokens).toBe(100)
   })
 
   it('treats sibling profile-like directories as default sessions', async () => {
@@ -454,11 +810,395 @@ skipUnlessSqlite('hermes provider', () => {
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=sibling-session`)
     expect(calls[0]).toMatchObject({
       deduplicationKey: 'hermes:default:sibling-session',
-      project: 'default',
+      project: 'hermes',
     })
   })
 
-  it('infers projects from Windows current working directory messages', async () => {
+  it('does not attribute pull URLs without an origin-backed workspace', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'pr-session',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('pr-session', 'assistant', 'Opened https://github.com/getagentseal/codeburn/pull/1037 for review', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-session`)
+    expect(calls[0]?.prLinks).toBeUndefined()
+    expect(calls[0]?.project).toBe('hermes')
+  })
+
+  it('captures GitHub pull URLs that are wrapped in prose punctuation', async () => {
+    const repo = join(tmpDir, 'punct-repo')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'pr-punct',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('pr-punct', 'assistant', 'See (https://github.com/getagentseal/codeburn/pull/1037).', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-punct`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
+  })
+
+  it('ignores GitHub pull URLs that only appear in tool dumps', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'tool-pr-noise',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('tool-pr-noise', 'tool', 'https://github.com/getagentseal/codeburn/pull/677 https://github.com/getagentseal/codeburn/pull/691', 1779549201)
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('tool-pr-noise', 'assistant', 'Closed the stale draft. Next is Keychain.', 1779549202)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=tool-pr-noise`)
+    expect(calls[0]?.prLinks).toBeUndefined()
+  })
+
+  it('keeps ACP sessions on Hermes because source=acp is a transport, not Buzz', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'acp-session',
+        source: 'acp',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('acp-session', 'user', 'hello from buzz', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=acp-session`)
+    expect(calls[0]).toMatchObject({
+      provider: 'hermes',
+      project: 'hermes',
+    })
+  })
+
+  it('does not treat $HOME as a project', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'home-cwd',
+        source: 'desktop',
+        cwd: homedir(),
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('home-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=home-cwd`)
+    expect(calls[0]?.provider).toBe('hermes')
+    expect(calls[0]?.project).toBe('hermes')
+    expect(calls[0]?.workingDirectory).toBeUndefined()
+  })
+
+  it('does not treat a relative cwd as a workspace', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'rel-cwd',
+        source: 'desktop',
+        cwd: '.',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('rel-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=rel-cwd`)
+    expect(calls[0]?.project).toBe('hermes')
+    expect(calls[0]?.projectPath).toBeUndefined()
+  })
+
+  it('ignores fenced and unrelated-repo pull URLs when a git root is known', async () => {
+    const repo = join(tmpDir, 'codeburn-src')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'pr-filter',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run(
+          'pr-filter',
+          'assistant',
+          [
+            'Opened https://github.com/getagentseal/codeburn/pull/1037',
+            'Also see https://github.com/evil/codeburn/pull/2',
+            '```',
+            'https://github.com/getagentseal/codeburn/pull/677',
+            '```',
+            '~~~',
+            'https://github.com/getagentseal/codeburn/pull/4',
+            '~~~',
+          ].join('\n'),
+          1779549201,
+        )
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=pr-filter`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/1037'])
+    expect(calls[0]?.project).toBe('codeburn-src')
+  })
+
+  it('uses origin even when another remote is listed first', async () => {
+    const repo = join(tmpDir, 'multi-remote')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(
+      join(repo, '.git', 'config'),
+      [
+        '[remote "evil"]',
+        '\turl = https://github.com/evil/codeburn.git',
+        '[remote "origin"]',
+        '\turl = https://github.com/getagentseal/codeburn.git',
+        '',
+      ].join('\n'),
+    )
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'origin-wins',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run(
+          'origin-wins',
+          'assistant',
+          'https://github.com/evil/codeburn/pull/3 https://github.com/getagentseal/codeburn/pull/4',
+          1779549201,
+        )
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=origin-wins`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/4'])
+  })
+
+  it('emits no pull links when only upstream exists', async () => {
+    const repo = join(tmpDir, 'upstream-only')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "upstream"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'upstream-only',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('upstream-only', 'assistant', 'https://github.com/getagentseal/codeburn/pull/2', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=upstream-only`)
+    expect(calls[0]?.prLinks).toBeUndefined()
+  })
+
+  it('ignores unclosed fenced pull URLs', async () => {
+    const repo = join(tmpDir, 'unclosed-fence')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'unclosed',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run(
+          'unclosed',
+          'assistant',
+          'Opened https://github.com/getagentseal/codeburn/pull/8\n~~~\nhttps://github.com/getagentseal/codeburn/pull/6',
+          1779549201,
+        )
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=unclosed`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/8'])
+  })
+
+  it('ignores unclosed backtick fences and non-GitHub origin', async () => {
+    const repo = join(tmpDir, 'unclosed-tick')
+    await mkdir(join(repo, '.git'), { recursive: true })
+    await writeFile(join(repo, '.git', 'config'), '[remote "origin"]\n\turl = https://github.com/getagentseal/codeburn.git\n')
+    const other = join(tmpDir, 'gitlab-origin')
+    await mkdir(join(other, '.git'), { recursive: true })
+    await writeFile(join(other, '.git', 'config'), '[remote "origin"]\n\turl = git@gitlab.com:getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'unclosed-tick',
+        gitRepoRoot: repo,
+        inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      insertSession(db, {
+        id: 'gitlab-origin',
+        gitRepoRoot: other,
+        inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0,
+        startedAt: 1779549300,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('unclosed-tick', 'assistant', 'Opened https://github.com/getagentseal/codeburn/pull/10\n```\nhttps://github.com/getagentseal/codeburn/pull/11', 1779549201)
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('gitlab-origin', 'assistant', 'https://github.com/getagentseal/codeburn/pull/12', 1779549301)
+    })
+
+    const tick = await collectCalls(tmpDir, `${dbPath}#hermes-session=unclosed-tick`)
+    expect(tick[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/10'])
+    const gitlab = await collectCalls(tmpDir, `${dbPath}#hermes-session=gitlab-origin`)
+    expect(gitlab[0]?.prLinks).toBeUndefined()
+  })
+
+  it('reads origin from a linked worktree commondir', async () => {
+    const common = join(tmpDir, 'main.git')
+    const worktreeGit = join(tmpDir, 'main.git', 'worktrees', 'wt')
+    const repo = join(tmpDir, 'linked-wt')
+    await mkdir(worktreeGit, { recursive: true })
+    await mkdir(repo, { recursive: true })
+    await writeFile(join(repo, '.git'), `gitdir: ${worktreeGit}\n`)
+    await writeFile(join(worktreeGit, 'commondir'), `${common}\n`)
+    await writeFile(join(common, 'config'), '[remote "origin"]\n\turl = git@github.com:getagentseal/codeburn.git\n')
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'wt-origin',
+        gitRepoRoot: repo,
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('wt-origin', 'assistant', 'https://github.com/getagentseal/codeburn/pull/9', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=wt-origin`)
+    expect(calls[0]?.prLinks).toEqual(['https://github.com/getagentseal/codeburn/pull/9'])
+  })
+
+  it('rejects a slash-UNC path as a workspace on POSIX', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'unc-cwd',
+        source: 'desktop',
+        cwd: '//server/share/repo',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('unc-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=unc-cwd`)
+    expect(calls[0]?.project).toBe('hermes')
+    expect(calls[0]?.projectPath).toBeUndefined()
+  })
+
+  it('takes a drive-letter cwd as a workspace only on a Windows host', async () => {
+    const dbPath = createHermesDb(tmpDir)
+    withTestDb(dbPath, (db) => {
+      insertSession(db, {
+        id: 'drive-cwd',
+        source: 'desktop',
+        cwd: 'C:\\repos\\codeburn',
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0,
+        startedAt: 1779549200,
+      })
+      db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
+        .run('drive-cwd', 'user', 'hi', 1779549201)
+    })
+
+    const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=drive-cwd`)
+    // A state.db is only ever read from this host's own Hermes home, so a
+    // drive-letter path is a real workspace on Windows and an odd relative
+    // filename anywhere else.
+    if (process.platform === 'win32') {
+      expect(calls[0]?.projectPath).toBe('C:\\repos\\codeburn')
+      expect(calls[0]?.workingDirectory).toBe('C:\\repos\\codeburn')
+    } else {
+      expect(calls[0]?.project).toBe('hermes')
+      expect(calls[0]?.projectPath).toBeUndefined()
+    }
+  })
+
+  it('never promotes prompt text into project or cwd provenance', async () => {
     const dbPath = createHermesDb(tmpDir)
     withTestDb(dbPath, (db) => {
       insertSession(db, {
@@ -471,14 +1211,13 @@ skipUnlessSqlite('hermes provider', () => {
         startedAt: 1779549200,
       })
       db.prepare('INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)')
-        .run('windows-cwd-session', 'user', 'Current working directory: C:\\AI_LAB\\OPENCLAW\nAdd Windows path support', 1779549201)
+        .run('windows-cwd-session', 'user', 'Current working directory: /tmp/secret-client\nAdd path support', 1779549201)
     })
 
     const calls = await collectCalls(tmpDir, `${dbPath}#hermes-session=windows-cwd-session`)
-    expect(calls[0]).toMatchObject({
-      project: 'C--AI_LAB-OPENCLAW',
-      projectPath: 'C:\\AI_LAB\\OPENCLAW',
-    })
+    expect(calls[0]?.project).toBe('tmp-secret-client')
+    expect(calls[0]?.projectPath).toBeUndefined()
+    expect(calls[0]?.workingDirectory).toBeUndefined()
   })
 
   it('groups by the sessions.cwd column when present, ahead of message scraping', async () => {
@@ -502,6 +1241,7 @@ skipUnlessSqlite('hermes provider', () => {
     expect(calls[0]).toMatchObject({
       project: 'Users-me-projects-codeburn',
       projectPath: '/Users/me/projects/codeburn',
+      workingDirectory: '/Users/me/projects/codeburn',
     })
   })
 

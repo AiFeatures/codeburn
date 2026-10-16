@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { aggregateSessions, renderJson, renderTable } from '../src/sessions-report.js'
-import type { ClassifiedTurn, ProjectSummary, SessionSummary } from '../src/types.js'
+import { aggregateByBranch, aggregateSessions, attributeSessionPrSpend, renderJson, renderTable } from '../src/sessions-report.js'
+import type { ClassifiedTurn, ParsedApiCall, ProjectSummary, SessionSummary } from '../src/types.js'
 
 function makeProject(): ProjectSummary {
   const turn: ClassifiedTurn = {
@@ -93,7 +93,31 @@ describe('sessions JSON emitter', () => {
       startedAt: '2026-07-10T10:00:00.000Z',
       endedAt: '2026-07-10T10:05:00.000Z',
       durationMs: 300_000,
+      estimatedCost: 0,
+      isEstimated: false,
     }])
+  })
+
+  it('marks an estimated session row and explains the marker under the table', () => {
+    const project = makeProject()
+    project.sessions[0]!.totalEstimatedCostUSD = 0.12
+    const rows = aggregateSessions([project])
+    expect(rows[0]).toMatchObject({ cost: 0.12, estimatedCost: 0.12, isEstimated: true })
+    const output = renderTable(rows, { terminalWidth: 120 })
+    expect(output).toContain('~$0.12')
+    expect(output.split('\n').at(-1)).toBe('~ estimated cost (priced from estimated tokens)')
+    expect(renderTable(aggregateSessions([makeProject()]), { terminalWidth: 120 })).not.toContain('estimated')
+  })
+
+  it('does not mark a fully estimated session whose cost prints as $0.00', () => {
+    const project = makeProject()
+    project.sessions[0]!.totalCostUSD = 0.0003
+    project.sessions[0]!.totalEstimatedCostUSD = 0.0003
+    const rows = aggregateSessions([project])
+    expect(rows[0]).toMatchObject({ estimatedCost: 0.0003, isEstimated: false })
+    const output = renderTable(rows, { terminalWidth: 120 })
+    expect(output).toContain('$0.00')
+    expect(output).not.toContain('~')
   })
 
   it('renders a simple table', () => {
@@ -107,21 +131,21 @@ describe('sessions JSON emitter', () => {
   it('hides home-directory slugs and renders compact agent/worktree names', () => {
     const rows = aggregateSessions([makeProject()])
     rows[0]!.sessionId = 'agent-a72cc958e305e4957'
-    rows[0]!.project = '-Users-torukmakto-Projects-eywa-eywa--claude-worktrees-issue-131'
+    rows[0]!.project = '-Users-devuser-Projects-eywa-eywa--claude-worktrees-issue-131'
     const output = renderTable(rows, { terminalWidth: 160 })
 
     expect(output).toContain('Agent a72cc958')
     expect(output).toContain('eywa · issue-131')
-    expect(output).not.toContain('Users-torukmakto')
+    expect(output).not.toContain('Users-devuser')
   })
 
   it('normalizes Claude dot-worktree slugs without exposing the home directory', () => {
     const rows = aggregateSessions([makeProject()])
-    rows[0]!.project = 'Users-torukmakto-codeburn-.claude-worktrees-agent-a213f7c77871f483f'
+    rows[0]!.project = 'Users-devuser-codeburn-.claude-worktrees-agent-a213f7c77871f483f'
     const output = renderTable(rows, { terminalWidth: 120 })
 
     expect(output).toContain('codeburn · agent a213f7c7')
-    expect(output).not.toContain('Users-torukmakto')
+    expect(output).not.toContain('Users-devuser')
     expect(output).not.toContain('.claude-worktrees')
   })
 
@@ -141,5 +165,68 @@ describe('sessions JSON emitter', () => {
     expect(output.indexOf('Review the')).toBeLessThan(output.indexOf('Older task'))
     expect(output).not.toContain('Users-private')
     expect(Math.max(...lines.slice(0, -1).map(line => line.length))).toBeLessThanOrEqual(80)
+  })
+})
+
+// A copilot serve set pairs some calls with an already-counted per-turn call
+// (shutdown rollups, residuals, store rows). Their tokens and cost are real and
+// must survive into every spend surface, but they carry no behavioral weight, so
+// no user-visible calls/turns counter may count them.
+function copilotCall(overrides: Partial<ParsedApiCall> & { deduplicationKey: string }): ParsedApiCall {
+  return { ...makeProject().sessions[0]!.turns[0]!.assistantCalls[0]!, provider: 'copilot', ...overrides }
+}
+
+function makeSupplementaryProject(): ProjectSummary {
+  const project = makeProject()
+  const session = project.sessions[0]!
+  const mixed = session.turns[0]!
+  mixed.gitBranch = 'feat/copilot'
+  mixed.assistantCalls = [
+    copilotCall({ deduplicationKey: 'behavioral-1', costUSD: 0.10 }),
+    copilotCall({ deduplicationKey: 'supp-1', costUSD: 0.02, supplementaryAccounting: true }),
+  ]
+  session.turns.push({
+    ...mixed,
+    gitBranch: undefined,
+    timestamp: '2026-07-10T10:02:00.000Z',
+    assistantCalls: [copilotCall({ deduplicationKey: 'supp-2', costUSD: 0.05, supplementaryAccounting: true })],
+  })
+  session.apiCalls = 1
+  session.totalCostUSD = 0.17
+  return project
+}
+
+describe('supplementary accounting weight', () => {
+  it('counts only turns with a behavioral call in the session rows', () => {
+    const rows = aggregateSessions([makeSupplementaryProject()])
+    expect(rows[0]!.turns).toBe(1)
+    expect(rows[0]!.calls).toBe(1)
+    expect(rows[0]!.cost).toBeCloseTo(0.17)
+  })
+
+  it('attributes supplementary spend to a PR while counting only behavioral calls', () => {
+    const url = 'https://github.com/acme/app/pull/7'
+    const { perUrl } = attributeSessionPrSpend({
+      turns: [
+        { prRefs: [url], assistantCalls: [{ costUSD: 0.10 }, { costUSD: 0.02, supplementaryAccounting: true }] },
+        // Supplementary-only turn: no calls, but its cost still belongs to the PR.
+        { assistantCalls: [{ costUSD: 0.05, supplementaryAccounting: true }] },
+      ],
+      totalCostUSD: 0.17,
+      apiCalls: 1,
+      totalSavingsUSD: 0,
+    })
+
+    const pr = perUrl.get(url)!
+    expect(pr.calls).toBe(1)
+    expect(pr.cost).toBeCloseTo(0.17)
+  })
+
+  it('attributes supplementary spend to a branch while counting only behavioral calls', () => {
+    const rows = aggregateByBranch([makeSupplementaryProject()])
+    expect(rows).toHaveLength(1)
+    expect(rows[0]!.branch).toBe('feat/copilot')
+    expect(rows[0]!.calls).toBe(1)
+    expect(rows[0]!.cost).toBeCloseTo(0.17)
   })
 })

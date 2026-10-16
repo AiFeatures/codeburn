@@ -10,8 +10,10 @@ Hermes Agent CLI profiles.
 
 | Source | Path |
 |---|---|
-| Default Hermes profile | `$HERMES_HOME/state.db` if set, otherwise `~/.hermes/state.db` |
-| Named Hermes profiles | `$HERMES_HOME/profiles/<profile>/state.db` |
+| Default Hermes profile | `$HERMES_HOME/state.db` if set; otherwise `%LOCALAPPDATA%/hermes/state.db` on Windows (falling back to `AppData/Local/hermes` under the home directory), or `~/.hermes/state.db` on macOS/Linux |
+| Named Hermes profiles | `<Hermes home>/profiles/<profile>/state.db` |
+
+`HERMES_HOME` takes precedence on every platform, so it can point CodeBurn to a legacy or custom Hermes installation. Windows uses the same home for its default database and named profiles.
 
 ## Storage format
 
@@ -29,6 +31,10 @@ Hermes stores durable token accounting at the session level, so CodeBurn emits o
 - actual or estimated cost when Hermes recorded one
 
 If Hermes recorded no positive cost, CodeBurn falls back to its normal model pricing table.
+
+## Billing route
+
+Hermes records the door a session was billed through separately from the model: `sessions.billing_provider` is `anthropic`, `openai-codex`, `bedrock`, … The parser maps it through `routeFromProviderField` to the call's `route` (`bedrock`; every other value, direct doors included, maps to none), so a session on `--provider bedrock` lands in a `Fable 5.1 (Bedrock)` row next to — never merged with — the direct row. For a Bedrock session the model column already carries Bedrock's id, so the id shape and the column agree. The route rides on the cached call; the `billing-route-v1` parse version forces one re-parse of sessions cached before it existed.
 
 ## Project grouping
 
@@ -51,7 +57,7 @@ Terminal command arguments are exposed as `bashCommands` for CodeBurn's command 
 
 ## Caching
 
-The shared session cache fingerprints Hermes state DB files. `HERMES_HOME` is included in the provider environment fingerprint so changing the runtime home invalidates stale cached results.
+The shared session cache fingerprints Hermes state DB files. `HERMES_HOME` and `LOCALAPPDATA` are included in the provider environment fingerprint so changing either configured home invalidates stale cached results.
 
 ## Quirks
 
@@ -62,6 +68,6 @@ The shared session cache fingerprints Hermes state DB files. `HERMES_HOME` is in
 ## When fixing a bug here
 
 1. Reproduce against a real Hermes `state.db` or a minimal SQLite fixture.
-2. Run `npm test -- tests/providers/hermes.test.ts --run`.
+2. Run `npx vitest run tests/providers/hermes.test.ts`.
 3. For local smoke testing, use an isolated cache directory, for example:
    `CODEBURN_CACHE_DIR=/tmp/codeburn-hermes-cache node --import tsx -e "import { parseAllSessions } from './src/parser.ts'; console.log(await parseAllSessions(undefined, 'hermes'))"`.

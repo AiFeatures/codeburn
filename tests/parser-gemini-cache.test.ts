@@ -5,8 +5,10 @@ import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { CACHE_VERSION, computeEnvFingerprint, sessionCachePath } from '../src/session-cache.js'
+import { CACHE_VERSION, computeEnvFingerprint, type SessionCache } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 import type { DateRange } from '../src/types.js'
+import { setHome } from './setup/home.js'
 
 let home: string
 let cacheDir: string
@@ -14,7 +16,7 @@ let cacheDir: string
 beforeEach(async () => {
   home = await mkdtemp(join(tmpdir(), 'codeburn-gemini-home-'))
   cacheDir = await mkdtemp(join(tmpdir(), 'codeburn-gemini-cache-'))
-  process.env['HOME'] = home
+  setHome(home)
   process.env['CODEBURN_CACHE_DIR'] = cacheDir
 })
 
@@ -54,7 +56,7 @@ describe('Gemini session cache migration', () => {
     }))
 
     const fileStat = await stat(sessionPath)
-    await writeFile(sessionCachePath(), JSON.stringify({
+    await writeCacheOnDisk({
       version: CACHE_VERSION,
       providers: {
         gemini: {
@@ -97,7 +99,7 @@ describe('Gemini session cache migration', () => {
           },
         },
       },
-    }))
+    } as SessionCache)
 
     const range: DateRange = {
       start: new Date('2026-05-16T00:00:00.000Z'),
@@ -117,7 +119,7 @@ describe('Gemini session cache migration', () => {
       'gemini:gemini-session-1:g2',
     ])
 
-    const savedCache = JSON.parse(await readFile(sessionCachePath(), 'utf-8'))
+    const savedCache = await readCacheOnDisk() as any
     const savedKeys = savedCache.providers.gemini.files[sessionPath].turns.flatMap((turn: { calls: Array<{ deduplicationKey: string }> }) =>
       turn.calls.map(call => call.deduplicationKey),
     )

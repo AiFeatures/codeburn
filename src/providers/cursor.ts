@@ -1,14 +1,25 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
+import { getEditorDataDir } from '../editor-data-dir.js'
 
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { readCachedResults, writeCachedResults } from '../cursor-cache.js'
-import { isSqliteAvailable, isSqliteBusyError, getSqliteLoadError, openDatabase, blobToText, type SqliteDatabase } from '../sqlite.js'
+import { importSource, importSourceParser } from '../cursor-import.js'
+import {
+  isSqliteAvailable,
+  isSqliteBusyError,
+  getSqliteLoadError,
+  openDatabase,
+  blobToText,
+  isSqliteReadonlyError,
+  warnSqliteReadonlyOnce,
+  type SqliteDatabase,
+} from '../sqlite.js'
 import { estimateTokensFromChars } from '../token-estimate.js'
 import type { DateRange } from '../types.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 /** Matches cli-date.ts "all" period cap (6 months). */
 const CURSOR_MAX_LOOKBACK_MONTHS = 6
@@ -75,14 +86,8 @@ function rethrowBusy(err: unknown): void {
   if (isSqliteBusyError(err)) throw err
 }
 
-function getCursorDbPath(): string {
-  if (process.platform === 'darwin') {
-    return join(homedir(), 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'state.vscdb')
-  }
-  if (process.platform === 'win32') {
-    return join(homedir(), 'AppData', 'Roaming', 'Cursor', 'User', 'globalStorage', 'state.vscdb')
-  }
-  return join(homedir(), '.config', 'Cursor', 'User', 'globalStorage', 'state.vscdb')
+export function getCursorDbPath(): string {
+  return join(getEditorDataDir('Cursor', homedir(), process.platform), 'User', 'globalStorage', 'state.vscdb')
 }
 
 function getCursorWorkspaceStorageDir(globalDbPath: string): string {
@@ -188,7 +193,8 @@ function loadWorkspaceMap(workspaceStorageDir: string): WorkspaceMapping {
     let db: SqliteDatabase
     try {
       db = openDatabase(wsDbPath)
-    } catch {
+    } catch (err) {
+      if (isSqliteReadonlyError(err)) warnSqliteReadonlyOnce(wsDbPath)
       continue
     }
     try {
@@ -936,12 +942,13 @@ function parseBubbles(
   return { calls: results }
 }
 
+// Always the full lookback, never the requested range: the session cache keys
+// this parse on the DB fingerprint alone and serves it to every later range.
 function createParser(
   source: SessionSource,
   seenKeys: Set<string>,
-  dateRange?: DateRange,
 ): SessionParser {
-  const timeFloor = getCursorTimeFloor(dateRange)
+  const timeFloor = getCursorTimeFloor()
 
   return {
     async *parse(): AsyncGenerator<ParsedProviderCall> {
@@ -1045,11 +1052,16 @@ export function createCursorProvider(dbPathOverride?: string): Provider {
       return rawTool
     },
 
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: dbPathOverride ?? getCursorDbPath(), label: 'db' }]
+    },
+
     async discoverSessions(): Promise<SessionSource[]> {
-      if (!isSqliteAvailable()) return []
+      const imported = importSource('cursor')
+      if (!isSqliteAvailable()) return imported
 
       const dbPath = dbPathOverride ?? getCursorDbPath()
-      if (!existsSync(dbPath)) return []
+      if (!existsSync(dbPath)) return imported
 
       const wsMap = loadWorkspaceMap(getCursorWorkspaceStorageDir(dbPath))
       const sources: SessionSource[] = []
@@ -1071,11 +1083,11 @@ export function createCursorProvider(dbPathOverride?: string): Provider {
         project: ORPHAN_PROJECT,
         provider: 'cursor',
       })
-      return sources
+      return [...sources, ...imported]
     },
 
-    createSessionParser(source: SessionSource, seenKeys: Set<string>, dateRange?: DateRange): SessionParser {
-      return createParser(source, seenKeys, dateRange)
+    createSessionParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
+      return importSourceParser(source, seenKeys, 'cursor') ?? createParser(source, seenKeys)
     },
   }
 }

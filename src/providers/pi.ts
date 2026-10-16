@@ -1,21 +1,13 @@
+import type { Dirent } from 'node:fs'
 import { readdir, stat } from 'fs/promises'
 import { basename, join } from 'path'
 import { homedir } from 'os'
 
-import { readSessionFile } from '../fs-utils.js'
+import { readSessionFile, readSessionLines } from '../fs-utils.js'
 import { calculateCost } from '../models.js'
 import { extractBashCommands } from '../bash-utils.js'
 import { normalizeContentBlocks } from '../content-utils.js'
-import type { Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
-
-const modelDisplayNames: Record<string, string> = {
-  'gpt-5.4': 'GPT-5.4',
-  'gpt-5.4-mini': 'GPT-5.4 Mini',
-  'gpt-5.5': 'GPT-5.5',
-  'gpt-5': 'GPT-5',
-  'gpt-4o': 'GPT-4o',
-  'gpt-4o-mini': 'GPT-4o Mini',
-}
+import type { ProbeRoot, Provider, SessionSource, SessionParser, ParsedProviderCall } from './types.js'
 
 const toolNameMap: Record<string, string> = {
   bash: 'Bash',
@@ -31,9 +23,6 @@ const toolNameMap: Record<string, string> = {
   todo: 'TodoWrite',
   patch: 'Patch',
 }
-
-// Pre-sorted by key length descending so longer/more-specific keys match first
-const modelDisplayEntries = Object.entries(modelDisplayNames).sort((a, b) => b[0].length - a[0].length)
 
 // Pi/OMP have no dedicated skill tool the way Claude Code does. A native skill
 // load is emitted as an ordinary `read` tool call whose path points at the
@@ -68,17 +57,85 @@ type PiEntry = {
   id?: string
   timestamp?: string
   cwd?: string
+  model?: string
+  // `model_usage` entries (OMP side calls) carry these at the top level.
+  provider?: string
+  purpose?: string
+  stopReason?: string
+  usage?: {
+    input?: number
+    output?: number
+    cacheRead?: number
+    cacheWrite?: number
+    cost?: { total?: number }
+  }
   message?: {
     role?: string
     content?: Array<{ type?: string; text?: string; name?: string; arguments?: Record<string, unknown> }> | string
     model?: string
     responseId?: string
+    attribution?: {
+      timestamp?: number
+    }
     usage?: {
       input: number
       output: number
       cacheRead: number
       cacheWrite: number
+      cost?: {
+        total?: number
+      }
     }
+  }
+}
+
+// OMP logs side calls outside the assistant transcript as `model_usage`
+// entries: find and judge decisions (Jev), cache warming, and similar. They
+// never duplicate an assistant message, so each one counts as its own call.
+// The tool column carries the purpose, such as `find`, so a report can split
+// decision spend from chat spend.
+function modelUsageCall(entry: PiEntry, source: SessionSource, sessionId: string, lineIdx: number,
+                        sessionTimestamp: string, seenKeys: Set<string>): ParsedProviderCall | null {
+  const usage = entry.usage
+  if (!usage) return null
+  const input = usage.input ?? 0
+  const output = usage.output ?? 0
+  const cacheRead = usage.cacheRead ?? 0
+  const cacheWrite = usage.cacheWrite ?? 0
+  if (input === 0 && output === 0 && cacheRead === 0) return null
+  const bare = entry.model ?? ''
+  // OMP writes routed ids such as `~typesafe/jev-latest` beside provider
+  // `openrouter`. The provider prefix keeps them distinct and priceable.
+  const model = !entry.provider || bare.startsWith(`${entry.provider}/`) ? bare : `${entry.provider}/${bare}`
+  if (!model) return null
+  const dedupKey = `${source.provider}:${source.path}:model_usage:${entry.id || entry.timestamp || String(lineIdx)}`
+  if (seenKeys.has(dedupKey)) return null
+  seenKeys.add(dedupKey)
+  const reported = usage.cost?.total
+  const costUSD = typeof reported === 'number' && Number.isFinite(reported) && reported !== 0
+    ? reported
+    : calculateCost(model, input, output, cacheWrite, cacheRead, 0)
+  const timestamp = entry.timestamp || sessionTimestamp
+  if (!timestamp) return null
+  return {
+    provider: source.provider,
+    model,
+    inputTokens: input,
+    outputTokens: output,
+    cacheCreationInputTokens: cacheWrite,
+    cacheReadInputTokens: cacheRead,
+    cachedInputTokens: cacheRead,
+    reasoningTokens: 0,
+    webSearchRequests: 0,
+    costUSD,
+    tools: [entry.purpose ? `omp:${entry.purpose}` : 'omp:side-call'],
+    bashCommands: [],
+    skills: [],
+    timestamp,
+    speed: 'standard',
+    deduplicationKey: dedupKey,
+    userMessage: '',
+    sessionId,
   }
 }
 
@@ -90,16 +147,36 @@ function getOmpSessionsDir(override?: string): string {
   return override ?? join(homedir(), '.omp', 'agent', 'sessions')
 }
 
-async function readFirstEntry(filePath: string): Promise<PiEntry | null> {
-  const content = await readSessionFile(filePath)
-  if (content === null) return null
-  const line = content.split('\n')[0]
-  if (!line?.trim()) return null
-  try {
-    return JSON.parse(line) as PiEntry
-  } catch {
-    return null
+// OMP can write a fixed-width title metadata line (`type: "title"`) before the
+// `type: "session"` header (issue #845), and either provider may pad the
+// header with blank lines. Scan a bounded number of leading lines rather than
+// just the first one, and rather than the whole file (issue #846 read each
+// transcript in full to reach line 0), so discovery stays cheap even when a
+// file turns out to have no session record at all (a message-only file, or a
+// pathological run of blank/junk lines).
+const MAX_HEADER_LINES_SCANNED = 20
+
+function looksAbsolutePath(value: string): boolean {
+  const trimmed = value.trim()
+  if (!trimmed) return false
+  return trimmed.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(trimmed)
+}
+
+async function readSessionEntry(filePath: string): Promise<PiEntry | null> {
+  let linesScanned = 0
+  for await (const line of readSessionLines(filePath)) {
+    if (linesScanned >= MAX_HEADER_LINES_SCANNED) break
+    linesScanned++
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    try {
+      const entry = JSON.parse(trimmed) as PiEntry
+      if (entry.type === 'session') return entry
+    } catch {
+      continue
+    }
   }
+  return null
 }
 
 async function discoverSessionsInDir(sessionsDir: string, providerName: string): Promise<SessionSource[]> {
@@ -117,28 +194,64 @@ async function discoverSessionsInDir(sessionsDir: string, providerName: string):
     const dirStat = await stat(dirPath).catch(() => null)
     if (!dirStat?.isDirectory()) continue
 
-    let files: string[]
+    let entries: Dirent[]
     try {
-      files = await readdir(dirPath)
+      entries = await readdir(dirPath, { withFileTypes: true })
     } catch {
       continue
     }
 
-    for (const file of files) {
-      if (!file.endsWith('.jsonl')) continue
-      const filePath = join(dirPath, file)
-      const fileStat = await stat(filePath).catch(() => null)
-      if (!fileStat?.isFile()) continue
+    const addSession = async (filePath: string, agentName?: string): Promise<void> => {
+      const entry = await readSessionEntry(filePath)
+      if (!entry) return
+      // Prefer the session header cwd when present. Keep basename(project) for
+      // display, but retain the absolute cwd on sourcePath so parse/grouping
+      // never have to infer identity from the sole observed leaf name (#1260).
+      const rawCwd = typeof entry.cwd === 'string' ? entry.cwd.trim() : ''
+      const cwd = rawCwd || dirName
+      const absCwd = looksAbsolutePath(cwd) ? cwd : undefined
+      sources.push({
+        path: filePath,
+        project: basename(cwd) || cwd,
+        provider: providerName,
+        ...(absCwd ? { sourcePath: absCwd } : {}),
+        ...(agentName ? {
+          agentName,
+          ...(typeof entry.timestamp === 'string' ? { agentStartedAt: entry.timestamp } : {}),
+        } : {}),
+      })
+    }
 
-      const first = await readFirstEntry(filePath)
-      if (!first || first.type !== 'session') continue
+    for (const entry of entries) {
+      if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+        await addSession(join(dirPath, entry.name))
+        continue
+      }
+      if (providerName !== 'omp' || !entry.isDirectory()) continue
 
-      const cwd = first.cwd ?? dirName
-      sources.push({ path: filePath, project: basename(cwd), provider: providerName })
+      const agentDir = join(dirPath, entry.name)
+      const agentEntries = await readdir(agentDir, { withFileTypes: true }).catch(() => [])
+      for (const agentEntry of agentEntries) {
+        if (!agentEntry.isFile() || !agentEntry.name.endsWith('.jsonl')) continue
+        await addSession(join(agentDir, agentEntry.name), basename(agentEntry.name, '.jsonl'))
+      }
     }
   }
 
   return sources
+}
+
+// OMP records a session-level model (`model_change` entry) plus an optional
+// per-message `model`. The per-message value may be a bare model name without
+// the provider prefix (e.g. "gpt-5.6-terra" vs "openai-codex/gpt-5.6-terra").
+// Prefer the fully-qualified form when the two agree; fall back to whatever
+// the message carries, then the session model, then a safe default.
+function resolveMessageModel(messageModel: string, resolvedModel: string): string {
+  if (messageModel.includes('/')) return messageModel
+  if (resolvedModel && (!messageModel || resolvedModel === messageModel || resolvedModel.endsWith(`/${messageModel}`))) {
+    return resolvedModel
+  }
+  return messageModel || resolvedModel || 'gpt-5'
 }
 
 function createParser(source: SessionSource, seenKeys: Set<string>): SessionParser {
@@ -146,9 +259,22 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
     async *parse(): AsyncGenerator<ParsedProviderCall> {
       const content = await readSessionFile(source.path)
       if (content === null) return
+      // Last-resort timestamp so a call whose entry/user/session timestamps are
+      // all missing lands inside the session's window instead of being dropped.
+      const fileStat = await stat(source.path).catch(() => null)
+      const fileMtime = fileStat?.mtime.toISOString() ?? ''
       const lines = content.split('\n').filter(l => l.trim())
       let sessionId = basename(source.path, '.jsonl')
+      let resolvedModel = ''
       let pendingUserMessage = ''
+      let sessionTimestamp = ''
+      let pendingUserTimestamp = ''
+      // Absolute session cwd from the header (or discovery sourcePath). Must
+      // survive into projectPath/workingDirectory so cross-provider merge can
+      // key by real path instead of basename-only (#1260).
+      let sessionCwd = typeof source.sourcePath === 'string' && looksAbsolutePath(source.sourcePath)
+        ? source.sourcePath.trim()
+        : ''
 
       for (const [lineIdx, line] of lines.entries()) {
         let entry: PiEntry
@@ -160,6 +286,21 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
 
         if (entry.type === 'session') {
           sessionId = entry.id ?? sessionId
+          if (typeof entry.timestamp === 'string' && entry.timestamp) sessionTimestamp = entry.timestamp
+          if (typeof entry.cwd === 'string' && entry.cwd.trim()) {
+            const headerCwd = entry.cwd.trim()
+            if (looksAbsolutePath(headerCwd)) sessionCwd = headerCwd
+          }
+          continue
+        }
+        if (entry.type === 'model_change') {
+          if (typeof entry.model === 'string' && entry.model) resolvedModel = entry.model
+          continue
+        }
+
+        if (entry.type === 'model_usage') {
+          const call = modelUsageCall(entry, source, sessionId, lineIdx, sessionTimestamp, seenKeys)
+          if (call) yield call
           continue
         }
 
@@ -169,6 +310,12 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (!msg) continue
 
         if (msg.role === 'user') {
+          const attributedTimestamp = msg.attribution?.timestamp
+          if (typeof entry.timestamp === 'string' && entry.timestamp) {
+            pendingUserTimestamp = entry.timestamp
+          } else if (typeof attributedTimestamp === 'number' && Number.isFinite(attributedTimestamp)) {
+            pendingUserTimestamp = new Date(attributedTimestamp).toISOString()
+          }
           const texts = normalizeContentBlocks(msg.content)
             .filter(c => c.type === 'text')
             .map(c => c.text ?? '')
@@ -180,16 +327,16 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
         if (msg.role !== 'assistant' || !msg.usage) continue
 
         // Coerce undefined/null token fields to 0. Pi/OMP session files
-        // sometimes omit individual usage fields; the destructure used to
-        // pass undefined into calculateCost which then returned NaN, and
-        // that NaN propagated into every aggregate cost total.
+        // sometimes omit individual usage fields; pass only numeric values to
+        // the pricing fallback so it cannot contaminate aggregates with NaN.
         const input = msg.usage.input ?? 0
         const output = msg.usage.output ?? 0
         const cacheRead = msg.usage.cacheRead ?? 0
         const cacheWrite = msg.usage.cacheWrite ?? 0
         if (input === 0 && output === 0) continue
 
-        const model = msg.model ?? 'gpt-5'
+        const messageModel = msg.model ?? ''
+        const model = resolveMessageModel(messageModel, resolvedModel)
         const responseId = msg.responseId ?? ''
         const dedupKey = `${source.provider}:${source.path}:${responseId || entry.id || entry.timestamp || String(lineIdx)}`
 
@@ -223,9 +370,20 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
             return typeof cmd === 'string' ? extractBashCommands(cmd) : []
           })
 
-        const costUSD = calculateCost(model, input, output, cacheWrite, cacheRead, 0)
-        const timestamp = entry.timestamp ?? ''
-
+        const reportedCost = msg.usage.cost?.total
+        // A zero reported cost acts as absent: OMP writes cost.total = 0 for
+        // xai-oauth calls, so the alias table and price overrides never apply.
+        // A genuinely free call would recompute to a small nonzero number;
+        // that is the trade-off we accept for fixing the OAuth zero.
+        // Per-message USD, never a running session total (verified against
+        // real Pi transcripts: cost.total equals this message's own
+        // input+output+cacheRead+cacheWrite and does not increase monotonically).
+        const isReported = typeof reportedCost === 'number' && Number.isFinite(reportedCost) && reportedCost !== 0
+        const costUSD = isReported
+          ? reportedCost
+          : calculateCost(messageModel || resolvedModel || model, input, output, cacheWrite, cacheRead, 0)
+        const timestamp = entry.timestamp || pendingUserTimestamp || sessionTimestamp || fileMtime
+        if (!timestamp) continue
         yield {
           provider: source.provider,
           model,
@@ -237,6 +395,7 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           reasoningTokens: 0,
           webSearchRequests: 0,
           costUSD,
+          ...(isReported ? { costFromBilling: true } : {}),
           tools,
           bashCommands,
           skills,
@@ -245,6 +404,11 @@ function createParser(source: SessionSource, seenKeys: Set<string>): SessionPars
           deduplicationKey: dedupKey,
           userMessage: pendingUserMessage,
           sessionId,
+          project: source.project,
+          ...(sessionCwd ? {
+            projectPath: sessionCwd,
+            workingDirectory: sessionCwd,
+          } : {}),
         }
 
         pendingUserMessage = ''
@@ -258,12 +422,19 @@ export function createPiProvider(sessionsDir?: string): Provider {
 
   return {
     name: 'pi',
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: dir, label: 'sessions' }]
+    },
     displayName: 'Pi',
 
+    // No local display table (#1530): every entry one used to carry exists in
+    // the global SHORT_NAMES with the same label, and a local list that lags
+    // behind it re-creates the #1530 inconsistency (a bare `gpt-5` key
+    // swallowing `gpt-5-mini` into "GPT-5"). Echoing the raw id lets the
+    // report layer's fallbackRawModelDisplayName resolve every id with the
+    // one global getShortModelName all providers share.
     modelDisplayName(model: string): string {
-      for (const [key, name] of modelDisplayEntries) {
-        if (model.startsWith(key)) return name
-      }
       return model
     },
 
@@ -288,12 +459,13 @@ export function createOmpProvider(sessionsDir?: string): Provider {
 
   return {
     name: 'omp',
+
+    async probeRoots(): Promise<ProbeRoot[]> {
+      return [{ path: dir, label: 'sessions' }]
+    },
     displayName: 'OMP',
 
     modelDisplayName(model: string): string {
-      for (const [key, name] of modelDisplayEntries) {
-        if (model.startsWith(key)) return name
-      }
       return model
     },
 

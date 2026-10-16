@@ -6,8 +6,10 @@ import { spawnSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 
 import { getDateRange } from '../src/cli-date.js'
+import { noonTz } from './fixtures/clock.js'
 
 const CLI_TIMEOUT_MS = 30_000
+const CLI_TZ = noonTz()
 
 function runCli(args: string[], home: string) {
   return spawnSync(process.execPath, ['--import', 'tsx', 'src/cli.ts', ...args], {
@@ -19,7 +21,7 @@ function runCli(args: string[], home: string) {
       USERPROFILE: home,
       HOMEPATH: home,
       HOMEDRIVE: '',
-      TZ: 'UTC',
+      TZ: CLI_TZ,
     },
     encoding: 'utf-8',
     timeout: CLI_TIMEOUT_MS,
@@ -38,9 +40,9 @@ function timestampFromDate(date: Date, offsetMinutes = 0): string {
 }
 
 function currentMonthTimestamp(offsetMinutes: number): string {
-  const now = new Date()
-  const base = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 12, 0, 0))
-  return timestampFromDate(base, offsetMinutes)
+  // Five minutes back. The child runs in CLI_TZ, where it is about noon on the
+  // UTC date, so that is this month even on the 1st just after midnight UTC.
+  return timestampFromDate(new Date(Date.now() - 5 * 60_000), offsetMinutes)
 }
 
 function userLine(sessionId: string, timestamp: string): string {
@@ -63,7 +65,7 @@ function assistantLine(sessionId: string, timestamp: string): string {
       id: `msg-${sessionId}`,
       type: 'message',
       role: 'assistant',
-      model: 'claude-sonnet-4-5',
+      model: 'claude-sonnet-4-6',
       content: [{ type: 'text', text: 'done' }],
       usage: {
         input_tokens: 1_000_000,
@@ -213,6 +215,7 @@ describe('codeburn budget command', () => {
   it('uses the same weekly spend window for budget --check and overview -p week', async () => {
     const home = await mkdtemp(join(tmpdir(), 'codeburn-cli-budget-'))
     try {
+      process.env.TZ = CLI_TZ
       const weekStart = getDateRange('week').range.start
       await seedClaudeSpend(home, {
         sessionId: 'weekly-boundary-session',

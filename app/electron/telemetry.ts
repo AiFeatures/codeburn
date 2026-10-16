@@ -1,6 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
+import { writeFileAtomic } from './tray-settings'
+import { compareSemver } from './updates'
 
 // Anonymous, consent-gated product telemetry for the desktop app ONLY.
 // Runs entirely in the Electron main process. Like cli.ts, this module must
@@ -14,7 +17,12 @@ import { dirname, join } from 'node:path'
 //   Either way the user decides on the consent screen.
 // - The only identifier is a random UUID minted locally. No fingerprinting.
 // - Events carry day-granularity timestamps only, and props pass a whitelist
-//   sanitizer (short strings / finite numbers / booleans, capped arrays).
+//   sanitizer: every leaf is a short string, a finite number or a boolean, and
+//   the nesting, key count and array length are all capped. Anything else
+//   (functions, dates, deep trees) is dropped rather than encoded.
+// - The richest event is `usage_snapshot`, the CLI-computed daily aggregate in
+//   `payload.telemetrySnapshot`. It is bucketed and name-only by construction:
+//   see src/telemetry-snapshot.ts for the contract it holds.
 // - Dev / unpackaged builds never send (CODEBURN_TELEMETRY_DEV=1 overrides
 //   for end-to-end testing).
 
@@ -33,6 +41,57 @@ export function defaultEnabledFor(country: string | null | undefined): boolean {
   return !DEFAULT_OFF_COUNTRIES.has(country.toUpperCase())
 }
 
+/// Average CPU of the app over a session, as a percent of one core. Coarse
+/// enough that a session is never recognisable from it; the point is only
+/// whether a build runs light, warm or hot.
+/// Buckets: `<1`, `1-5`, `5-15`, `15-40`, `40+`.
+export function cpuBucket(percent: number): string {
+  if (!Number.isFinite(percent) || percent < 1) return '<1'
+  if (percent < 5) return '1-5'
+  if (percent < 15) return '5-15'
+  if (percent < 40) return '15-40'
+  return '40+'
+}
+
+/// Peak resident memory in MB, same treatment.
+/// Buckets: `<250`, `250-500`, `500-1k`, `1-3k`, `3k+`.
+export function memBucket(mb: number): string {
+  if (!Number.isFinite(mb) || mb < 250) return '<250'
+  if (mb < 500) return '250-500'
+  if (mb < 1000) return '500-1k'
+  if (mb < 3000) return '1-3k'
+  return '3k+'
+}
+
+/// How long a failed CLI read ran before it failed.
+/// Buckets: `<1s`, `1-5s`, `5-15s`, `15-30s`, `30-120s`, `120s+`.
+export function durationBucket(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 1000) return '<1s'
+  if (ms < 5000) return '1-5s'
+  if (ms < 15_000) return '5-15s'
+  if (ms < 30_000) return '15-30s'
+  if (ms < 120_000) return '30-120s'
+  return '120s+'
+}
+
+const CLI_ERROR_REASONS: Array<[string, RegExp]> = [
+  ['oom', /heap out of memory|ENOMEM|allocation failed/i],
+  ['lock-busy', /SQLITE_BUSY|SQLITE_LOCKED|database (?:is |table is )?locked|refresh lock|EBUSY/i],
+  ['eacces', /EACCES|EPERM|permission denied|operation not permitted/i],
+  ['enoent', /ENOENT|no such file/i],
+  ['network', /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|fetch failed|socket hang up/i],
+  ['parse', /SyntaxError|Unexpected token|Unexpected end of JSON|not valid JSON/i],
+  ['shutdown', /shutting down|cancelled/i],
+  ['serve', /serve (?:exited|not running|write failed|request failed)/i],
+]
+
+/// Sorts a failed CLI read's message (stderr, which can carry a path) into a
+/// small enum here, so only the label leaves the machine.
+export function cliErrorReason(message: string): string {
+  for (const [reason, pattern] of CLI_ERROR_REASONS) if (pattern.test(message)) return reason
+  return 'other'
+}
+
 export const EVENT_NAMES = new Set([
   'app_open',
   'app_close',
@@ -40,13 +99,35 @@ export const EVENT_NAMES = new Set([
   'cold_start',
   'usage_snapshot',
   'cli_error',
+  // Name-only interaction events. Props carry a fix id, a provider, a format,
+  // a model name or a setting name and its boolean/enum value, never free text.
+  'optimize_apply',
+  'plan_set',
+  'export',
+  'compare_view',
+  'settings_change',
+  // Enums only: a provider id, a stage and an error kind; a version pair and an outcome.
+  'provider_read_fail',
+  'update_result',
 ])
+
+/// A few seconds of wall time is too short a base for a percent: one burst of startup work
+/// lands the whole session in a top bucket that says nothing about how the build runs. Under
+/// the floor the figure is omitted rather than sent as noise.
+const MIN_CPU_WALL_SECONDS = 30
 
 const MAX_QUEUE = 200
 const MAX_CLI_ERRORS_PER_KIND_PER_DAY = 20
 const MAX_STRING = 64
 const MAX_ARRAY = 12
 const MAX_KEYS = 16
+// Containers may nest this deep below the props object. The daily usage
+// snapshot is the deepest shape we send: props -> models[] -> model -> tasks[]
+// -> task. Anything deeper is dropped whole.
+const MAX_DEPTH = 5
+// Belt and braces on top of the per-level caps: one event can never encode more
+// than this many leaf values, whatever shape it arrives in.
+const MAX_LEAVES = 1000
 
 export type TelemetryStatus = {
   installId: string
@@ -55,6 +136,10 @@ export type TelemetryStatus = {
   defaultEnabled: boolean
   /** True once the user has been through the onboarding consent screen. */
   onboarded: boolean
+  /** Set by the setters only: whether the decision reached disk. False means it
+   *  holds for this session but the menu bar app, which reads the file, will
+   *  keep inheriting the old one. */
+  persisted?: boolean
 }
 
 type PersistedState = {
@@ -65,6 +150,16 @@ type PersistedState = {
   lastSnapshotDay?: string
   cliErrorDay?: string
   cliErrorCounts?: Record<string, number>
+  /** Written just before an update installs, settled on the next launch. */
+  pendingUpdate?: { from: string; to: string }
+}
+
+/** The slice of Electron's ProcessMetric this module reads. Injected, because
+ *  telemetry.ts must not import electron. workingSetSize is in KB,
+ *  cumulativeCPUUsage in seconds of CPU time. */
+export type ProcessMetricSample = {
+  cpu?: { percentCPUUsage?: number; cumulativeCPUUsage?: number }
+  memory?: { workingSetSize?: number }
 }
 
 type Deps = {
@@ -80,6 +175,11 @@ type Deps = {
   endpoint?: string
   fetchFn?: typeof fetch
   now?: () => Date
+  /** Electron `app.getAppMetrics()`. Covers the Electron processes only. */
+  getAppMetrics?: () => ProcessMetricSample[]
+  /** The resident `codeburn serve` child's own totals (app/electron/cli.ts),
+   *  which getAppMetrics cannot see. Null while it has not answered. */
+  getServeUsage?: () => { cpuSec: number; rssMb: number } | null
 }
 
 type QueuedEvent = { name: string; day: string; props: Record<string, unknown> }
@@ -99,45 +199,52 @@ function loadCliErrorBudget(day: unknown, counts: unknown): Pick<PersistedState,
   return { cliErrorDay: day, cliErrorCounts: cleanCounts }
 }
 
-function sanitizeValue(value: unknown): unknown | undefined {
-  if (typeof value === 'string') return value.slice(0, MAX_STRING)
-  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
-  if (typeof value === 'boolean') return value
-  return undefined
+type LeafBudget = { left: number }
+
+function sanitizeValue(value: unknown, depth: number, budget: LeafBudget): unknown | undefined {
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    if (budget.left <= 0) return undefined
+    if (typeof value === 'number' && !Number.isFinite(value)) return undefined
+    budget.left--
+    return typeof value === 'string' ? value.slice(0, MAX_STRING) : value
+  }
+  if (depth >= MAX_DEPTH) return undefined
+  if (Array.isArray(value)) {
+    const items: unknown[] = []
+    for (const entry of value.slice(0, MAX_ARRAY)) {
+      const sv = sanitizeValue(entry, depth + 1, budget)
+      if (sv !== undefined) items.push(sv)
+    }
+    return items.length > 0 ? items : undefined
+  }
+  // Plain objects only. A Date, Map, function or class instance carries state
+  // we have no whitelist for, so it is dropped rather than walked.
+  if (value === null || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return undefined
+  const flat = sanitizeObject(value as Record<string, unknown>, depth + 1, budget)
+  return Object.keys(flat).length > 0 ? flat : undefined
 }
 
-/** Whitelist sanitizer: primitives, plus one level of arrays-of-flat-objects. */
-export function sanitizeProps(props: unknown): Record<string, unknown> {
-  if (!props || typeof props !== 'object' || Array.isArray(props)) return {}
+function sanitizeObject(obj: Record<string, unknown>, depth: number, budget: LeafBudget): Record<string, unknown> {
   const out: Record<string, unknown> = {}
   let keys = 0
-  for (const [key, value] of Object.entries(props as Record<string, unknown>)) {
+  for (const [key, value] of Object.entries(obj)) {
     if (keys >= MAX_KEYS) break
-    const k = key.slice(0, MAX_STRING)
-    if (Array.isArray(value)) {
-      const items: Record<string, unknown>[] = []
-      for (const entry of value.slice(0, MAX_ARRAY)) {
-        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue
-        const flat: Record<string, unknown> = {}
-        let inner = 0
-        for (const [ik, iv] of Object.entries(entry as Record<string, unknown>)) {
-          if (inner >= MAX_KEYS) break
-          const sv = sanitizeValue(iv)
-          if (sv === undefined) continue
-          flat[ik.slice(0, MAX_STRING)] = sv
-          inner++
-        }
-        if (Object.keys(flat).length > 0) items.push(flat)
-      }
-      if (items.length > 0) { out[k] = items; keys++ }
-      continue
-    }
-    const sv = sanitizeValue(value)
+    const sv = sanitizeValue(value, depth, budget)
     if (sv === undefined) continue
-    out[k] = sv
+    out[key.slice(0, MAX_STRING)] = sv
     keys++
   }
   return out
+}
+
+/** Whitelist sanitizer. Keeps short strings, finite numbers and booleans, plus
+ *  plain objects and arrays of them nested up to MAX_DEPTH, each level capped by
+ *  MAX_KEYS / MAX_ARRAY and the whole event by MAX_LEAVES. Everything else is
+ *  dropped. Deep enough for the daily usage snapshot's model x task cross and
+ *  nothing more. */
+export function sanitizeProps(props: unknown): Record<string, unknown> {
+  if (!props || typeof props !== 'object' || Array.isArray(props)) return {}
+  return sanitizeObject(props as Record<string, unknown>, 1, { left: MAX_LEAVES })
 }
 
 export class Telemetry {
@@ -145,11 +252,22 @@ export class Telemetry {
   private state: PersistedState
   private queue: QueuedEvent[] = []
   private openedAt: number
+  /** Total CPU seconds across the Electron processes, when the platform reports
+   *  it cumulatively. Null on a build that only reports instantaneous percent. */
+  private cpuSeconds: number | null = null
+  /** What the counters already stood at when this session's clock started. Both are
+   *  cumulative since their process began, and the wall time below is measured from here,
+   *  so only the growth since this point can be divided by it. */
+  private cpuSecondsAtOpen: number | null = null
+  private serveCpuSecAtOpen: number | null = null
+  private cpuPercentSamples: number[] = []
+  private peakMemMb = 0
 
   constructor(deps: Deps) {
     this.deps = deps
     this.state = this.load()
     this.openedAt = Date.now()
+    this.sampleResources()
   }
 
   private stateFile(): string {
@@ -167,18 +285,25 @@ export class Telemetry {
           onboardedAt: typeof raw.onboardedAt === 'string' ? raw.onboardedAt : undefined,
           lastSnapshotDay: typeof raw.lastSnapshotDay === 'string' ? raw.lastSnapshotDay : undefined,
           ...loadCliErrorBudget(raw.cliErrorDay, raw.cliErrorCounts),
+          ...(typeof raw.pendingUpdate?.from === 'string' && typeof raw.pendingUpdate.to === 'string'
+            ? { pendingUpdate: { from: raw.pendingUpdate.from, to: raw.pendingUpdate.to } }
+            : {}),
         }
       }
     } catch { /* first run or unreadable — start fresh */ }
     return { version: 1, installId: randomUUID(), enabled: defaultEnabledFor(this.deps.country) }
   }
 
-  private save(): void {
+  /** Returns whether the state reached disk. Atomic because the macOS menu bar
+   *  app reads this file to inherit the decision and must never see a torn one. */
+  private save(): boolean {
     try {
-      const file = this.stateFile()
-      if (!existsSync(dirname(file))) mkdirSync(dirname(file), { recursive: true })
-      writeFileSync(file, JSON.stringify(this.state), { mode: 0o600 })
-    } catch { /* consent must still work in-memory */ }
+      writeFileAtomic(this.stateFile(), JSON.stringify(this.state), 0o600)
+      return true
+    } catch {
+      // Consent must still work in-memory, but the caller has to be told.
+      return false
+    }
   }
 
   status(): TelemetryStatus {
@@ -198,8 +323,8 @@ export class Telemetry {
       this.queue = []
       this.state.installId = randomUUID()
     }
-    this.save()
-    return this.status()
+    const persisted = this.save()
+    return { ...this.status(), persisted }
   }
 
   /** The onboarding consent screen's final decision. Unlocks sending. */
@@ -232,24 +357,114 @@ export class Telemetry {
       this.queue.shift()
     }
     const sanitizedProps = sanitizeProps(props)
-    if (name === 'cli_error') {
+    const budgetKey = name === 'cli_error' ? String(sanitizedProps.kind ?? '')
+      : name === 'provider_read_fail'
+        ? `provider:${String(sanitizedProps.provider ?? '')}:${String(sanitizedProps.stage ?? '')}:${String(sanitizedProps.kind ?? '')}`
+      : name === 'update_result' ? `update:${String(sanitizedProps.outcome ?? '')}`
+      : null
+    if (budgetKey !== null) {
       if (this.state.cliErrorDay !== day) {
         this.state.cliErrorDay = day
         this.state.cliErrorCounts = Object.create(null) as Record<string, number>
       }
       const counts = this.state.cliErrorCounts ?? (this.state.cliErrorCounts = Object.create(null) as Record<string, number>)
-      const kind = typeof sanitizedProps.kind === 'string' ? sanitizedProps.kind : ''
-      const count = Object.prototype.hasOwnProperty.call(counts, kind) ? counts[kind]! : 0
-      if (count >= MAX_CLI_ERRORS_PER_KIND_PER_DAY) return
-      counts[kind] = count + 1
+      const cap = name === 'provider_read_fail' ? 1 : MAX_CLI_ERRORS_PER_KIND_PER_DAY
+      const count = Object.prototype.hasOwnProperty.call(counts, budgetKey) ? counts[budgetKey]! : 0
+      if (count >= cap) return
+      counts[budgetKey] = count + 1
       this.save()
     }
     this.queue.push({ name, day, props: sanitizedProps })
   }
 
-  /** Record session duration; queued for the next (final) flush. */
+  /** Remembers the update about to install, so the next launch can tell whether it landed. */
+  noteUpdateInstall(from: string, to: string): void {
+    this.state.pendingUpdate = { from, to }
+    this.save()
+  }
+
+  /** On launch: a newer version running means the install landed, and `to` is what runs;
+   *  the old one still running means it did not. An older one is a manual downgrade: the
+   *  marker goes and nothing is sent. */
+  settleUpdate(currentVersion: string): void {
+    const pending = this.state.pendingUpdate
+    if (!pending) return
+    delete this.state.pendingUpdate
+    this.save()
+    const order = compareSemver(currentVersion, pending.from)
+    if (order > 0) this.track('update_result', { from: pending.from, to: currentVersion, outcome: 'ok' })
+    else if (order === 0) this.track('update_result', { from: pending.from, to: pending.to, outcome: 'install_fail' })
+  }
+
+  /** One cheap read of how heavy this app run is. Called on the existing flush
+   *  beat and once at close, never on a timer of its own. */
+  sampleResources(): void {
+    try {
+      let cumulativeSec = 0
+      let hasCumulative = false
+      let percent = 0
+      let hasPercent = false
+      let workingSetKb = 0
+      for (const metric of this.deps.getAppMetrics?.() ?? []) {
+        const cumulative = metric.cpu?.cumulativeCPUUsage
+        if (typeof cumulative === 'number' && Number.isFinite(cumulative)) {
+          cumulativeSec += cumulative
+          hasCumulative = true
+        }
+        const share = metric.cpu?.percentCPUUsage
+        if (typeof share === 'number' && Number.isFinite(share)) {
+          percent += share
+          hasPercent = true
+        }
+        const workingSet = metric.memory?.workingSetSize
+        if (typeof workingSet === 'number' && Number.isFinite(workingSet)) workingSetKb += workingSet
+      }
+      if (hasCumulative) {
+        this.cpuSeconds = cumulativeSec
+        this.cpuSecondsAtOpen ??= cumulativeSec
+      } else if (hasPercent) this.cpuPercentSamples.push(percent)
+      this.peakMemMb = Math.max(this.peakMemMb, workingSetKb / 1024)
+      // Sampled here, not at close, because close is the only place the figure is read and
+      // a baseline taken then would be the reading itself. A serve child that restarted
+      // counts from zero again, so a reading below the baseline rebases to it.
+      const serveCpuSec = this.deps.getServeUsage?.()?.cpuSec
+      if (typeof serveCpuSec === 'number' && Number.isFinite(serveCpuSec)) {
+        if (this.serveCpuSecAtOpen === null || serveCpuSec < this.serveCpuSecAtOpen) this.serveCpuSecAtOpen = serveCpuSec
+      }
+    } catch { /* resource metrics are never worth a thrown quit */ }
+  }
+
+  /** Bucket labels only: how much CPU and memory this run cost, in the app and
+   *  in the serve child that does the parsing. A figure we could not measure is
+   *  omitted rather than sent as a zero, which would read as "free". */
+  private resourceProps(): Record<string, string> {
+    const props: Record<string, string> = {}
+    try {
+      this.sampleResources()
+      const wallSeconds = (Date.now() - this.openedAt) / 1000
+      const cpuMeasurable = wallSeconds >= MIN_CPU_WALL_SECONDS
+      if (cpuMeasurable) {
+        if (this.cpuSeconds !== null && this.cpuSecondsAtOpen !== null) {
+          props.cpu = cpuBucket(((this.cpuSeconds - this.cpuSecondsAtOpen) / wallSeconds) * 100)
+        } else if (this.cpuPercentSamples.length > 0) {
+          props.cpu = cpuBucket(this.cpuPercentSamples.reduce((a, b) => a + b, 0) / this.cpuPercentSamples.length)
+        }
+      }
+      if (this.peakMemMb > 0) props.mem = memBucket(this.peakMemMb)
+      const serve = this.deps.getServeUsage?.() ?? null
+      if (serve) {
+        if (cpuMeasurable && Number.isFinite(serve.cpuSec)) {
+          props.serveCpu = cpuBucket(((serve.cpuSec - (this.serveCpuSecAtOpen ?? serve.cpuSec)) / wallSeconds) * 100)
+        }
+        if (serve.rssMb > 0) props.serveMem = memBucket(serve.rssMb)
+      }
+    } catch { /* best effort: a partial answer beats none, and none beats a throw */ }
+    return props
+  }
+
+  /** Record session duration and resource cost; queued for the next (final) flush. */
   trackClose(): void {
-    this.track('app_close', { sessionMinutes: Math.round((Date.now() - this.openedAt) / 60_000) })
+    this.track('app_close', { sessionMinutes: Math.round((Date.now() - this.openedAt) / 60_000), ...this.resourceProps() })
   }
 
   /** Best-effort batch POST. Keeps the queue on failure, clears on success. */

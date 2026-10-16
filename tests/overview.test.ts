@@ -12,6 +12,7 @@ function makeProject(opts: {
   provider: string
   tokens: { input: number; output: number; cacheR: number; cacheW: number }
   estimated?: boolean
+  dedupKey?: string
 }): ProjectSummary {
   const usage = {
     inputTokens: opts.tokens.input,
@@ -48,7 +49,7 @@ function makeProject(opts: {
         category: 'coding',
         retries: 0,
         hasEdits: true,
-        assistantCalls: [{ provider: opts.provider, model: opts.model, costUSD: opts.cost, usage }],
+        assistantCalls: [{ provider: opts.provider, model: opts.model, costUSD: opts.cost, usage, ...(opts.dedupKey ? { deduplicationKey: opts.dedupKey } : {}) }],
       }],
     }],
   } as unknown as ProjectSummary
@@ -224,6 +225,64 @@ describe('renderOverview', () => {
   })
 })
 
+describe('renderOverview Cursor local-estimate disclosure (#1545)', () => {
+  it('marks Cursor dollars priced from local files as not the bill', () => {
+    const out = renderOverview([makeProject({
+      project: 'proj',
+      projectPath: '/Users/test/proj',
+      cost: 3.14,
+      calls: 2,
+      model: 'claude-sonnet-4-5',
+      provider: 'cursor',
+      tokens: { input: 1000, output: 200, cacheR: 0, cacheW: 0 },
+      dedupKey: 'cursor:state-vscdb:1',
+    })], { label: 'June 2026', color: false })
+
+    expect(out).toContain("includes $3.14 of Cursor priced from local files, not Cursor's bill")
+    expect(out).toContain('codeburn import cursor')
+  })
+
+  it('stays silent when the Cursor rows are imported dashboard events', () => {
+    const out = renderOverview([makeProject({
+      project: 'Cursor (imported)',
+      projectPath: '/Users/test/proj',
+      cost: 41.2,
+      calls: 70,
+      model: 'claude-opus-5-5-medium',
+      provider: 'cursor',
+      tokens: { input: 10000, output: 2000, cacheR: 0, cacheW: 0 },
+      dedupKey: 'cursor-import:abc123',
+    })], { label: 'June 2026', color: false })
+
+    expect(out).not.toContain("not Cursor's bill")
+  })
+
+  it('stays silent for non-Cursor providers and names the Cursor-agent variant too', () => {
+    const claude = renderOverview([makeProject({
+      project: 'proj',
+      projectPath: '/Users/test/proj',
+      cost: 5,
+      calls: 1,
+      model: 'claude-sonnet-4-5',
+      provider: 'claude',
+      tokens: { input: 100, output: 20, cacheR: 0, cacheW: 0 },
+    })], { label: 'June 2026', color: false })
+    expect(claude).not.toContain('codeburn import cursor')
+
+    const agent = renderOverview([makeProject({
+      project: 'proj',
+      projectPath: '/Users/test/proj',
+      cost: 2,
+      calls: 1,
+      model: 'gpt-5.6',
+      provider: 'cursor-agent',
+      tokens: { input: 100, output: 20, cacheR: 0, cacheW: 0 },
+      dedupKey: 'cursor-agent:session:1',
+    })], { label: 'June 2026', color: false })
+    expect(agent).toContain("includes $2.00 of Cursor priced from local files, not Cursor's bill")
+  })
+})
+
 describe('renderOverview unpriced models', () => {
   it('warns when a model with usage has no pricing data', () => {
     const out = renderOverview([makeProject({
@@ -240,6 +299,23 @@ describe('renderOverview unpriced models', () => {
     expect(out).toContain('1 model at $0')
     expect(out).toContain('zz-mystery-paid-model-999')
     expect(out).toContain('codeburn model-alias')
+    expect(out).toContain('model-flat-rate')
+    expect(out).not.toContain('Fix: codeburn model-alias')
+  })
+
+  it('stays silent for subscription SKUs whose $0 is correct', () => {
+    const out = renderOverview([makeProject({
+      project: 'pass',
+      projectPath: '/Users/test/pass',
+      cost: 0,
+      calls: 4,
+      model: 'auto-genius',
+      provider: 'cline-cli',
+      tokens: { input: 1000, output: 200, cacheR: 0, cacheW: 0 },
+    })], { label: 'June 2026', color: false })
+
+    expect(out).not.toContain('Unpriced')
+    expect(out).not.toContain('model-alias')
   })
 
   it('stays silent when every model is priced', () => {
@@ -254,5 +330,75 @@ describe('renderOverview unpriced models', () => {
     })], { label: 'June 2026', color: false })
 
     expect(out).not.toContain('Unpriced')
+  })
+})
+
+describe('renderOverview #1260 residuals', () => {
+  it('keeps same basename distinct abs paths as separate Top projects rows', () => {
+    const out = renderOverview([
+      makeProject({
+        project: 'vault',
+        projectPath: '/a/vault',
+        cost: 10,
+        calls: 1,
+        model: 'claude-sonnet-4-5',
+        provider: 'claude',
+        tokens: { input: 10, output: 5, cacheR: 0, cacheW: 0 },
+      }),
+      makeProject({
+        project: 'vault',
+        projectPath: '/b/vault',
+        cost: 1,
+        calls: 1,
+        model: 'gpt-5.4',
+        provider: 'pi',
+        tokens: { input: 10, output: 5, cacheR: 0, cacheW: 0 },
+      }),
+    ], { label: 'residuals', color: false })
+    expect(out).toContain('a/vault')
+    expect(out).toContain('b/vault')
+    expect(out).toContain('$10.00')
+    expect(out).toContain('$1.00')
+    // Must not collapse into a single basename-only vault row for both costs.
+    const top = out.split('Top projects')[1]?.split('Daily')[0] ?? ''
+    expect(top).not.toMatch(/│\s+vault\s+│\s+\$11\.00/)
+  })
+
+  it('keeps POSIX case-distinct paths as separate Top projects rows', () => {
+    const out = renderOverview([
+      makeProject({
+        project: 'Vault',
+        projectPath: '/a/Vault',
+        cost: 10,
+        calls: 1,
+        model: 'claude-sonnet-4-5',
+        provider: 'claude',
+        tokens: { input: 10, output: 5, cacheR: 0, cacheW: 0 },
+      }),
+      makeProject({
+        project: 'vault',
+        projectPath: '/a/vault',
+        cost: 1,
+        calls: 1,
+        model: 'gpt-5.4',
+        provider: 'pi',
+        tokens: { input: 10, output: 5, cacheR: 0, cacheW: 0 },
+      }),
+    ], { label: 'residuals', color: false })
+    const top = out.split('Top projects')[1]?.split('Daily')[0] ?? ''
+    expect(top).toContain('$10.00')
+    expect(top).toContain('$1.00')
+    expect(top).not.toContain('$11.00')
+  })
+
+  it('groups thousands in the integer part only', () => {
+    const render = (cost: number) => renderOverview([makeProject({
+      project: 'p', projectPath: '/Users/test/p', cost, calls: 1, model: 'claude-opus-4-8', provider: 'claude',
+      tokens: { input: 1, output: 1, cacheR: 0, cacheW: 0 },
+    })], { label: 'June 2026', color: false })
+    expect(render(0.0028)).toContain('$0.0028')
+    expect(render(0.0028)).not.toContain('$0.0,028')
+    expect(render(1234.5678)).toContain('$1,234.57')
+    expect(render(1234567)).toContain('$1,234,567.00')
   })
 })

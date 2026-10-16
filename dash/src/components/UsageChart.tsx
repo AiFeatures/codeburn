@@ -26,14 +26,19 @@ function makeTooltip(labels: Record<string, string>, fmt: (n: number) => string,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const total = items.reduce((s: number, p: any) => s + p.value, 0)
     return (
-      <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs shadow-xl ring-1 ring-black/5">
+      <div className="rounded-lg border border-border bg-popover px-3 py-2 text-xs shadow-xl ring-1 ring-border">
         <div className="mb-1.5 font-medium text-foreground">{formatPeriod(String(lbl))}</div>
         <div className="flex flex-col gap-1">
           {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
           {items.slice(0, 6).map((p: any) => (
             <div key={p.dataKey} className="flex items-center gap-2">
               <span className="h-2.5 w-2.5 shrink-0 rounded-sm" style={{ background: p.color }} />
-              <span className="flex-1 truncate text-tertiary-foreground">{labels[String(p.dataKey)] ?? String(p.dataKey)}</span>
+              <span
+                className="flex-1 truncate text-tertiary-foreground"
+                title={labels[String(p.dataKey)] ?? String(p.dataKey)}
+              >
+                {labels[String(p.dataKey)] ?? String(p.dataKey)}
+              </span>
               <span className="tabular-nums text-muted-foreground">{fmt(p.value)}</span>
             </div>
           ))}
@@ -172,7 +177,7 @@ function GranularLines({
         {series.map(item => (
           <span key={item.key} className="flex min-w-0 items-center gap-1.5">
             <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: item.color }} />
-            <span className="max-w-40 truncate">{item.label}</span>
+            <span className="max-w-40 truncate" title={item.label}>{item.label}</span>
           </span>
         ))}
       </div>
@@ -252,7 +257,7 @@ function StackedBars({
             tick={{ fontSize: 11, fill: 'var(--color-tertiary-foreground)' }}
             tickFormatter={axisFmt}
           />
-          <Tooltip cursor={{ fill: 'rgba(0,0,0,0.04)' }} content={<Tip />} />
+          <Tooltip cursor={{ fill: 'var(--chart-hover-cursor)' }} content={<Tip />} />
           {series.map((s, i) => (
             <Bar
               key={s.key}

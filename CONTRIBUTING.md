@@ -4,7 +4,7 @@ Thanks for your interest. This document covers what you need to know to send a w
 
 ## Prerequisites
 
-- Node.js 22.20 or newer (`engines.node` in `package.json`).
+- Node.js 22.13.0 or newer (`engines.node` in `package.json`).
 - npm 10 or newer (ships with recent Node).
 - macOS or Linux for full provider coverage. Windows works for most providers but Cursor / Antigravity development is easier on macOS.
 - Optional: Swift 6 toolchain if you are touching the macOS menubar (`mac/`).
@@ -18,22 +18,41 @@ cd codeburn
 npm install
 ```
 
-There is no separate build step required to run the dev CLI. `npm run dev` runs `tsx` against `src/cli.ts` directly.
+There is no separate build step required to run the dev CLI. `npm run dev` loads
+`tsx` through Node's `--import` flag and runs `src/cli.ts` directly. The command
+works with npm's default shell on Windows, macOS, and Linux; no shell configuration
+or extra environment assignment is required. Deprecation warnings are suppressed
+for this invocation, and any existing `NODE_OPTIONS` are retained.
+
+Use `--` to pass CLI arguments through npm. For a quick setup check that does not
+scan your session history, run:
+
+```bash
+npm run dev -- --version
+npm run dev -- status --help
+```
 
 ## Common Commands
 
 | Command | What it does |
 |---|---|
-| `npm test` | Runs the vitest suite (42 test files, 568 tests). |
+| `npm test` | Runs the vitest suite under `tests/`, excluding the four serial lock suites. |
+| `npm run test:locks` | Runs the four parallelism-sensitive `cache-refresh-lock` suites serially. |
+| `npm run test:watch` | Same scope as `npm test`, in watch mode. |
 | `npm run dev -- status` | Runs the CLI in dev mode against your real data. |
-| `npm run build` | Bundles the litellm pricing snapshot, then runs `tsup` to produce `dist/cli.js`. |
-| `npm run bundle-litellm` | Refreshes `src/data/litellm-snapshot.json` from the upstream litellm repo. |
+| `npm run build` | Builds the CLI and dashboard from the checked-in pricing catalogs without mutating tracked source files. |
+| `npm run bundle-litellm` | Explicitly refreshes the checked-in pricing catalogs from their upstream sources. Review and commit the resulting data changes separately. |
 
-To test a specific suite, pass a path:
+To test a specific suite, run vitest directly with a path:
 
 ```bash
-npm test -- tests/providers/codex.test.ts
+npx vitest run tests/providers/codex.test.ts
 ```
+
+`npm test` is scoped to `tests/` on purpose. The Electron app under `app/` carries its
+own vitest config and its own `jsdom` dependency in `app/node_modules`; letting vitest's
+default glob reach those specs from a root install fails with
+`ERR_MODULE_NOT_FOUND: jsdom`. To run the app's tests, install and run them from `app/`.
 
 ## What to Read Before Editing
 
@@ -65,9 +84,18 @@ See `docs/architecture.md` for a fuller map.
 
 ## Tests
 
-- Each new provider should ship with a fixture-based test under `tests/providers/`. The five providers without test files today (claude, gemini, goose, qwen, antigravity) are a known gap; new code should not add to that list.
+- Each new provider should ship with a fixture-based test under `tests/providers/`. The three providers without test files today (claude, goose, qwen) are a known gap; new code should not add to that list.
 - Each new optimize detector in `src/optimize.ts` needs at least one positive and one negative case in `tests/optimize.test.ts`.
 - If your change affects the menubar JSON contract, update `tests/menubar-json.test.ts`.
+- A new test that exercises the cross-process refresh lock must be named
+  `tests/cache-refresh-lock-<what>.test.ts` **and** added to the `test:locks` script in
+  `package.json`. `npm test` excludes that prefix, so a lock test placed anywhere else
+  runs under the full worker pool and fails intermittently; one that matches the prefix
+  but is missing from `test:locks` never runs at all.
+
+### The full suite is the gate
+
+Before opening or updating a PR, run `npm test` on your branch and on `main`, and compare (`cd app && npm test` if your change touches the Electron app). Your branch must introduce zero new failures. Listing only your own new tests as verification is not verification; the regressions we catch are almost always in tests the author never ran. For `mac/` changes the same applies to `swift test` run from `mac/`.
 
 ## Commit Message Format
 
@@ -90,6 +118,10 @@ If a flagged PR rejects on this check, the workflow prints the exact rebase comm
 
 **One PR at a time.** We will not review a second PR from you until the first is merged or closed. This keeps the review queue manageable and ensures each contribution gets proper attention.
 
+**Respond to review before writing more code.** If a maintainer posts findings on your PR, nothing new from you gets reviewed until you have addressed or answered them. Do not open PRs stacked on top of a branch with an unanswered review or known failing tests; a fix that lands above the bug it fixes means the PR below it was never mergeable.
+
+**You are accountable for what your agent submits.** Using AI agents to write PRs is fine; we do it too. But every PR carries your name, and "my agent generated it" is not a response to review findings. If your agent produces PRs faster than you can verify them against the full suite, slow the agent down.
+
 ## Adding a New Provider
 
 New providers have the highest bar because broken parsing silently produces wrong data for users. Before opening a PR:
@@ -98,6 +130,7 @@ New providers have the highest bar because broken parsing silently produces wron
 2. **Test against real data.** Run `npm run dev -- today` and `npm run dev -- models` with your real sessions and confirm the output looks correct — costs are non-zero, model names resolve, session counts match what you see in the tool.
 3. **Include proof in the PR.** Attach a screenshot or terminal output showing codeburn correctly parsing your real sessions. PRs for new providers without evidence of local testing will not be reviewed.
 4. **Do not rely on AI-generated guesses about storage paths or schemas.** Tools change their data formats between versions. The only way to know the current schema is to install the tool and inspect the actual files on disk.
+5. **Disclose your affiliation.** If you built the tool, work for the vendor, or otherwise benefit from it being listed, say so in the PR description. Being listed in CodeBurn is visibility in front of a large user base; undisclosed self-promotion gets the PR closed regardless of code quality. We may also hold new-tool submissions until the tool shows real adoption beyond its authors.
 
 PRs that add a provider based solely on online documentation or AI-generated code, without evidence of testing against real data, will be closed.
 
@@ -108,6 +141,10 @@ PRs that add a provider based solely on online documentation or AI-generated cod
 3. The `firstlook` workflow will auto-assess the PR. The `semgrep` CI workflow runs the hot-path bracket-assign guard. The `block-claude-coauthor` workflow scans commits.
 4. A maintainer reviews. For non-trivial changes, expect requests for tests.
 5. Squash-merge is the default. Keep the PR title short and accurate; the description carries the context.
+6. Fill in the description. A PR whose "Summary" is still the template is closed automatically; write what the change does and why, then reopen.
+7. If this is your first contribution and the change is over about 300 lines, open an issue first and reference it in the PR. Large work gets discussed before it is written; small fixes do not need this.
+8. Keep at most five pull requests open at a time. A sixth is closed automatically with a note and can be reopened once one of the others lands or closes. If you have more ideas than open slots, file an issue for each so the work is visible and can be discussed before it is written.
+9. UI change? Attach before and after screenshots of the affected screen to the PR. No screenshots, no review.
 
 ## Reporting Bugs
 

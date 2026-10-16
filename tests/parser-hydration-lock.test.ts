@@ -6,15 +6,20 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { existsSync } from 'fs'
-import { mkdir, mkdtemp, rm, unlink, writeFile, readFile } from 'fs/promises'
+import { mkdir, mkdtemp, rm, unlink, writeFile } from 'fs/promises'
 import { tmpdir } from 'os'
 import { join } from 'path'
 
 import { clearSessionCache, parseAllSessions } from '../src/parser.js'
-import { sessionCachePath } from '../src/session-cache.js'
+import { sessionCacheDir } from '../src/session-cache.js'
+import { readCacheOnDisk, writeCacheOnDisk } from './fixtures/session-cache-io.js'
 
 let tmpHome: string
 let cacheDir: string
+
+// A pid that is alive and is not us. pid 1 is init on POSIX but does not exist
+// on Windows, where probing it reports ESRCH and the lock would read as dead.
+const LIVE_FOREIGN_PID = process.ppid
 
 function lockPath(): string {
   return join(cacheDir, 'hydrating.lock')
@@ -71,22 +76,20 @@ describe('parseAllSessions hydration lock', () => {
     await writeClaudeSession(50)
     expect(totalOutput(await parseAllSessions(undefined, 'claude'))).toBe(50)
 
-    const warm = JSON.parse(await readFile(sessionCachePath(), 'utf-8'))
-    for (const section of Object.values(warm.providers) as Array<{ files: Record<string, { turns: Array<{ calls: Array<{ usage: { outputTokens: number } }> }> }> }>) {
+    const tampered = await readCacheOnDisk()
+    for (const section of Object.values(tampered.providers)) {
       for (const file of Object.values(section.files)) {
         for (const turn of file.turns) for (const call of turn.calls) call.usage.outputTokens = 999
       }
     }
-    const tampered = JSON.stringify(warm)
 
     // Go cold: remove the versioned cache and drop the in-memory cache so the
     // next parse genuinely cold-starts and consults the lock.
-    await unlink(sessionCachePath())
+    await rm(sessionCacheDir(), { recursive: true })
     clearSessionCache()
 
-    // A fresh lock held by another live process (pid 1 is always alive and is
-    // not us). The cold parse must block on it.
-    await writeFile(lockPath(), JSON.stringify({ pid: 1, at: Date.now() }))
+    // A fresh lock held by another live process. The cold parse must block on it.
+    await writeFile(lockPath(), JSON.stringify({ pid: LIVE_FOREIGN_PID, at: Date.now() }))
 
     let resolved = false
     const promise = parseAllSessions(undefined, 'claude').then(r => { resolved = true; return r })
@@ -97,7 +100,7 @@ describe('parseAllSessions hydration lock', () => {
 
     // The "first process" finishes: it leaves the warm (tampered) cache behind
     // and releases the lock. The waiter wakes, reloads, and serves the cache.
-    await writeFile(sessionCachePath(), tampered)
+    await writeCacheOnDisk(tampered)
     await unlink(lockPath())
 
     const result = await promise
@@ -113,14 +116,15 @@ describe('parseAllSessions hydration lock', () => {
     // A stale lock (timestamp well past the freshness window) must be ignored,
     // replaced, and the parse proceeds normally.
     await mkdir(cacheDir, { recursive: true })
-    await writeFile(lockPath(), JSON.stringify({ pid: 1, at: Date.now() - 20 * 60_000 }))
+    await writeFile(lockPath(), JSON.stringify({ pid: LIVE_FOREIGN_PID, at: Date.now() - 20 * 60_000 }))
 
     const result = await parseAllSessions(undefined, 'claude')
     expect(totalOutput(result)).toBe(50)
     // Lock released in the finally.
     expect(existsSync(lockPath())).toBe(false)
-    // The parse warmed the versioned cache.
-    expect(existsSync(sessionCachePath())).toBe(true)
+    // The parse warmed the versioned cache: the envelope is what publishes it,
+    // so the directory merely existing proves nothing.
+    expect(existsSync(join(sessionCacheDir(), 'envelope.json'))).toBe(true)
   })
 
   it('ignores a fresh lock whose pid is dead', async () => {
@@ -140,8 +144,8 @@ describe('parseAllSessions hydration lock', () => {
     await writeClaudeSession(50)
     await mkdir(cacheDir, { recursive: true })
 
-    // A fresh lock held by a live process (pid 1): the cold parse starts waiting.
-    await writeFile(lockPath(), JSON.stringify({ pid: 1, at: Date.now() }))
+    // A fresh lock held by a live process: the cold parse starts waiting.
+    await writeFile(lockPath(), JSON.stringify({ pid: LIVE_FOREIGN_PID, at: Date.now() }))
     let resolved = false
     const promise = parseAllSessions(undefined, 'claude').then(r => { resolved = true; return r })
     await delay(60)

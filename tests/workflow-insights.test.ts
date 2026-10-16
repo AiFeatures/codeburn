@@ -119,10 +119,23 @@ describe('scanUserCorrections', () => {
       'undo the migration when done',
       'the build is failing, can you fix it',
       'what went wrong here',
+      // Verbatim from an injected skill prompt that counted 4 phantom
+      // corrections on real data: "wrong answer" is prose idiom, not a
+      // correction, which is why "answer" is not in the wrong-<noun> list.
+      'When unsure: a well-composed page is never the wrong answer; an over-designed visual identity sometimes is.',
     ]
     const p = project([session('s1', phrases.map(m => turn({ userMessage: m })))])
     const r = scanUserCorrections([p])
     expect(r.corrections).toBe(0)
+  })
+
+  it('still flags concrete wrong-<artifact> follow-ups', () => {
+    const p = project([session('s1', [
+      turn({ userMessage: 'rename the helper' }),
+      turn({ userMessage: 'you edited the wrong file' }),
+      turn({ userMessage: "that's the wrong approach, use the cache" }),
+    ])])
+    expect(scanUserCorrections([p]).corrections).toBe(2)
   })
 
   it('ignores continuation turns with no fresh prompt', () => {
@@ -337,7 +350,29 @@ describe('review-findings regressions', () => {
     expect(isExpectedFreeModel('qwen3.6:35b-a3b-bf16')).toBe(true)
     expect(isExpectedFreeModel('llama-3-8b-q4')).toBe(true)
     expect(isExpectedFreeModel('claude-opus-4-8')).toBe(false)
+    expect(isExpectedFreeModel('auto-genius')).toBe(true)
     // 95 local calls + 5 unpriced cloud calls: coverage must be 0, not 0.95.
     expect(computePricingCoverage(5, 5)).toBe(0)
+  })
+
+  it('excludes sidechain-only work from every human workflow signal', () => {
+    const editCall = call({
+      tools: ['Edit'],
+      timestamp: '2026-06-01T10:06:00Z',
+      toolSequence: [[{ tool: 'Edit', file: '/home/u/app/src/a.ts' }]],
+    })
+    const sidechain = session('agent-reviewer', [
+      turn({ userMessage: 'review the change', timestamp: '2026-06-01T10:00:00Z' }),
+      turn({ userMessage: 'you missed the edge case', calls: [editCall], timestamp: '2026-06-01T10:06:00Z' }),
+      turn({ userMessage: 'that is still wrong', timestamp: '2026-06-01T10:07:00Z' }),
+      turn({ userMessage: 'revert that change', timestamp: '2026-06-01T10:08:00Z' }),
+    ], { feature: cat(10, 0) } as SessionSummary['categoryBreakdown'])
+    sidechain.isSidechain = true
+    const projects = [project([sidechain])]
+
+    expect(scanUserCorrections(projects)).toEqual({ corrections: 0, userTurns: 0, correctionRate: null })
+    expect(medianTimeToFirstEditMs(projects)).toBeNull()
+    expect(aggregateFileChurn(projects)).toEqual([])
+    expect(worstOneShotCategory(projects)).toBeNull()
   })
 })

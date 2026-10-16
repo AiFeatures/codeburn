@@ -1,5 +1,6 @@
 import chalk from 'chalk'
 import type { ProjectSummary } from './types.js'
+import { behavioralCallCount } from './behavioral-weight.js'
 
 // Re-exported from currency.ts so existing imports from './format.js' keep working.
 // The currency-aware version applies exchange rate and symbol automatically.
@@ -10,9 +11,42 @@ export { formatCost }
 /// Prefix a formatted cost with the estimated marker (`~`) when the figure is
 /// priced from estimated tokens rather than metered. Keeps the marker identical
 /// across the report, overview, and MCP surfaces so a legend line can explain it
-/// once. `isEstimated` is typically `entry.estimatedCostUSD > 0`.
+/// once. `isEstimated` is typically `isEstimatedCost(entry.cost, entry.estimatedCostUSD)`.
 export function markEstimated(costStr: string, isEstimated: boolean): string {
   return isEstimated ? `~${costStr}` : costStr
+}
+
+export const ESTIMATED_COST_LEGEND = '~ estimated cost (priced from estimated tokens)'
+
+/// A row carries the estimated marker once its estimated portion is at least 1%
+/// of its cost: a handful of unmetered calls inside a metered row (a Codex turn
+/// with no token record) must not mark the whole row as a guess. `shown` is the
+/// amount as the surface prints it; a figure that reads as zero ("$0.00") gets
+/// no marker, since there is nothing visible to qualify.
+export function isEstimatedCost(costUSD: number, estimatedCostUSD: number | undefined, shown: string = formatCost(costUSD)): boolean {
+  const estimated = estimatedCostUSD ?? 0
+  return estimated > 0 && estimated >= costUSD * 0.01 && /[1-9]/.test(shown)
+}
+
+/// Shared wording for the durable-cache carry-forward footnote: some of a
+/// period's total came from days whose session logs have since expired, but
+/// the figure is real (preserved in the durable daily cache). overview.ts and
+/// dashboard.tsx both show this so a headline that includes carried days
+/// doesn't read as inconsistent with detail views that can only see
+/// surviving session files.
+export function carriedCostNote(carriedCostUSD: number): string | null {
+  return carriedCostUSD > 0 ? `includes ${formatCost(carriedCostUSD)} preserved from expired session logs` : null
+}
+
+/// Shared wording for the gateway-exclusion footnote. A Vercel AI Gateway row
+/// is a daily aggregate the local tools routed through the gateway already
+/// report, so it is shown but never added to a total. overview.ts and
+/// dashboard.tsx both print this so a headline that is short of the provider
+/// list explains itself.
+export function excludedGatewayNote(excludedGatewayCostUSD: number): string | null {
+  return excludedGatewayCostUSD > 0
+    ? `excludes ${formatCost(excludedGatewayCostUSD)} of Vercel AI Gateway daily totals (your local tools may already count it) — include with: codeburn gateway-totals include`
+    : null
 }
 
 export function formatTokens(n: number): string {
@@ -20,6 +54,7 @@ export function formatTokens(n: number): string {
   // the UI as "Infinity" or "NaN" strings when an upstream calculation glitches.
   if (!Number.isFinite(n)) return '?'
   if (n < 0) return '0'
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return Math.round(n).toString()
@@ -72,7 +107,9 @@ export function renderStatusBar(projects: ProjectSummary[], totals?: StatusBarTo
         if (!bucketTs) continue
         const day = localDateString(new Date(bucketTs))
         const turnCost = turn.assistantCalls.reduce((s, c) => s + c.costUSD, 0)
-        const turnCalls = turn.assistantCalls.length
+        // Cost keeps every call; the calls figure counts only behavioral ones,
+        // so a supplementary-only turn still spends but adds no requests.
+        const turnCalls = behavioralCallCount(turn.assistantCalls)
         if (day === today) { todayCost += turnCost; todayCalls += turnCalls }
         if (day >= monthStart) { monthCost += turnCost; monthCalls += turnCalls }
       }

@@ -1,35 +1,77 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, shell, type MenuItemConstructorOptions } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme, powerMonitor, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 
-import { CliError, killAll, resolveCodeburnPath, spawnCli, spawnCliAction, type ActionResult, type SpawnPriority } from './cli'
-import { getQuota, sanitizeError } from './quota'
+import { createBridgeHandlers as createHandlers, NO_UPDATE_STATUS, type Deps, type Handler } from './bridge-handlers'
+import { killAll, reapOrphanServe, resolveCodeburnPath, serveUsage, shutdownAll, spawnCli, spawnCliAction, startServe } from './cli'
+import { MenubarCompanion, readDockEnabled, STARTUP_APPS_SETTINGS_URL } from './menubar'
+import { MacMenubar, type InstallPhase } from './mac-menubar'
+import { getQuota } from './quota'
 import { Telemetry } from './telemetry'
+import { autoUpdateSupported, createAutoUpdateChecker, releaseFeedOverride, type AutoUpdateChecker } from './auto-update'
+import { createCompanionUpdater, type CompanionUpdater, type CompanionUpdateStatus } from './companion-update'
 import { createUpdateChecker, type UpdateChecker, type UpdateStatus } from './updates'
 
 // Initialized in bootstrap() once Electron paths exist; stays null under tests.
 let telemetryInstance: Telemetry | null = null
 // The once-per-launch + 24h update-availability checker. Null under tests.
 let updateChecker: UpdateChecker | null = null
+// Set instead of a link-only checker where the install can replace itself.
+let autoUpdate: AutoUpdateChecker | null = null
+// The bundled tray app and its Capacity Dock (Windows only). Null under tests.
+let companion: MenubarCompanion | null = null
+let macMenubar: MacMenubar | null = null
+// Brings the menubar app and the global CLI up to the desktop's version. Null under tests.
+let companionUpdate: CompanionUpdater | null = null
 
-/** The slice of Telemetry the bridge handlers use — injectable for tests. */
-export type TelemetryBridge = Pick<Telemetry, 'status' | 'setEnabled' | 'completeOnboarding' | 'track'>
+export {
+  appleLanguageFor, exportedPath, makeProgressReader, NO_COMPANION, NO_COMPANION_ACTION,
+  readConfigCursorSync, readConfigLanguage, readProjectFilter, writeConfigCursorSync, writeConfigLanguage, writeProjectFilter,
+} from './bridge-handlers'
+export type { Envelope, ProjectFilter, TelemetryBridge } from './bridge-handlers'
 
 type QuitTelemetry = Pick<Telemetry, 'trackClose' | 'flush'>
 type BeforeQuitEvent = { preventDefault: () => void }
-type BeforeQuitDeps = {
+type QuitFlushDeps = {
   getTelemetry: () => QuitTelemetry | null
-  killAll: () => void
-  quit: () => void
+  killAll: () => void | Promise<void>
   timeoutMs?: number
 }
+type BeforeQuitDeps = QuitFlushDeps & { quit: () => void }
 
 const QUIT_FLUSH_TIMEOUT_MS = 1500
+
+/** Track app_close, flush telemetry and stop the CLI children, bounded by the timeout. Never rejects. */
+export async function flushForQuit(deps: QuitFlushDeps): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    let childCleanup: Promise<unknown> = Promise.resolve()
+    try { childCleanup = Promise.resolve(deps.killAll()).catch(() => undefined) } catch { /* child cleanup must not wedge quit */ }
+
+    let telemetry: QuitTelemetry | null = null
+    try { telemetry = deps.getTelemetry() } catch { /* telemetry lookup is best-effort */ }
+
+    let flush: Promise<unknown> = Promise.resolve(false)
+    if (telemetry) {
+      try { telemetry.trackClose() } catch { /* flush the existing queue anyway */ }
+      try { flush = Promise.resolve(telemetry.flush()) } catch { /* use the resolved fallback */ }
+    }
+
+    const timeout = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, deps.timeoutMs ?? QUIT_FLUSH_TIMEOUT_MS)
+    })
+    await Promise.race([
+      Promise.all([flush.catch(() => false), childCleanup]),
+      timeout,
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
 
 /** Intercept one quit pass, then allow the re-entrant pass after a bounded flush. */
 export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQuitEvent) => void {
   let flushStarted = false
   let allowQuit = false
-  let closeTracked = false
 
   return event => {
     if (allowQuit) return
@@ -37,70 +79,55 @@ export function createBeforeQuitHandler(deps: BeforeQuitDeps): (event: BeforeQui
     if (flushStarted) return
     flushStarted = true
 
-    void (async () => {
-      let timer: ReturnType<typeof setTimeout> | undefined
-      try {
-        try { deps.killAll() } catch { /* child cleanup must not wedge quit */ }
-
-        let telemetry: QuitTelemetry | null = null
-        try { telemetry = deps.getTelemetry() } catch { /* telemetry lookup is best-effort */ }
-
-        let flush: Promise<unknown> = Promise.resolve(false)
-        if (telemetry) {
-          if (!closeTracked) {
-            closeTracked = true
-            try { telemetry.trackClose() } catch { /* flush the existing queue anyway */ }
-          }
-          try { flush = Promise.resolve(telemetry.flush()) } catch { /* use the resolved fallback */ }
-        }
-
-        const timeout = new Promise<void>(resolve => {
-          timer = setTimeout(resolve, deps.timeoutMs ?? QUIT_FLUSH_TIMEOUT_MS)
-        })
-        await Promise.race([flush.catch(() => false), timeout])
-      } finally {
-        if (timer !== undefined) clearTimeout(timer)
-        allowQuit = true
-        try { deps.quit() } catch { /* a throwing quit call must not reset the guard */ }
-      }
-    })()
+    void flushForQuit(deps).finally(() => {
+      allowQuit = true
+      try { deps.quit() } catch { /* a throwing quit call must not reset the guard */ }
+    })
   }
 }
 
-// Result envelope: handlers never throw across IPC so the structured error
-// `kind` survives contextBridge serialization. preload.ts unwraps it.
-export type Envelope<T = unknown> = { ok: true; value: T } | { ok: false; error: { kind: string; message: string } }
+/**
+ * The quit handler plus the flush an update install runs first. quitAndInstall quits through
+ * before-quit, and a handler that defers that quit cancels it, so the install flushes up front
+ * and every quit after that passes straight through.
+ */
+export function createQuitPath(deps: BeforeQuitDeps): {
+  beforeQuit: (event: BeforeQuitEvent) => void
+  beforeInstall: () => Promise<void>
+  /** The install did not quit the app: the next quit flushes again. */
+  cancelInstall: () => void
+} {
+  let installing = false
+  const handler = createBeforeQuitHandler(deps)
+  return {
+    beforeQuit: event => { if (!installing) handler(event) },
+    beforeInstall: async () => {
+      await flushForQuit(deps)
+      installing = true
+    },
+    cancelInstall: () => { installing = false },
+  }
+}
 
-// The first overview fetch after boot hydrates a cold cache from scratch (a full
-// history parse). That can far exceed the 45s read timeout, and killing it means
-// the cache never persists, so every later poll restarts the scan — perpetual
-// slowness. Give the first (cold) overview a long window; revert to the default
-// once it succeeds. Sections gate their own first poll on this one resolving so
-// the cold hydration runs ONCE, not once per section in parallel.
-const WARMUP_TIMEOUT_MS = 10 * 60_000
-// Wire marker for CLI scan-progress lines (src/parser.ts: PROGRESS_LINE_PREFIX).
-const PROGRESS_LINE_PREFIX = 'CODEBURN_PROGRESS '
+/** Passed by the menubar and the CLI engine to have this app update itself (design 2.1, step 4). */
+export const UPDATE_FLAG = '--codeburn-update'
+
+/** Check, then download; the download restarts into the update once it lands. Where this install
+ *  cannot replace itself there is no checker, and the window's banner is all there is. */
+export async function handOffUpdate(checker: Pick<AutoUpdateChecker, 'check' | 'download'> | null, onStatus: (status: UpdateStatus) => void): Promise<void> {
+  if (!checker) return
+  onStatus(await checker.check())
+  await checker.download()
+}
+
 // IPC channel carrying cold-start scan-progress events to the splash.
 export const PROGRESS_CHANNEL = 'codeburn:progress'
+/** Named steps of a running menubar install, pushed while the card waits on one. */
+export const MAC_MENUBAR_PROGRESS_CHANNEL = 'codeburn:macMenubarProgress'
 // IPC channel pushing update-availability status to open windows (launch + 24h).
 export const UPDATE_CHANNEL = 'codeburn:update'
+export const COMPANION_UPDATE_CHANNEL = 'codeburn:companionUpdate'
 
-/** Line-buffer a spawn's stderr and forward each parsed scan-progress event. */
-export function makeProgressReader(emit: (event: unknown) => void): (chunk: string) => void {
-  let buffer = ''
-  return chunk => {
-    buffer += chunk
-    let nl = buffer.indexOf('\n')
-    while (nl >= 0) {
-      const line = buffer.slice(0, nl)
-      buffer = buffer.slice(nl + 1)
-      if (line.startsWith(PROGRESS_LINE_PREFIX)) {
-        try { emit(JSON.parse(line.slice(PROGRESS_LINE_PREFIX.length))) } catch { /* ignore malformed line */ }
-      }
-      nl = buffer.indexOf('\n')
-    }
-  }
-}
 
 function broadcastProgress(event: unknown): void {
   for (const win of BrowserWindow.getAllWindows()) {
@@ -114,269 +141,16 @@ function broadcastUpdateStatus(status: UpdateStatus): void {
   }
 }
 
-const NO_UPDATE_STATUS: UpdateStatus = { currentVersion: '', latestVersion: null, updateAvailable: false, tag: null }
-
-function providerArgs(provider: string | undefined): string[] {
-  return provider && provider !== 'all' ? ['--provider', provider] : []
-}
-
-type DateRange = { from: string; to: string }
-
-function rangeArgs(range: DateRange | undefined): string[] {
-  return range ? ['--from', range.from, '--to', range.to] : []
-}
-
-function configSourceArgs(source: string | null): string[] {
-  return source ? ['--claude-config-source', source] : []
-}
-
-// Renderer-supplied strings become argv, so reject anything that could smuggle a
-// flag or shell metacharacter before it reaches the CLI. Thrown from the argv
-// builders, these surface through the same error envelope as any CliError.
-const PERIODS = new Set(['today', 'week', '30days', 'month', 'all', 'lifetime'])
-function vPeriod(period: string): string {
-  if (!PERIODS.has(period)) throw new CliError('bad-args', 'invalid period')
-  return period
-}
-function vProvider(provider: string): string {
-  if (!/^[a-z0-9-]+$/.test(provider)) throw new CliError('bad-args', 'invalid provider')
-  return provider
-}
-function vRange(range: DateRange | undefined): DateRange | undefined {
-  if (range && (!/^\d{4}-\d{2}-\d{2}$/.test(range.from) || !/^\d{4}-\d{2}-\d{2}$/.test(range.to))) {
-    throw new CliError('bad-args', 'invalid date range')
+function broadcastCompanionUpdate(status: CompanionUpdateStatus): void {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) win.webContents.send(COMPANION_UPDATE_CHANNEL, status)
   }
-  return range
-}
-function vCurrency(code: string): string {
-  if (!/^[A-Z]{3}$/.test(code)) throw new CliError('bad-args', 'invalid currency code')
-  return code
-}
-/** model/alias/device/plan tokens: must not be read as a CLI flag. */
-function vToken(value: string): string {
-  if (value.startsWith('-')) throw new CliError('bad-args', 'argument must not start with "-"')
-  return value
-}
-// Claude config source ids are `<kind>:<hex>` (src/providers/claude.ts) — the
-// colon is part of the real value, so the token class allows it while anchoring
-// the first char to alphanumeric so a leading "-" can never smuggle a flag.
-function vConfigSource(source: string | null | undefined): string | null {
-  if (source == null) return null
-  if (!/^[A-Za-z0-9][A-Za-z0-9:_-]*$/.test(source)) throw new CliError('bad-args', 'invalid claude config source')
-  return source
-}
-function vOutPath(outPath: string): string {
-  if (outPath.startsWith('-') || !path.isAbsolute(outPath)) throw new CliError('bad-args', 'export path must be absolute')
-  return outPath
-}
-// Price-override rates are USD per 1M tokens: every provided rate must be a
-// finite, strictly positive number before it becomes a CLI value.
-type PriceRates = { input?: number; output?: number; cacheRead?: number; cacheCreation?: number }
-function rateArg(flag: string, value: number | undefined): string[] {
-  if (value === undefined) return []
-  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw new CliError('bad-args', 'rate must be a positive number')
-  return [flag, String(value)]
-}
-function priceOverrideArgs(model: string, rates: PriceRates | undefined): string[] {
-  const r = rates ?? {}
-  return [
-    'price-override', vToken(model),
-    ...rateArg('--input', r.input),
-    ...rateArg('--output', r.output),
-    ...rateArg('--cache-read', r.cacheRead),
-    ...rateArg('--cache-creation', r.cacheCreation),
-  ]
 }
 
-function toEnvelopeError(err: unknown): { kind: string; message: string } {
-  if (err instanceof CliError) return { kind: err.kind, message: sanitizeError(err.message) }
-  return { kind: 'nonzero', message: sanitizeError(err instanceof Error ? err.message : String(err)) }
-}
 
-/**
- * Props for a `cli_error` telemetry event. Deliberately carries only
- * non-sensitive enums so the event is diagnosable without a repro yet leaks
- * nothing: `cmd` is the CLI subcommand (argv[0], a fixed literal like 'status'/
- * 'sessions' — never the full args, which can hold paths), and `detail` is the
- * not-found resolution/spawn stage. The error's `message` (which may contain a
- * path or stderr) is never read here — only `kind` and the stage enum are.
- */
-function cliErrorProps(err: unknown, cmd: string | undefined): Record<string, unknown> {
-  const props: Record<string, unknown> = {}
-  if (cmd) props.cmd = cmd
-  if (err instanceof CliError) {
-    props.kind = err.kind
-    if (err.kind === 'not-found' && err.detail) props.detail = err.detail
-  } else {
-    props.kind = 'nonzero'
-  }
-  return props
-}
 
-type Deps = {
-  spawnCli: (args: string[], opts?: { timeoutMs?: number; onStderr?: (chunk: string) => void; extraEnv?: NodeJS.ProcessEnv; priority?: SpawnPriority }) => Promise<unknown>
-  spawnCliAction: (args: string[], opts?: { timeoutMs?: number }) => Promise<ActionResult>
-  resolveCodeburnPath: () => string | null
-  getQuota: typeof getQuota
-  /** Forward cold-start scan-progress events to the renderer splash. */
-  emitProgress?: (event: unknown) => void
-  /** Consent-gated anonymous telemetry; absent under tests unless injected. */
-  telemetry?: TelemetryBridge | null
-  /** Cached update-availability status; absent under tests unless injected. */
-  getUpdateStatus?: () => Promise<UpdateStatus>
-}
-
-type Handler = (...args: any[]) => Promise<Envelope>
-
-/**
- * Maps every CodeburnBridge channel to its `codeburn` argv (plain args, no
- * shell) and returns a result envelope. Pure + injectable so the wiring is
- * unit-testable without launching Electron.
- */
-export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS) }): Record<string, Handler> {
-  const emitProgress = deps.emitProgress ?? (() => {})
-  const telemetry = deps.telemetry ?? null
-  // Flips true after the first overview fetch succeeds. Until then, every
-  // overview fetch runs cold (long timeout + progress streaming); the shared
-  // spawnCli coalescing means concurrent same-arg re-polls join one child.
-  let overviewWarmed = false
-  // cold_start is a once-per-launch metric. Because coalesced re-polls each
-  // re-enter the cold branch (and overviewWarmed only flips on success, so it
-  // never guards a still-failing warmup), emitting inline would record one row
-  // per poll — each with a launch-relative, cumulative elapsed time. Latch the
-  // emit and anchor the duration to the FIRST cold attempt instead.
-  let coldStartEmitted = false
-  let coldStartBegan: number | null = null
-  const emitColdStart = (timedOut: boolean): void => {
-    if (coldStartEmitted) return
-    coldStartEmitted = true
-    telemetry?.track('cold_start', { ms: Date.now() - (coldStartBegan ?? Date.now()), timedOut })
-  }
-
-  const run = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
-    let cmd: string | undefined
-    try {
-      const argv = build(...args)
-      cmd = argv[0]
-      return { ok: true, value: await deps.spawnCli(argv) }
-    } catch (err) {
-      const error = toEnvelopeError(err)
-      telemetry?.track('cli_error', cliErrorProps(err, cmd))
-      return { ok: false, error }
-    }
-  }
-
-  // The desktop never renders the granular timeline, so it always passes
-  // --no-timeline (skips buildGranularHistory on every poll). The Swift menubar
-  // omits the flag and keeps the timeline unchanged.
-  const buildOverviewArgs = (period: string, provider: string, range?: DateRange, configSource?: string | null): string[] => [
-    'status', '--format', 'menubar-json', '--period', vPeriod(period), '--no-timeline',
-    ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)), ...configSourceArgs(vConfigSource(configSource)),
-  ]
-
-  // `background` (renderer prefetch only) drops this fetch to background priority
-  // so it yields the CLI's run slots to any interactive poll or click. Optional
-  // and defaulting to interactive, so an older preload that omits it is unchanged.
-  const getOverview: Handler = async (period: string, provider: string, range?: DateRange, configSource?: string | null, background?: boolean) => {
-    coldStartBegan ??= Date.now()
-    const priority: SpawnPriority | undefined = background ? 'background' : undefined
-    try {
-      const args = buildOverviewArgs(period, provider, range, configSource)
-      if (overviewWarmed) return { ok: true, value: await deps.spawnCli(args, priority ? { priority } : undefined) }
-      const value = await deps.spawnCli(args, {
-        timeoutMs: WARMUP_TIMEOUT_MS,
-        extraEnv: { CODEBURN_PROGRESS: '1' },
-        onStderr: makeProgressReader(emitProgress),
-        ...(priority ? { priority } : {}),
-      })
-      overviewWarmed = true
-      emitProgress({ kind: 'done' })
-      emitColdStart(false)
-      return { ok: true, value }
-    } catch (err) {
-      const error = toEnvelopeError(err)
-      if (!overviewWarmed) emitColdStart(error.kind === 'timeout')
-      telemetry?.track('cli_error', cliErrorProps(err, 'status'))
-      return { ok: false, error }
-    }
-  }
-  const runAction = (build: (...args: any[]) => string[]): Handler => async (...args: any[]) => {
-    try {
-      const result = await deps.spawnCliAction(build(...args))
-      return { ok: true, value: { ...result, stderr: sanitizeError(result.stderr) } }
-    } catch (err) {
-      return { ok: false, error: toEnvelopeError(err) }
-    }
-  }
-
-  return {
-    'codeburn:getQuota': async (force?: boolean) => {
-      try { return { ok: true, value: await deps.getQuota({ force: Boolean(force) }) } }
-      catch (error) { return { ok: false, error: { kind: 'nonzero', message: sanitizeError(error) } } }
-    },
-    'codeburn:getOverview': getOverview,
-    'codeburn:getPlans': run((period: string) => ['status', '--format', 'json', '--period', vPeriod(period)]),
-    'codeburn:getActReport': run(() => ['act', 'report', '--json']),
-    'codeburn:getModels': run((period: string, provider: string, byTask: boolean, range?: DateRange) => [
-      'models', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...(byTask ? ['--by-task'] : []), ...rangeArgs(vRange(range)),
-    ]),
-    'codeburn:getSessions': run((period: string, provider: string, range?: DateRange) => [
-      'sessions', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
-    'codeburn:getCompareModels': run((period: string, provider: string) => [
-      'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)),
-    ]),
-    'codeburn:getCompare': run((period: string, provider: string, modelA: string, modelB: string) => [
-      'compare', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), '--model-a', vToken(modelA), '--model-b', vToken(modelB),
-    ]),
-    'codeburn:getYield': run((period: string, provider: string, range?: DateRange) => [
-      'yield', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
-    'codeburn:getSpendFlow': run((period: string, provider: string, range?: DateRange) => [
-      'spend', '--format', 'flow-json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
-    'codeburn:getOptimizeReport': run((period: string, provider: string, range?: DateRange) => [
-      'optimize', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
-    'codeburn:getDevices': run((period: string) => ['devices', '--format', 'json', '--period', vPeriod(period)]),
-    'codeburn:getDevicesScan': run(() => ['devices', 'scan', '--format', 'json']),
-    'codeburn:getShareStatus': run(() => ['share', 'status', '--format', 'json']),
-    'codeburn:getIdentity': run(() => ['identity', '--format', 'json']),
-    'codeburn:getAliases': run(() => ['model-alias', '--list', '--format', 'json']),
-    'codeburn:getProxyPaths': run(() => ['proxy-path', '--list', '--format', 'json']),
-    'codeburn:getAudit': run((period: string, provider: string, range?: DateRange) => [
-      'audit', '--format', 'json', '--period', vPeriod(period), ...providerArgs(vProvider(provider)), ...rangeArgs(vRange(range)),
-    ]),
-    'codeburn:getPriceOverrides': run(() => ['price-override', '--list', '--format', 'json']),
-    'codeburn:setCurrency': runAction((code: string) => ['currency', vCurrency(code)]),
-    'codeburn:resetCurrency': runAction(() => ['currency', '--reset']),
-    'codeburn:addAlias': runAction((from: string, to: string) => ['model-alias', vToken(from), vToken(to)]),
-    'codeburn:removeAlias': runAction((from: string) => ['model-alias', '--remove', vToken(from)]),
-    'codeburn:setPriceOverride': runAction((model: string, rates: PriceRates) => priceOverrideArgs(model, rates)),
-    'codeburn:removePriceOverride': runAction((model: string) => ['price-override', '--remove', vToken(model)]),
-    'codeburn:removeDevice': runAction((name: string) => ['devices', 'rm', vToken(name)]),
-    'codeburn:setPlan': runAction((id: string, provider: string) => ['plan', 'set', vToken(id), '--provider', vProvider(provider)]),
-    'codeburn:resetPlan': runAction((provider: string) => ['plan', 'reset', '--provider', vProvider(provider)]),
-    'codeburn:exportData': runAction((format: string, provider: string, outPath: string) => [
-      'export', '-f', vToken(format), '-o', vOutPath(outPath), '--provider', vProvider(provider),
-    ]),
-    'codeburn:cliStatus': async () => {
-      const p = deps.resolveCodeburnPath()
-      return { ok: true, value: { found: p !== null, path: p } }
-    },
-    // Telemetry consent + events. Value is null when telemetry is unavailable
-    // (tests, or init failure) — the renderer treats null as "no onboarding".
-    'codeburn:telemetryStatus': async () => ({ ok: true, value: telemetry ? telemetry.status() : null }),
-    'codeburn:telemetrySetEnabled': async (enabled?: boolean) => ({ ok: true, value: telemetry ? telemetry.setEnabled(Boolean(enabled)) : null }),
-    'codeburn:telemetryOnboarded': async (enabled?: boolean) => ({ ok: true, value: telemetry ? telemetry.completeOnboarding(Boolean(enabled)) : null }),
-    'codeburn:telemetryTrack': async (name?: string, props?: unknown) => {
-      telemetry?.track(String(name ?? ''), props)
-      return { ok: true, value: true }
-    },
-    // One-shot read of the cached update-availability status. The check itself
-    // runs in the background (launch + 24h); this returns whatever is known.
-    'codeburn:getUpdateStatus': async () => ({ ok: true, value: deps.getUpdateStatus ? await deps.getUpdateStatus() : NO_UPDATE_STATUS }),
-  }
+export function createBridgeHandlers(deps: Deps = { spawnCli, spawnCliAction, resolveCodeburnPath, getQuota, emitProgress: broadcastProgress, telemetry: telemetryInstance, getUpdateStatus: () => updateChecker ? updateChecker.getStatus() : Promise.resolve(NO_UPDATE_STATUS), downloadUpdate: () => autoUpdate ? autoUpdate.download() : Promise.resolve(NO_UPDATE_STATUS), installUpdate: () => autoUpdate?.install(), companionUpdateStatus: () => companionUpdate?.status() ?? null, updateCompanions: () => companionUpdate?.run(), companion: companion, macMenubar: macMenubar, stateDir: app.getPath('userData'), appVersion: app.getVersion(), isOnBatteryPower: () => powerMonitor.isOnBatteryPower() }): Record<string, Handler> {
+  return createHandlers(deps)
 }
 
 function registerHandlers(): void {
@@ -389,12 +163,24 @@ function registerHandlers(): void {
     return { ok: true, value: res.canceled ? null : (res.filePaths[0] ?? null) }
   })
   ipcMain.handle('open-external', (_event, url: string) => {
-    try {
-      const { protocol } = new URL(url)
-      if (protocol === 'https:' || protocol === 'http:') return shell.openExternal(url)
-    } catch { /* malformed URL — refuse to open */ }
-    return
+    const allowed = externalUrlToOpen(url)
+    return allowed === null ? undefined : shell.openExternal(allowed)
   })
+}
+
+/**
+ * What the renderer may hand the shell, or null for anything else. The web is http(s) only.
+ * The one exception is the Windows Settings page for startup apps, allowed by exact value:
+ * on the Store route launch at login is the package's own startup task, so the tray pane
+ * points at that page instead of offering a switch it cannot move (app/electron/menubar.ts).
+ */
+export function externalUrlToOpen(url: string, platform: string = process.platform): string | null {
+  if (platform === 'win32' && url === STARTUP_APPS_SETTINGS_URL) return url
+  try {
+    const { protocol } = new URL(url)
+    if (protocol === 'https:' || protocol === 'http:') return url
+  } catch { /* malformed URL, refuse to open */ }
+  return null
 }
 
 export function createApplicationMenuTemplate(isDev = Boolean(process.env.VITE_DEV_SERVER_URL)): MenuItemConstructorOptions[] {
@@ -488,11 +274,9 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // Chromium's default (kept explicit): when the window is minimized or fully
-      // occluded the renderer's document.visibilityState flips to 'hidden' and a
-      // visibilitychange fires. usePolled and the flame animation gate on that to
-      // stop background CLI polls and compositor wakeups while hidden. A merely
-      // unfocused-but-visible window stays 'visible' and keeps polling.
+      // Keep Chromium's normal background throttling so minimizing/occluding the
+      // window updates the Page Visibility API and pauses renderer animations.
+      // Data intervals remain registered and use a visibility catch-up on return.
       backgroundThrottling: true,
     },
   })
@@ -536,20 +320,30 @@ function bootstrap(): void {
     app.quit()
     return
   }
-  app.on('second-instance', () => {
+  app.on('second-instance', (_event, argv) => {
+    if (argv.includes(UPDATE_FLAG)) void handOffUpdate(autoUpdate, broadcastUpdateStatus)
     const [win] = BrowserWindow.getAllWindows()
     if (!win) return
     if (win.isMinimized()) win.restore()
     win.focus()
   })
 
-  app.on('before-quit', createBeforeQuitHandler({
+  const quitPath = createQuitPath({
     getTelemetry: () => telemetryInstance,
-    killAll,
+    killAll: shutdownAll,
     quit: () => app.quit(),
-  }))
+  })
+  app.on('before-quit', quitPath.beforeQuit)
 
   void app.whenReady().then(() => {
+    // Start the resident child early, but issue no artificial warm-up query:
+    // the first real overview request is the single cache hydration and streams
+    // its progress through serve. Every later panel reuses that parsed cache.
+    // A crash leaves no one to close the previous child's stdin, so reap it
+    // first — orphans hold FSEvents handles and a stale cache refresh lock.
+    const servePidFile = path.join(app.getPath('userData'), 'serve.pid')
+    reapOrphanServe(servePidFile)
+    startServe(servePidFile)
     // Consent-gated anonymous telemetry (desktop only). Nothing transmits until
     // the onboarding consent screen is completed and the toggle is on; EU/EEA/
     // UK/CH installs default the toggle off. Dev builds never send.
@@ -559,28 +353,132 @@ function bootstrap(): void {
         country: app.getLocaleCountryCode() || null,
         isPackaged: app.isPackaged,
         appVersion: app.getVersion(),
+        getAppMetrics: () => app.getAppMetrics(),
+        getServeUsage: serveUsage,
       })
+      telemetryInstance.settleUpdate(app.getVersion())
       // completeOnboarding tracks the first app_open itself; only already-
-      // onboarded installs record subsequent opens here.
-      if (telemetryInstance.status().onboarded) telemetryInstance.track('app_open', {})
-      setInterval(() => { void telemetryInstance?.flush() }, 5 * 60_000)
+      // onboarded installs record subsequent opens here. app_open carries the
+      // Capacity Dock state (on/off/none) so dock adoption is measurable.
+      if (telemetryInstance.status().onboarded) {
+        const dockPref = readDockEnabled()
+        telemetryInstance.track('app_open', { dock: dockPref === undefined ? 'none' : dockPref ? 'on' : 'off' })
+      }
+      setInterval(() => {
+        telemetryInstance?.sampleResources()
+        void telemetryInstance?.flush()
+      }, 5 * 60_000)
     } catch (err) {
       console.error('telemetry init failed (continuing without):', err)
     }
+    // The tray app and the Capacity Dock the desktop app carries on Windows. Constructed
+    // before the handlers so the sidebar's switches have something to read, and installed in
+    // the background so a `/passive` msiexec run never holds the first window back.
+    companion = new MenubarCompanion({
+      // Packaged: the real resources dir. Dev: null, unless CODEBURN_MENUBAR_RESOURCES points at
+      // a packaged-style layout (a `menubar` dir under it, with CodeBurn.exe beside it), so the
+      // tray install can be exercised without packaging. A dev convenience like CODEBURN_BIN and
+      // CODEBURN_DEV_REPO_ROOT; the CLI still validates the staged path in full (menubar-installer.ts).
+      resourcesPath: app.isPackaged ? process.resourcesPath : (process.env.CODEBURN_MENUBAR_RESOURCES ?? null),
+      stateDir: app.getPath('userData'),
+      // Electron sets this in an installed AppX package, which is the Store route.
+      store: (process as NodeJS.Process & { windowsStore?: boolean }).windowsStore === true,
+      platform: process.platform,
+      env: process.env,
+    })
+    const trayBootstrapped = companion.bootstrap().catch(err => console.error('menubar bootstrap failed:', err))
+    // No bootstrap: nothing is installed, moved or launched until the card asks.
+    macMenubar = new MacMenubar({
+      platform: process.platform,
+      // Electron sets this only in a Mac App Store build, where downloading an executable is
+      // against the rules, so the card offers the website instead of an Install button.
+      mas: (process as NodeJS.Process & { mas?: boolean }).mas === true,
+      runCli: spawnCliAction,
+      // So the menubar this installs can find a codeburn without one on PATH: the launcher is
+      // written into userData and recorded where the menubar looks first.
+      execPath: process.execPath,
+      bundledCli: process.env.CODEBURN_BUNDLED_CLI,
+      stateDir: app.getPath('userData'),
+      onPhase: (phase: InstallPhase) => {
+        for (const win of BrowserWindow.getAllWindows()) win.webContents.send(MAC_MENUBAR_PROGRESS_CHANNEL, phase)
+      },
+    })
     registerHandlers()
+    // Power source, pushed to the renderer so the live cadence halves on
+    // battery and restores on AC.
+    const broadcastPower = () => {
+      const onBattery = powerMonitor.isOnBatteryPower()
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (!win.isDestroyed()) win.webContents.send('codeburn:power', onBattery)
+      }
+    }
+    powerMonitor.on('on-battery', broadcastPower)
+    powerMonitor.on('on-ac', broadcastPower)
     installApplicationMenu()
+    // Seed the preload-readable app locale before any window loads. app.getLocale()
+    // needs the ready state, so this runs inside bootstrap's whenReady.
+    process.env.__CODEBURN_APP_LOCALE__ = app.getLocale()
     createWindow()
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow()
     })
 
     // Update availability: check once at launch, then every 24h, pushing each
-    // result to any open window. Never downloads/installs (unsigned builds);
-    // errors are swallowed inside the checker as a silent no-op.
-    updateChecker = createUpdateChecker({ currentVersion: app.getVersion() })
+    // result to any open window. Signed mac builds and the AppImage download and
+    // install on the reader's click; everything else gets a download link.
+    // Errors are swallowed inside the checkers as a silent no-op.
+    const windowsStore = (process as NodeJS.Process & { windowsStore?: boolean }).windowsStore === true
+    if (autoUpdateSupported({
+      platform: process.platform,
+      isPackaged: app.isPackaged,
+      mas: (process as NodeJS.Process & { mas?: boolean }).mas === true,
+      windowsStore,
+      appImage: process.env.APPIMAGE,
+    })) {
+      // Loaded only here: electron-updater picks a platform updater as soon as it is touched.
+      const { autoUpdater } = require('electron-updater') as typeof import('electron-updater')
+      // The end-to-end test's local feed; ignored unless it is on the allow-list.
+      const feed = releaseFeedOverride(process.env.CODEBURN_RELEASE_BASE)
+      if (feed) autoUpdater.setFeedURL({ provider: 'generic', url: feed })
+      autoUpdate = createAutoUpdateChecker({
+        updater: autoUpdater,
+        currentVersion: app.getVersion(),
+        onChange: broadcastUpdateStatus,
+        onDownloadFail: (outcome, from, to) => telemetryInstance?.track('update_result', { from, to, outcome }),
+        onInstall: (from, to) => telemetryInstance?.noteUpdateInstall(from, to),
+        beforeQuit: quitPath.beforeInstall,
+        // The app is still here: undo the quit flush so the CLI and serve work again.
+        onInstallFail: () => {
+          quitPath.cancelInstall()
+          killAll()
+          startServe(servePidFile)
+        },
+      })
+      updateChecker = autoUpdate
+    } else {
+      updateChecker = createUpdateChecker({ currentVersion: app.getVersion(), storeManaged: windowsStore })
+    }
+    if (process.argv.includes(UPDATE_FLAG)) void handOffUpdate(autoUpdate, broadcastUpdateStatus)
     const runUpdateCheck = () => { void updateChecker?.check().then(broadcastUpdateStatus) }
     runUpdateCheck()
     setInterval(runUpdateCheck, 24 * 60 * 60 * 1000)
+
+    // Companions follow the desktop. Packaged only: a dev build's CLI is the repo's, and its
+    // version says nothing about what should be installed. Windows waits for the tray install
+    // so msiexec and npm never run at once.
+    companionUpdate = createCompanionUpdater({
+      appVersion: app.getVersion(),
+      platform: process.platform,
+      stateDir: app.getPath('userData'),
+      readMenubarVersion: async () => (macMenubar ? (await macMenubar.status()).version : null),
+      runCli: spawnCliAction,
+      onChange: broadcastCompanionUpdate,
+      track: props => telemetryInstance?.track('update_result', props),
+    })
+    if (app.isPackaged) {
+      setTimeout(() => { void trayBootstrapped.then(() => companionUpdate?.start()) }, 15_000)
+      setInterval(() => { void companionUpdate?.check() }, 24 * 60 * 60 * 1000)
+    }
   })
 
   app.on('window-all-closed', () => {

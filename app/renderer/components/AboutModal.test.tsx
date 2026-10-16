@@ -20,7 +20,7 @@ const SAME: UpdateStatus = { currentVersion: '0.9.17', latestVersion: '0.9.17', 
 const UNKNOWN: UpdateStatus = { currentVersion: '0.9.17', latestVersion: null, updateAvailable: false, tag: null }
 
 function renderAbout() {
-  return render(<AboutModal socials={[]} onClose={() => {}} />)
+  return render(<AboutModal socials={[]} openKey="1" onClose={() => {}} />)
 }
 
 describe('AboutModal update check', () => {
@@ -36,6 +36,12 @@ describe('AboutModal update check', () => {
     renderAbout()
     await waitFor(() => expect(mocks.getUpdateStatus).toHaveBeenCalled())
     expect(screen.queryByText(/latest version/i)).toBeNull()
+  })
+
+  it('offers no update check on a store install', async () => {
+    mocks.getUpdateStatus.mockResolvedValue({ ...UNKNOWN, storeManaged: true })
+    renderAbout()
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Check for updates' })).toBeNull())
   })
 
   it('reports up to date on the current version', async () => {

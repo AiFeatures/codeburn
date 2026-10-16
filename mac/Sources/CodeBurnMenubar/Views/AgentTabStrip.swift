@@ -16,6 +16,7 @@ struct AgentTabStrip: View {
     @State private var stripViewportWidth: CGFloat = 0
     @State private var stripContentWidth: CGFloat = 0
     @State private var scrollWheelMonitor: Any?
+    @State private var viewportAnchor: ProviderFilter?
 
     var body: some View {
         GeometryReader { viewportGeo in
@@ -23,7 +24,7 @@ struct AgentTabStrip: View {
                 HStack(spacing: 4) {
                     if isOverflowing {
                         Button {
-                            selectAdjacentProvider(direction: -1, proxy: proxy)
+                            pageProviderStrip(direction: .backward, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.left")
                                 .font(.system(size: 10, weight: .semibold))
@@ -32,7 +33,7 @@ struct AgentTabStrip: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(canMoveBackward ? Color.primary : Color.secondary.opacity(0.35))
                         .disabled(!canMoveBackward)
-                        .help("Show previous providers")
+                        .help(L("Show previous providers"))
                     }
 
                     ScrollView(.horizontal, showsIndicators: false) {
@@ -41,9 +42,11 @@ struct AgentTabStrip: View {
                                 AgentTab(
                                     filter: filter,
                                     cost: cost(for: filter),
+                                    isEstimated: isEstimated(filter),
                                     isActive: store.selectedProvider == filter,
                                     quota: store.quotaSummary(for: filter)
                                 ) {
+                                    viewportAnchor = filter
                                     store.switchTo(provider: filter)
                                     withAnimation(.easeInOut(duration: 0.18)) {
                                         proxy.scrollTo(filter.id, anchor: .center)
@@ -73,7 +76,7 @@ struct AgentTabStrip: View {
 
                     if isOverflowing {
                         Button {
-                            selectAdjacentProvider(direction: 1, proxy: proxy)
+                            pageProviderStrip(direction: .forward, proxy: proxy)
                         } label: {
                             Image(systemName: "chevron.right")
                                 .font(.system(size: 10, weight: .semibold))
@@ -82,23 +85,25 @@ struct AgentTabStrip: View {
                         .buttonStyle(.plain)
                         .foregroundStyle(canMoveForward ? Color.primary : Color.secondary.opacity(0.35))
                         .disabled(!canMoveForward)
-                        .help("Show next providers")
+                        .help(L("Show next providers"))
                     }
                 }
                 .onAppear {
                     stripViewportWidth = viewportGeo.size.width
                     installScrollWheelMonitorIfNeeded()
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(store.selectedProvider.id, anchor: .center)
-                    }
+                    viewportAnchor = pagingState.viewportAnchor
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onChange(of: viewportGeo.size.width) { _, newWidth in
                     stripViewportWidth = newWidth
                 }
                 .onChange(of: store.selectedProvider) { _, newProvider in
-                    withAnimation(.easeInOut(duration: 0.18)) {
-                        proxy.scrollTo(newProvider.id, anchor: .center)
-                    }
+                    viewportAnchor = visibleFilters.contains(newProvider) ? newProvider : pagingState.viewportAnchor
+                    scrollToViewportAnchor(proxy: proxy)
+                }
+                .onChange(of: visibleFilters) { _, _ in
+                    viewportAnchor = pagingState.viewportAnchor
+                    scrollToViewportAnchor(proxy: proxy)
                 }
                 .onDisappear {
                     removeScrollWheelMonitorIfNeeded()
@@ -109,17 +114,27 @@ struct AgentTabStrip: View {
     }
 
     private var periodAll: MenubarPayload {
-        store.periodAllPayload ?? store.payload
+        // `store.payload` is the SCOPED selection. Falling back to it while the
+        // selection has no cached data of its own used to surface the previous
+        // provider's totals here; the same hasCachedData gate the popover body
+        // uses keeps that out of the tab strip.
+        store.periodAllPayload ?? (store.hasCachedData ? store.payload : .empty)
     }
 
     private var visibleFilters: [ProviderFilter] {
-        // Tabs reflect the SELECTED range: every provider with usage (cost > 0)
-        // in the period, ordered by usage. Providers with no usage in the range
-        // are omitted. `.all` always leads. cost(for:) reads periodAll, so this
-        // updates as the user switches periods.
+        // Tabs reflect the selected range. The payload's activity signal keeps
+        // token-only and subscription/flat-rate providers visible while hiding
+        // providers merely discovered on disk. Older payloads lack the activity
+        // signal, so their zero-cost discovery rows fail closed.
+        let activeKeys = ProviderVisibility.activeKeys(
+            providerDetails: periodAll.current.providerDetails,
+            legacyProviders: periodAll.current.providers
+        )
         let costs = Dictionary(uniqueKeysWithValues: ProviderFilter.allCases.map { ($0, cost(for: $0) ?? 0) })
         let detected = ProviderFilter.allCases.filter { filter in
-            filter == .all || (costs[filter] ?? 0) > 0
+            filter == .all
+                || activeKeys.contains(filter.cliArg)
+                || filter.providerKeys.contains(where: activeKeys.contains)
         }
         return detected.sorted { a, b in
             if a == .all { return true }
@@ -129,6 +144,14 @@ struct AgentTabStrip: View {
             if ca != cb { return ca > cb }
             return a.rawValue < b.rawValue
         }
+    }
+
+    private func isEstimated(_ filter: ProviderFilter) -> Bool {
+        guard filter != .all, let cost = cost(for: filter) else { return false }
+        let estimated = periodAll.current.providerDetails
+            .filter { filter.providerKeys.contains($0.id.lowercased()) || filter.providerKeys.contains($0.label.lowercased()) }
+            .reduce(0.0) { $0 + ($1.estimatedCostUSD ?? 0) }
+        return isEstimatedCost(cost, estimated, shown: cost.asCompactCurrency())
     }
 
     private func cost(for filter: ProviderFilter) -> Double? {
@@ -143,21 +166,29 @@ struct AgentTabStrip: View {
         }
     }
 
-    private var currentFilterIndex: Int {
-        visibleFilters.firstIndex(of: store.selectedProvider) ?? 0
+    private var pagingState: ProviderStripPagingState {
+        ProviderStripPagingState(
+            filters: visibleFilters,
+            selectedProvider: store.selectedProvider,
+            viewportAnchor: viewportAnchor
+        )
     }
 
-    private var canMoveBackward: Bool { currentFilterIndex > 0 }
-    private var canMoveForward: Bool { currentFilterIndex < visibleFilters.count - 1 }
+    private var canMoveBackward: Bool { pagingState.canMoveBackward }
+    private var canMoveForward: Bool { pagingState.canMoveForward }
     private var isOverflowing: Bool { stripContentWidth > (stripViewportWidth - 30) }
 
-    private func selectAdjacentProvider(direction: Int, proxy: ScrollViewProxy) {
-        guard !visibleFilters.isEmpty else { return }
-        let targetIndex = min(max(currentFilterIndex + direction, 0), visibleFilters.count - 1)
-        let target = visibleFilters[targetIndex]
-        store.switchTo(provider: target)
+    private func pageProviderStrip(direction: ProviderStripPagingDirection, proxy: ScrollViewProxy) {
+        var state = pagingState
+        guard let target = state.move(direction: direction) else { return }
+        viewportAnchor = target
+        scrollToViewportAnchor(proxy: proxy)
+    }
+
+    private func scrollToViewportAnchor(proxy: ScrollViewProxy) {
+        guard let viewportAnchor else { return }
         withAnimation(.easeInOut(duration: 0.18)) {
-            proxy.scrollTo(target.id, anchor: .center)
+            proxy.scrollTo(viewportAnchor.id, anchor: .center)
         }
     }
 
@@ -201,6 +232,7 @@ struct AgentTabStrip: View {
 private struct AgentTab: View {
     let filter: ProviderFilter
     let cost: Double?
+    var isEstimated = false
     let isActive: Bool
     let quota: QuotaSummary?
     let onTap: () -> Void
@@ -221,37 +253,39 @@ private struct AgentTab: View {
     }
 
     var body: some View {
-        VStack(spacing: 3) {
-            HStack(spacing: 5) {
-                Text(filter.rawValue)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .tracking(-0.05)
-                if let cost, cost > 0 {
-                    Text(cost.asCompactCurrency())
-                        .font(.codeMono(size: 10.5, weight: .medium))
-                        .foregroundStyle(isActive ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
-                        .tracking(-0.2)
-                }
-            }
-            if quota != nil {
-                AgentTabQuotaBar(quota: quota, isActive: isActive)
-                    .frame(height: 3)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isActive ? AnyShapeStyle(Theme.brandAccent) : AnyShapeStyle(Color.secondary.opacity(0.08)))
-        )
-        .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-        .contentShape(Rectangle())
-        .onTapGesture {
+        Button {
             hoverPopoverShown = false
             hoverEnterTask?.cancel()
             clickDismissed = true
             onTap()
+        } label: {
+            VStack(spacing: 3) {
+                HStack(spacing: 5) {
+                    Text(filter.rawValue)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .tracking(-0.05)
+                    if let cost, cost > 0 {
+                        Text((isEstimated ? "~" : "") + cost.asCompactCurrency())
+                            .font(.codeMono(size: 10.5, weight: .medium))
+                            .foregroundStyle(isActive ? AnyShapeStyle(.white.opacity(0.8)) : AnyShapeStyle(.secondary))
+                            .tracking(-0.2)
+                    }
+                }
+                if quota != nil {
+                    AgentTabQuotaBar(quota: quota, isActive: isActive)
+                        .frame(height: 3)
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(isActive ? AnyShapeStyle(Theme.brandAccent) : AnyShapeStyle(Color.secondary.opacity(0.08)))
+            )
+            .foregroundStyle(isActive ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
         .onHover { hovering in
             hoverEnterTask?.cancel()
             hoverExitTask?.cancel()
@@ -333,7 +367,7 @@ private struct QuotaDetailPopover: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             case .loading where quota.details.isEmpty:
-                Text("Loading…")
+                Text(L("Loading…"))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             default:
@@ -346,23 +380,23 @@ private struct QuotaDetailPopover: View {
 
     private var disconnectedMessage: String {
         switch quota.providerFilter {
-        case .codex:  return "Sign in with `codex` (ChatGPT mode) to track quota."
-        case .claude: return "Sign in to Claude Code to track quota."
-        default:      return "Sign in to track quota."
+        case .codex:  return L("Sign in with `codex` (ChatGPT mode) to track quota.")
+        case .claude: return L("Sign in to Claude Code to track quota.")
+        default:      return L("Sign in to track quota.")
         }
     }
 
     private var rowsCard: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
-                Text("\(quota.providerFilter.rawValue) usage")
+                Text(L("%@ usage", quota.providerFilter.displayLabel))
                     .font(.system(size: 11, weight: .semibold))
                 if case .stale = quota.connection {
-                    Text("stale")
+                    Text(L("stale"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.secondary)
                 } else if case .transientFailure = quota.connection {
-                    Text("retrying")
+                    Text(L("retrying"))
                         .font(.system(size: 9.5))
                         .foregroundStyle(.orange)
                 }
@@ -385,7 +419,7 @@ private struct QuotaDetailPopover: View {
                         .fixedSize(horizontal: true, vertical: false)
                 }
             }
-            ForEach(Array(quota.details.enumerated()), id: \.offset) { _, w in
+            ForEach(Array(quota.details.enumerated()), id: \.offset) { index, w in
                 QuotaDetailRow(window: w)
             }
             if !quota.footerLines.isEmpty {
@@ -402,66 +436,54 @@ private struct QuotaDetailPopover: View {
 
     private func terminalFailureCard(reason: String?) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(reconnectTitle)
+            Text(reconnectPresentation.title)
                 .font(.system(size: 11.5, weight: .semibold))
                 .foregroundStyle(.red)
-            Text(reason ?? defaultReconnectReason)
+            Text(reason ?? reconnectPresentation.defaultReason)
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
-            Text(reconnectInstruction)
+            Text(reconnectPresentation.instruction)
                 .font(.system(size: 10.5))
                 .foregroundStyle(.secondary)
         }
     }
 
-    private var reconnectTitle: String {
-        switch quota.providerFilter {
-        case .codex:  return "Reconnect Codex"
-        default:      return "Reconnect Claude"
-        }
-    }
-
-    private var defaultReconnectReason: String {
-        switch quota.providerFilter {
-        case .codex:  return "Refresh token rejected by OpenAI."
-        default:      return "Refresh token rejected by Anthropic."
-        }
-    }
-
-    private var reconnectInstruction: String {
-        switch quota.providerFilter {
-        case .codex:  return "Run `codex login` in your terminal, then click Reconnect."
-        default:      return "Open Claude Code in your terminal and type `/login`, then click Reconnect."
-        }
+    private var reconnectPresentation: ProviderReconnectPresentation {
+        ProviderReconnectPresentation(provider: quota.providerFilter)
     }
 }
 
 private struct QuotaDetailRow: View {
     let window: QuotaSummary.Window
 
+    private static let labelWidth: CGFloat = 92
+    private static let rowSpacing: CGFloat = 8
+
     var body: some View {
-        HStack(spacing: 8) {
-            Text(window.label)
-                .font(.system(size: 10.5))
-                .frame(width: 92, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.18))
-                    Capsule()
-                        .fill(barColor)
-                        .frame(width: max(2, geo.size.width * CGFloat(min(max(window.percent, 0), 1))))
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: Self.rowSpacing) {
+                Text(window.label)
+                    .font(.system(size: 10.5))
+                    .frame(width: Self.labelWidth, alignment: .leading)
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.secondary.opacity(0.18))
+                        Capsule()
+                            .fill(barColor)
+                            .frame(width: max(2, geo.size.width * CGFloat(min(max(window.percent, 0), 1))))
+                    }
                 }
-            }
-            .frame(height: 4)
-            Text(window.percentLabel)
-                .font(.codeMono(size: 10.5, weight: .medium))
-                .frame(width: 36, alignment: .trailing)
-            if !window.resetsInLabel.isEmpty {
-                Text(window.resetsInLabel)
-                    .font(.codeMono(size: 10))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 50, alignment: .trailing)
+                .frame(height: 4)
+                Text(window.percentLabel)
+                    .font(.codeMono(size: 10.5, weight: .medium))
+                    .frame(width: 36, alignment: .trailing)
+                if !window.resetsInLabel.isEmpty {
+                    Text(window.resetsInLabel)
+                        .font(.codeMono(size: 10))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 50, alignment: .trailing)
+                }
             }
         }
     }
@@ -494,13 +516,14 @@ extension ProviderFilter {
         case .kiloCode: return Color(red: 0x00/255.0, green: 0x96/255.0, blue: 0x88/255.0)
         case .kiro: return Color(red: 0x4A/255.0, green: 0x9E/255.0, blue: 0xC4/255.0)
         case .kimi: return Color(red: 0xA4/255.0, green: 0xC6/255.0, blue: 0x39/255.0)
+        case .kimiCode: return Color(red: 0xA3/255.0, green: 0xE6/255.0, blue: 0x35/255.0)
         case .lingtaiTui: return Color(red: 0x22/255.0, green: 0xA7/255.0, blue: 0xA0/255.0)
         case .openclaw: return Color(red: 0xDA/255.0, green: 0x70/255.0, blue: 0x56/255.0)
+        case .openclaude: return Color(red: 0xC2/255.0, green: 0x41/255.0, blue: 0x6B/255.0)
         case .opencode: return Color(red: 0x5B/255.0, green: 0x83/255.0, blue: 0x5B/255.0)
         case .pi: return Color(red: 0xB2/255.0, green: 0x6B/255.0, blue: 0x3D/255.0)
         case .qwen: return Color(red: 0x61/255.0, green: 0x5E/255.0, blue: 0xEB/255.0)
         case .omp: return Color(red: 0x8B/255.0, green: 0x5C/255.0, blue: 0xB0/255.0)
-        case .rooCode: return Color(red: 0x4C/255.0, green: 0xAF/255.0, blue: 0x50/255.0)
         case .crush: return Color(red: 0xE0/255.0, green: 0x6C/255.0, blue: 0x9F/255.0)
         case .antigravity: return Color(red: 0xFF/255.0, green: 0x7A/255.0, blue: 0x45/255.0)
         case .goose: return Color(red: 0xB7/255.0, green: 0x8D/255.0, blue: 0x52/255.0)

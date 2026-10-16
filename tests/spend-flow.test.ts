@@ -6,6 +6,14 @@ import { spawnSync } from 'node:child_process'
 import { describe, expect, it, vi } from 'vitest'
 
 import type { DateRange, ProjectSummary, SessionSummary, TokenUsage } from '../src/types.js'
+import { utcDaysAgo } from './fixtures/clock.js'
+
+// These specs spawn the real CLI (tsx compile + full parse) per test, which
+// blows the 5s default under full parallel suite load while passing cleanly
+// in isolation — the exact flake class #948 documented and CI has hit
+// (cli-emitters timed out on a green PR). Same file-level remedy as
+// cli-status-menubar.test.ts: a 30s ceiling for spawn-heavy suites only.
+vi.setConfig({ testTimeout: 30_000 })
 
 const parserMock = vi.hoisted(() => ({
   parseAllSessions: vi.fn(),
@@ -57,10 +65,10 @@ function session(id: string, project: string, costs: Record<string, number>): Se
   } as SessionSummary
 }
 
-function project(name: string, sessions: SessionSummary[]): ProjectSummary {
+function project(name: string, sessions: SessionSummary[], projectPath = `/tmp/${name}`): ProjectSummary {
   return {
     project: name,
-    projectPath: `/tmp/${name}`,
+    projectPath,
     sessions,
     totalCostUSD: sessions.reduce((sum, s) => sum + s.totalCostUSD, 0),
     totalSavingsUSD: 0,
@@ -89,7 +97,7 @@ function runCli(args: string[], home: string) {
       ...process.env,
       CLAUDE_CONFIG_DIR: join(home, '.claude'),
       CODEBURN_CACHE_DIR: join(home, '.cache', 'codeburn'),
-      HOME: home,
+      HOME: home, USERPROFILE: home,
       TZ: 'UTC',
     },
     encoding: 'utf-8',
@@ -148,12 +156,34 @@ describe('computeSpendFlow', () => {
       { id: 'sonnet', label: 'sonnet', cost: 5 },
     ])
     expect(flow.projects).toEqual([
-      { id: 'beta', label: 'beta', cost: 15 },
-      { id: 'alpha', label: 'alpha', cost: 6 },
+      { id: '/tmp/beta', label: 'beta', cost: 15 },
+      { id: '/tmp/alpha', label: 'alpha', cost: 6 },
     ])
     expectTotalsReconcile(flow.models, sumLinksBy(flow.links, 'model'))
     expectTotalsReconcile(flow.projects, sumLinksBy(flow.links, 'project'))
     expect(flow.links.reduce((sum, link) => sum + link.cost, 0)).toBeCloseTo(21, 10)
+  })
+
+  it('distinguishes same-basename hyphenated cwd labels without rewriting the hyphen', async () => {
+    const { computeSpendFlow } = await import('../src/spend-flow.js')
+    const range: DateRange = {
+      start: new Date('2026-09-01T00:00:00.000Z'),
+      end: new Date('2026-09-07T23:59:59.999Z'),
+    }
+    parserMock.parseAllSessions.mockResolvedValueOnce([
+      project('shared-vault', [session('s-shared', 'shared-vault', { opus: 0.46891 })], '/tmp/shared-vault'),
+      project('shared-vault', [session('s-alt', 'shared-vault', { sonnet: 0.018 })], '/tmp/alt/shared-vault'),
+      project('foo-bar', [session('s-hyphen', 'foo-bar', { haiku: 0.015 })], '/tmp/foo-bar'),
+    ])
+
+    const flow = await computeSpendFlow(range, 'all')
+    const byId = Object.fromEntries(flow.projects.map(p => [p.id, p]))
+    expect(byId['/tmp/shared-vault']?.label).toBe('tmp/shared-vault')
+    expect(byId['/tmp/alt/shared-vault']?.label).toBe('alt/shared-vault')
+    expect(byId['/tmp/foo-bar']?.label).toBe('foo-bar')
+    expect(flow.projects.map(p => p.label)).not.toContain('shared/vault')
+    expect(byId['/tmp/shared-vault']?.cost).toBeCloseTo(0.46891, 10)
+    expect(byId['/tmp/alt/shared-vault']?.cost).toBeCloseTo(0.018, 10)
   })
 
   it('rolls models and projects beyond the top 8 into other without losing cost', async () => {
@@ -205,9 +235,9 @@ describe('computeSpendFlow', () => {
 
     expect(flow.models).toContainEqual({ id: 'other', label: 'other', cost: 1000 })
     expect(flow.models).toContainEqual({ id: '__other__', label: 'Other', cost: 30 })
-    expect(flow.projects).toContainEqual({ id: 'other', label: 'other', cost: 1000 })
+    expect(flow.projects).toContainEqual({ id: '/tmp/other', label: 'other', cost: 1000 })
     expect(flow.projects).toContainEqual({ id: '__other__', label: 'Other', cost: 30 })
-    expect(flow.links).toContainEqual({ model: 'other', project: 'other', cost: 1000 })
+    expect(flow.links).toContainEqual({ model: 'other', project: '/tmp/other', cost: 1000 })
     expect(flow.links).toContainEqual({ model: '__other__', project: '__other__', cost: 30 })
     expectTotalsReconcile(flow.models, sumLinksBy(flow.links, 'model'))
     expectTotalsReconcile(flow.projects, sumLinksBy(flow.links, 'project'))
@@ -244,8 +274,8 @@ describe('codeburn spend --format flow-json', () => {
       await writeFile(
         join(projectDir, 'session.jsonl'),
         [
-          userLine('s1', '2026-04-10T09:00:00Z'),
-          assistantLine('s1', '2026-04-10T09:01:00Z', 'msg-1', 'claude-sonnet-4-5'),
+          userLine('s1', `${utcDaysAgo(30)}T09:00:00Z`),
+          assistantLine('s1', `${utcDaysAgo(30)}T09:01:00Z`, 'msg-1', 'claude-sonnet-4-5'),
         ].join('\n'),
       )
 
